@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>zcode OSS Readiness Audit</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b1020;--panel:#131a2d;--text:#e8edf7;--muted:#9eabc3;--ok:#43d17a;--work:#f5ba42;--block:#ff667a;--line:#2a3550;--link:#79b8ff}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,sans-serif} main{max-width:1050px;margin:auto;padding:40px 20px 80px}
+    h1{font-size:clamp(2rem,5vw,3.4rem);margin:0 0 6px} h2{margin-top:42px} a{color:var(--link)} code{background:#080c17;padding:.12rem .35rem;border-radius:4px}
+    .summary,.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:26px 0}
+    .metric strong{display:block;font-size:1.8rem}.muted{color:var(--muted)} table{width:100%;border-collapse:collapse;background:var(--panel);border-radius:14px;overflow:hidden} th,td{text-align:left;vertical-align:top;padding:14px;border-bottom:1px solid var(--line)} th{color:var(--muted)}
+    .status{white-space:nowrap;font-weight:700}.done{color:var(--ok)}.work{color:var(--work)}.blocked{color:var(--block)}.todo{color:var(--muted)}
+    .bar{height:12px;background:#080c17;border-radius:999px;overflow:hidden}.bar span{display:block;width:50%;height:100%;background:linear-gradient(90deg,var(--ok),var(--work))}.warning{border-left:4px solid var(--block)} li{margin:.45rem 0} footer{margin-top:45px;color:var(--muted)}
+  </style>
+</head>
+<body><main>
+  <p class="muted">Softorize / zcode · OSS readiness dashboard</p>
+  <h1>Open-source readiness audit</h1>
+  <p>Living checklist created 20 August 2026. Open this file directly in a browser; refresh after repository updates.</p>
+  <div class="summary">
+    <div class="metric"><strong>14</strong><span class="muted">completed</span></div>
+    <div class="metric"><strong>0</strong><span class="muted">in progress</span></div>
+    <div class="metric"><strong>1</strong><span class="muted">unresolved risk</span></div>
+    <div class="metric"><strong>93%</strong><div class="bar" aria-label="93 percent complete"><span style="width:93%"></span></div></div>
+  </div>
+
+  <section class="card warning">
+    <h2 style="margin-top:0">Publication gate: provenance</h2>
+    <p>The repository explicitly records work based on a leaked Claude Code source map, and 81 current source locations describe material as ported or verbatim from reference source. A qualified legal/provenance review and any required clean-room replacement must finish before changing visibility. Removing the comments alone does not resolve provenance. Because public repositories expose reachable Git history, publish a cleared squashed snapshot or explicitly approve a post-review history rewrite. The clearance process is recorded in <code>PROVENANCE.md</code>.</p>
+  </section>
+
+  <h2>Checklist</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Area</th><th>Result / next action</th></tr></thead>
+    <tbody>
+      <tr><td class="status blocked">● BLOCKED</td><td>Code provenance</td><td>Legal review required. Evidence: <code>GAP_MATRIX_REMAINING.md:80</code>, <code>docs/BEST_PRACTICIES.md:7</code>, parity-audit reference paths, and <code>src/cli/repl_spinner.zig:1221</code>.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Secret-history scan</td><td>Gitleaks 8.30.1 scanned all 1,020 commits (about 21 MB) with zero findings.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Action pinning</td><td>Replaced one floating action tag and three nonexistent setup-zig SHAs with the known-working pinned v2.2.1 commit.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Nightly fuzz startup</td><td>Created <code>zig-out</code> before <code>-femit-bin</code>; prior matrix failures were all <code>FileNotFound</code>.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Security policy</td><td>Removed the nonexistent PGP-key promise and made GitHub private vulnerability reporting the canonical route.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Version consistency</td><td>Aligned VS Code extension to CLI version 0.12.45 and made releases stamp the tag version before VSIX packaging.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Extension dependencies</td><td>Updated compatible transitive dependencies; <code>npm audit</code> now reports zero known vulnerabilities.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Community baseline</td><td>Apache-2.0 license, README, contribution guide, conduct policy, security policy, changelog, issue forms, PR template, Dependabot, CodeQL, SBOM and provenance workflows exist.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Maintainer routing</td><td>Added <code>CODEOWNERS</code> for default maintainer review and a private security-reporting link to the issue chooser.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Automated secret scanning</td><td>Added a pinned Gitleaks workflow for pushes, pull requests, and manual runs.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Action hardening</td><td>Moved composite-action inputs out of generated shell source, added temporary-file cleanup, collision-safe output delimiters, and full action linting.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Governance and support</td><td>Added maintainer-led governance, support expectations, ownership, and contributor-facing reporting routes.</td></tr>
+      <tr><td class="status done">● DONE</td><td>GitHub public settings</td><td>Published as a history-free public repository. Vulnerability reporting, secret scanning, push protection, code-owner review, deletion protection, and force-push protection are configured.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Repository presentation</td><td>Added a concise GitHub description and <code>zig</code>, <code>ai</code>, <code>coding-agent</code>, <code>cli</code>, and <code>mcp</code> topics. Homepage awaits a real project site.</td></tr>
+      <tr><td class="status done">● DONE</td><td>Machine-specific artifacts</td><td>Removed committed generated reference captures, ignored future captures, replaced the hard-coded reference binary, and sanitized all current-tree <code>/Users/Toto</code> paths. The parity corpus remains quarantined by the provenance launch gate.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Verification log</h2>
+  <ul>
+    <li>Repository is public with one root commit; default branch is <code>main</code>.</li>
+    <li>Markdown relative-link scan found no missing local targets.</li>
+    <li>Recent CodeQL runs pass.</li>
+    <li>Scheduled review failure diagnosed as an invalid third-party action SHA.</li>
+    <li>Fuzz failure diagnosed as a missing output directory, not a discovered parser crash.</li>
+    <li>VS Code extension compiled and packaged successfully as version 0.12.45.</li>
+    <li><code>npm audit</code> reports zero known vulnerabilities after lockfile updates.</li>
+    <li>Gitleaks full-history scan: 1,020 commits scanned, zero leaks found.</li>
+    <li>Gitleaks current-tree scan: about 146 MB scanned, zero leaks found.</li>
+    <li>One-second core fuzz smoke test passed all 11 tests.</li>
+    <li>All GitHub workflow and issue-template YAML files parse successfully.</li>
+    <li>Actionlint 1.7.12 reports no workflow errors.</li>
+    <li>Full Zig suite: 4,151 passed, 3 skipped, 0 failed.</li>
+    <li>Current-tree personal path scan: zero <code>/Users/Toto</code> occurrences.</li>
+    <li>Tracked generated reference capture removed; future reference captures are ignored.</li>
+  </ul>
+  <footer>Maintained in <code>docs/oss-readiness.html</code>. Status labels reflect repository state, not legal advice.</footer>
+</main></body></html>

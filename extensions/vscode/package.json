@@ -1,0 +1,105 @@
+{
+  "name": "zcode-vscode",
+  "displayName": "zcode",
+  "description": "First-party VS Code integration for the zcode CLI",
+  "version": "0.12.45",
+  "publisher": "softorize",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Softorize/zcode.git"
+  },
+  "homepage": "https://github.com/Softorize/zcode",
+  "bugs": {
+    "url": "https://github.com/Softorize/zcode/issues"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:zcode.status",
+    "onCommand:zcode.runPrompt",
+    "onCommand:zcode.reviewWorking",
+    "onCommand:zcode.applySelectedPatch",
+    "onCommand:zcode.shareSession",
+    "onCommand:zcode.webHandoffSession",
+    "onCommand:zcode.importSharedSession"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "zcode.status",
+        "title": "zcode: Status"
+      },
+      {
+        "command": "zcode.runPrompt",
+        "title": "zcode: Run Prompt"
+      },
+      {
+        "command": "zcode.reviewWorking",
+        "title": "zcode: Review Working Tree"
+      },
+      {
+        "command": "zcode.applySelectedPatch",
+        "title": "zcode: Apply Selected Patch"
+      },
+      {
+        "command": "zcode.shareSession",
+        "title": "zcode: Share Session"
+      },
+      {
+        "command": "zcode.webHandoffSession",
+        "title": "zcode: Web Handoff Session"
+      },
+      {
+        "command": "zcode.importSharedSession",
+        "title": "zcode: Import Shared Session"
+      }
+    ],
+    "configuration": {
+      "title": "zcode",
+      "properties": {
+        "zcode.binaryPath": {
+          "type": "string",
+          "default": "zcode",
+          "description": "Path to the zcode CLI binary used for JSON-lines API requests."
+        },
+        "zcode.apiProfile": {
+          "type": "string",
+          "enum": [
+            "editor",
+            "read-only",
+            "full"
+          ],
+          "default": "editor",
+          "description": "Capability profile passed to zcode api serve. Use read-only to disable prompt execution, patch application, and session handoff from the extension."
+        },
+        "zcode.protocolLog": {
+          "type": "string",
+          "enum": [
+            "redacted",
+            "off",
+            "raw"
+          ],
+          "default": "redacted",
+          "description": "Controls JSON-lines protocol logging in the zcode output channel. Raw logs may include prompts, patches, and session data."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.3.2",
+    "@types/node": "^22.10.2",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "scenario_name": "command-commit-basic",
+  "scenario_class": "command",
+  "description": "Smoke scenario for #562: send a trivial prompt to the reference and capture the stream-json wire output. Used to prove the reference runner end-to-end. Real /commit-in-a-git-repo capture comes once the harness is stable.",
+  "seed": {
+    "cwd": "/tmp",
+    "env_denylist": [],
+    "env_fixed": { "TZ": "UTC" },
+    "terminal_size": { "cols": 80, "rows": 24 }
+  },
+  "inputs": [
+    { "type": "command", "value": "reply with exactly the word OK and nothing else" }
+  ],
+  "timeout_ms": 60000
+}

@@ -1,0 +1,3 @@
+# One dependency name per line. Blank lines and `#` comments ignored.
+# Adding a name here requires reviewer approval (supply-chain policy).
+# Empty file = zcode must declare zero dependencies in build.zig.zon.

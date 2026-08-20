@@ -1,0 +1,36 @@
+name: zcode-pr-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - id: zcode
+        uses: ./.github/actions/zcode
+        with:
+          provider: openai
+          command: review branch ${{ github.base_ref }}
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          ZCODE_REVIEW: ${{ steps.zcode.outputs.result }}
+        with:
+          script: |
+            const body = process.env.ZCODE_REVIEW || "zcode review produced no output.";
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## zcode review\n\n${body}`
+            });

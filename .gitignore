@@ -1,0 +1,14 @@
+.zig-cache/
+.zig-cache-fresh/
+zig-out/
+.DS_Store
+.zcode/
+.env
+.env.*
+*.pem
+*.key
+extensions/*/node_modules/
+extensions/*/out/
+extensions/*/*.vsix
+dist/
+.claude/

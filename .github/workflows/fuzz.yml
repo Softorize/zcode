@@ -1,0 +1,77 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Nightly 02:13 UTC. Long-enough budget to shake out new parser
+    # regressions that the seconds-scale CI fuzz passes would miss.
+    - cron: '13 2 * * *'
+  # Manual trigger so a reviewer can rerun on an open PR branch.
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Fuzz budget per parser, in seconds"
+        required: false
+        default: "900"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per fuzz module. Keeps individual crashes isolated
+        # and lets a single failing parser fail loudly without
+        # masking the others.
+        target:
+          - core
+          - mcp
+          - tools
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Run fuzz harness (${{ matrix.target }})
+        env:
+          ZCODE_FUZZ_DURATION_SECONDS: ${{ inputs.duration_seconds || '900' }}
+          ZCODE_FUZZ_TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p zig-out
+          # The fuzz_tests.zig modules live at src/<target>/fuzz_tests.zig.
+          # Running them under `zig test` exercises every harness in the
+          # module; ZCODE_FUZZ_DURATION_SECONDS is consumed by the harness
+          # itself where it drives an input-generation loop. Any crash or
+          # std.debug.assert failure becomes a non-zero exit, which bubbles
+          # up as a GitHub Actions failure and opens an auto-issue via the
+          # triage workflow.
+          zig test "src/${{ matrix.target }}/fuzz_tests.zig" \
+            --test-filter fuzz \
+            -femit-bin=zig-out/fuzz-${{ matrix.target }} || {
+            echo "::error title=fuzz crash::${{ matrix.target }} fuzz harness failed"
+            exit 1
+          }
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            zig-out/fuzz-*
+            .zig-cache/**
+          if-no-files-found: ignore
+          retention-days: 14

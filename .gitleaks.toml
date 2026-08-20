@@ -1,0 +1,21 @@
+title = "zcode gitleaks config"
+
+[[allowlists]]
+description = "MCP WebSocket protocol header false positive"
+regexTarget = "match"
+regexes = [
+  '''Sec-WebSocket-Key:''',
+]
+
+[[allowlists]]
+description = "Historical synthetic secret fixtures used in tests"
+regexTarget = "match"
+regexes = [
+  '''ghp_1234567890abcdefghijklmnopqrst''',
+  '''ghp_1234567890abcdef''',
+  '''sk-supersecret123''',
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''aB3cD4eF5gH6iJ7kL8mN9oP0q''',
+  '''00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff''',
+  '''ABEiM0RVZneImaq7zN3u/wARIjNEVWZ3iJmqu8zd7v8=''',
+]

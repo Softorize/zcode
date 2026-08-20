@@ -1,0 +1,267 @@
+[
+  {
+    "id": 1,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/services/tools/StreamingToolExecutor.ts",
+    "target_file": "src/agent_runtime.zig",
+    "description": "Concurrent tool execution: run concurrent-safe tools in parallel instead of sequentially",
+    "status": "DONE",
+    "priority": 1
+  },
+  {
+    "id": 2,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/tools/BashTool/bashSecurity.ts",
+    "target_file": "src/tools/shell.zig",
+    "description": "Bash security: comprehensive command analysis (2000+ lines) for injection, exfiltration, path constraint enforcement",
+    "status": "DONE",
+    "priority": 1
+  },
+  {
+    "id": 3,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/QueryEngine.ts",
+    "target_file": "src/agent_runtime.zig",
+    "description": "Tool result persistence: cache tool results >10KB to disk files instead of keeping in memory",
+    "status": "DONE",
+    "priority": 1
+  },
+  {
+    "id": 4,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/services/compact/compact.ts",
+    "target_file": "src/core/compaction.zig",
+    "description": "Forked agent compaction: use subagent to generate summaries instead of keyword extraction",
+    "status": "SKIPPED",
+    "priority": 2,
+    "skip_reason": "Requires passing AgentRuntime to compaction which is called from prompt_engine. Architectural change needed. Current keyword extraction works and is fast."
+  },
+  {
+    "id": 5,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/cost-tracker.ts",
+    "target_file": "src/core/cost.zig",
+    "description": "Cost persistence: save/restore session costs across resume, cache read/creation token tracking",
+    "status": "SKIPPED",
+    "priority": 2,
+    "skip_reason": "Token totals already tracked in TokenStatus. Adding to SessionSnapshot requires changes to 10+ files. Low user impact since /cost already shows current session costs."
+  },
+  {
+    "id": 6,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/history.ts",
+    "target_file": "src/cli/repl.zig",
+    "description": "History paste store: hash-based paste content storage, Ctrl+R interactive history picker",
+    "status": "SKIPPED",
+    "priority": 2,
+    "skip_reason": "Requires significant architectural changes or new infrastructure"
+  },
+  {
+    "id": 7,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/context.ts",
+    "target_file": "src/core/context.zig",
+    "description": "Memoized context: cache git status and system context across turns within a conversation",
+    "status": "DONE",
+    "priority": 2
+  },
+  {
+    "id": 8,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/Tool.ts",
+    "target_file": "src/core/types.zig",
+    "description": "Dynamic tool descriptions: per-tool description() method for context-aware prompt generation",
+    "status": "SKIPPED",
+    "priority": 2,
+    "skip_reason": "Requires significant architectural changes or new infrastructure"
+  },
+  {
+    "id": 9,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/tools/BashTool/BashTool.ts",
+    "target_file": "src/tools/shell.zig",
+    "description": "Bash output truncation: configurable max output bytes with structured truncation message",
+    "status": "DONE",
+    "priority": 2
+  },
+  {
+    "id": 10,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/constants/prompts.ts",
+    "target_file": "src/core/prompt_engine.zig",
+    "description": "MCP server instructions: inject connected MCP server instructions into system prompt",
+    "status": "DONE",
+    "priority": 2
+  },
+  {
+    "id": 11,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/services/api/claude.ts",
+    "target_file": "src/agent_history.zig",
+    "description": "Overloaded fallback: switch to non-streaming on 529 (overloaded) API errors",
+    "status": "DONE",
+    "priority": 2
+  },
+  {
+    "id": 12,
+    "type": "MISSING_FILE",
+    "reference_file": "src/tools/ToolSearchTool/",
+    "target_file": "src/tools/tool_search.zig",
+    "description": "ToolSearchTool: deferred tool loading when tool count exceeds threshold",
+    "status": "SKIPPED",
+    "priority": 3,
+    "skip_reason": "ToolSearchTool requires new tool with lazy loading architecture"
+  },
+  {
+    "id": 13,
+    "type": "MISSING_FILE",
+    "reference_file": "src/tools/EnterWorktreeTool/",
+    "target_file": "src/tools/worktree.zig",
+    "description": "EnterWorktree/ExitWorktree tools: create and manage git worktrees from agent",
+    "status": "DONE",
+    "priority": 3
+  },
+  {
+    "id": 14,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/tools/BashTool/BashTool.ts",
+    "target_file": "src/tools/shell.zig",
+    "description": "Interactive command detection: detect vim/less/top/nano and warn user",
+    "status": "DONE",
+    "priority": 3
+  },
+  {
+    "id": 15,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/tools/FileReadTool/FileReadTool.ts",
+    "target_file": "src/tools/file.zig",
+    "description": "File read state cache: track which files were read to avoid re-reading unchanged files",
+    "status": "SKIPPED",
+    "priority": 3,
+    "skip_reason": "File read cache requires mutable state tracking across turns"
+  },
+  {
+    "id": 16,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/tools/GrepTool/GrepTool.ts",
+    "target_file": "src/tools/grep.zig",
+    "description": "Grep file type filter: --type flag for filtering by language (js, py, rs, zig)",
+    "status": "DONE",
+    "priority": 3
+  },
+  {
+    "id": 17,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/Tool.ts",
+    "target_file": "src/tools/tool_schemas.zig",
+    "description": "Tool concurrency flags: isConcurrencySafe, isReadOnly, isDestructive per tool",
+    "status": "DONE",
+    "priority": 3
+  },
+  {
+    "id": 18,
+    "type": "LOGIC_GAP",
+    "reference_file": "src/services/api/claude.ts",
+    "target_file": "src/providers/common.zig",
+    "description": "Prompt cache control headers: split system prompt blocks with cache_control for API-level caching",
+    "status": "SKIPPED",
+    "priority": 3,
+    "skip_reason": "Prompt cache control headers require API-specific message building"
+  },
+  {
+    "id": 19,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/commands/onboarding/",
+    "target_file": "src/repl_commands.zig",
+    "description": "/onboarding command: interactive first-run wizard for new users",
+    "status": "DONE",
+    "priority": 3
+  },
+  {
+    "id": 20,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/commands/theme/",
+    "target_file": "src/repl_commands.zig",
+    "description": "/theme command: terminal color theme selection",
+    "status": "DONE",
+    "priority": 3
+  },
+  {
+    "id": 21,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/services/api/withRetry.ts",
+    "target_file": "src/providers/common.zig",
+    "description": "Exponential backoff with jitter: proper retry strategy instead of fixed delay",
+    "status": "DONE",
+    "priority": 3
+  },
+  {
+    "id": 22,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/commands/feedback/",
+    "target_file": "src/repl_commands.zig",
+    "description": "/feedback command: send feedback to developers",
+    "status": "DONE",
+    "priority": 4
+  },
+  {
+    "id": 23,
+    "type": "MISSING_FILE",
+    "reference_file": "src/vim/",
+    "target_file": "src/cli/vim.zig",
+    "description": "Vim mode: full vim keybinding state machine (INSERT/NORMAL modes)",
+    "status": "SKIPPED",
+    "priority": 4,
+    "skip_reason": "Vim mode requires full state machine (500+ lines)"
+  },
+  {
+    "id": 24,
+    "type": "MISSING_FILE",
+    "reference_file": "src/keybindings/",
+    "target_file": "src/cli/keybindings.zig",
+    "description": "Custom keybindings: chord support, context-aware key resolution, user config",
+    "status": "SKIPPED",
+    "priority": 4,
+    "skip_reason": "Custom keybindings requires chord parser and resolver"
+  },
+  {
+    "id": 25,
+    "type": "MISSING_FILE",
+    "reference_file": "src/voice/",
+    "target_file": "src/voice.zig",
+    "description": "Voice input/output: STT/TTS integration for hands-free operation",
+    "status": "SKIPPED",
+    "priority": 5,
+    "skip_reason": "Voice requires STT/TTS external service integration"
+  },
+  {
+    "id": 26,
+    "type": "MISSING_FILE",
+    "reference_file": "src/tools/LSPTool/",
+    "target_file": "src/tools/lsp.zig",
+    "description": "LSP tool: Language Server Protocol integration for editor features",
+    "status": "SKIPPED",
+    "priority": 5,
+    "skip_reason": "LSP requires language server process management"
+  },
+  {
+    "id": 27,
+    "type": "MISSING_FILE",
+    "reference_file": "src/coordinator/",
+    "target_file": "src/core/coordinator.zig",
+    "description": "Coordinator mode: multi-agent orchestration with dedicated worker agents",
+    "status": "SKIPPED",
+    "priority": 5,
+    "skip_reason": "Coordinator mode requires worker agent architecture"
+  },
+  {
+    "id": 28,
+    "type": "MISSING_FUNCTION",
+    "reference_file": "src/services/oauth/",
+    "target_file": "src/core/auth.zig",
+    "description": "OAuth/PKCE authentication: browser-based auth flow with token persistence",
+    "status": "SKIPPED",
+    "priority": 5,
+    "skip_reason": "OAuth requires browser-based PKCE flow"
+  }
+]
