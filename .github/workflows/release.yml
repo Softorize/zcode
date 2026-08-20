@@ -1,0 +1,231 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-assets:
+    name: build (${{ matrix.asset_name }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-linux
+            asset_name: zcode-linux-x86_64
+          - runner: ubuntu-latest
+            target: aarch64-linux
+            asset_name: zcode-linux-aarch64
+          - runner: macos-latest
+            target: x86_64-macos
+            asset_name: zcode-macos-x86_64
+          - runner: macos-latest
+            target: aarch64-macos
+            asset_name: zcode-macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Build release asset
+        env:
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          ASSET_NAME: ${{ matrix.asset_name }}
+        run: |
+          version="${VERSION#v}"
+          bash scripts/release/build_release_asset.sh "$version" "$TARGET" "$ASSET_NAME" dist
+
+      - name: Sign and notarize macOS asset
+        if: runner.os == 'macOS'
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_SIGNING_CERT_B64: ${{ secrets.APPLE_SIGNING_CERT_B64 }}
+          APPLE_SIGNING_CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          bash scripts/release/macos_sign_and_notarize.sh "dist/${{ matrix.asset_name }}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+        with:
+          cosign-release: v2.4.1
+
+      - name: Sign release artifact with cosign
+        run: bash scripts/release/sign_artifact.sh "dist/${{ matrix.asset_name }}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            dist/${{ matrix.asset_name }}
+            dist/${{ matrix.asset_name }}.sig
+            dist/${{ matrix.asset_name }}.pem
+            dist/${{ matrix.asset_name }}.bundle
+          if-no-files-found: error
+
+      - name: Generate artifact attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-path: dist/${{ matrix.asset_name }}
+
+  hashes:
+    name: compute artifact hashes for SLSA
+    needs: build-assets
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256 subjects (binaries only)
+        id: hash
+        shell: bash
+        run: |
+          cd dist
+          # Provenance covers the binaries themselves. The .sig / .pem
+          # files are covered transitively because they are generated
+          # inside this workflow run; verifiers check provenance against
+          # the binary hash, then cosign against the signature.
+          sha256sum \
+            zcode-linux-x86_64 \
+            zcode-linux-aarch64 \
+            zcode-macos-x86_64 \
+            zcode-macos-aarch64 \
+            > slsa-subjects.txt
+          echo "hashes=$(base64 -w0 < slsa-subjects.txt)" >> "$GITHUB_OUTPUT"
+
+  provenance:
+    name: SLSA3 provenance
+    needs: hashes
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563 # v2.0.0
+    with:
+      base64-subjects: "${{ needs.hashes.outputs.hashes }}"
+      provenance-name: zcode.intoto.jsonl
+      upload-assets: false
+
+  publish-release:
+    name: publish release
+    needs: [build-assets, provenance]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build VS Code extension bundle
+        run: |
+          cd extensions/vscode
+          npm ci
+          npm run compile
+          version="${GITHUB_REF_NAME#v}"
+          npm version "$version" --no-git-tag-version --allow-same-version
+          npx @vscode/vsce package --out ../../dist/zcode-vscode-${{ github.ref_name }}.vsix
+
+      - name: Generate SBOM
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          bash scripts/release/generate_sbom.sh "$version" dist/release
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+        with:
+          cosign-release: v2.4.1
+
+      - name: Sign SBOM with cosign
+        run: bash scripts/release/sign_sbom.sh dist/release/sbom.cdx.json
+
+      - name: Generate release metadata
+        env:
+          VERSION: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          version="${VERSION#v}"
+          bash scripts/release/generate_release_metadata.sh "$version" "$REPO" dist dist/release
+
+      - name: Audit release artifacts
+        run: |
+          bash scripts/release/audit_release_artifacts.sh dist
+
+      - name: Build air-gapped install bundles
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          mkdir -p dist/airgap
+          for arch in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
+            bash scripts/release/airgap_bundle.sh "$version" "$arch" dist dist/airgap
+          done
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@c062e08bd532815e2082a07b400ef65b1a63919d # v2.3.2
+        with:
+          files: |
+            dist/zcode-*
+            dist/zcode-vscode-*.vsix
+            dist/release/SHA256SUMS
+            dist/release/update.json
+            dist/release/zcode.rb
+            dist/release/sbom.cdx.json
+            dist/release/sbom.cdx.json.sig
+            dist/release/sbom.cdx.json.pem
+            dist/release/sbom.cdx.json.bundle
+            dist/zcode.intoto.jsonl
+            dist/airgap/*.tar.gz
+            install.sh
+
+      - name: Publish Homebrew tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO || 'Softorize/homebrew-zcode' }}
+        run: |
+          bash scripts/release/publish_homebrew_tap.sh dist/release/zcode.rb

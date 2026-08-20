@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    name: security scan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          version=8.21.2
+          asset="gitleaks_${version}_linux_x64.tar.gz"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          curl -sSfL -o "$tmp/$asset" "https://github.com/gitleaks/gitleaks/releases/download/v${version}/$asset"
+          curl -sSfL -o "$tmp/checksums.txt" "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_checksums.txt"
+          grep "  $asset$" "$tmp/checksums.txt" > "$tmp/checksums.selected"
+          (cd "$tmp" && sha256sum -c checksums.selected)
+          tar xzf "$tmp/$asset" -C /usr/local/bin gitleaks
+
+      - name: Run gitleaks
+        run: gitleaks detect --source . --verbose
+
+      - name: Run Zig SAST checks
+        run: bash scripts/ci/zig_sast.sh src
+
+      - name: Check dependency-pin allowlist
+        run: bash scripts/ci/check_dependency_pin.sh build.zig.zon scripts/ci/allowed_dependencies.txt
+
+      - name: Check workflow action pins
+        run: bash scripts/ci/check_workflow_pins.sh
+
+  build-and-test:
+    name: build-and-test (${{ matrix.os }})
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Windows excluded: codebase uses POSIX-only APIs (tcgetattr, signals, poll)
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Cache Zig artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
+      - name: Install system dependencies
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -q && sudo apt-get install -yq ripgrep bubblewrap
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            brew install ripgrep
+          fi
+
+      - name: Check formatting
+        run: zig fmt --check build.zig src tests
+
+      - name: Validate shell scripts
+        run: |
+          bash -n install.sh
+          find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Run integration tests
+        run: zig build test-integration
+
+      - name: Run live local provider smoke
+        if: vars.ZCODE_LIVE_LOCAL_SMOKE == '1'
+        env:
+          ZCODE_LIVE_LOCAL_BASE_URL: ${{ vars.ZCODE_LIVE_LOCAL_BASE_URL }}
+          ZCODE_LIVE_LOCAL_MODEL: ${{ vars.ZCODE_LIVE_LOCAL_MODEL }}
+          ZCODE_LIVE_LOCAL_REQUIRED: "1"
+        run: bash scripts/ci/live_local_provider_smoke.sh
+
+      - name: Build VS Code extension
+        run: |
+          cd extensions/vscode
+          npm ci
+          npm run compile
+          npm run package
+          bash ../../scripts/release/audit_release_artifacts.sh ./*.vsix
+
+      - name: Validate GitHub App scripts
+        run: |
+          bash -n scripts/github_app/*.sh
+          scripts/github_app/render_manifest.sh https://zcode.example.com https://github.com/Softorize/zcode >/tmp/zcode-github-app-manifest.json
+
+  reproducible-build:
+    name: reproducible build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Build twice with the release script and compare
+        run: |
+          # Invoke the same script the release workflow uses, so the
+          # optimization level, target flag, and version override match
+          # what ships. Building with bare `zig build` would prove only
+          # the dev-mode path is reproducible, and would miss
+          # ReleaseSafe-specific nondeterminism (panic message tables,
+          # @src() interning in safety checks) that ends up in the
+          # published artifact.
+          mkdir -p out-A out-B
+          bash scripts/release/build_release_asset.sh 0.0.0-repro x86_64-linux zcode-linux-x86_64 out-A
+          bash scripts/release/build_release_asset.sh 0.0.0-repro x86_64-linux zcode-linux-x86_64 out-B
+          if ! cmp -s out-A/zcode-linux-x86_64 out-B/zcode-linux-x86_64; then
+            sha256sum out-A/zcode-linux-x86_64 out-B/zcode-linux-x86_64
+            echo "FAIL: two builds from the same source produced different binaries." >&2
+            echo "Investigate embedded timestamps, absolute paths, or non-deterministic" >&2
+            echo "comptime state in build.zig or src/." >&2
+            exit 1
+          fi
+          echo "OK: release binary is byte-for-byte reproducible."

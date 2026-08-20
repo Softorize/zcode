@@ -1,0 +1,22 @@
+{
+  "scenario_name": "cloud-stub-commands",
+  "scenario_class": "command",
+  "description": "#567: verify all 8 cloud-dependent commands are recognized by zcode and return a labeled stub message explaining the external dependency. zcode-only scenario (the reference will attempt to actually run these, so we don't capture the reference side).",
+  "seed": {
+    "cwd": "/tmp",
+    "env_denylist": [],
+    "env_fixed": { "TZ": "UTC" },
+    "terminal_size": { "cols": 80, "rows": 24 }
+  },
+  "inputs": [
+    { "type": "command", "value": "/teleport" },
+    { "type": "command", "value": "/remote-setup" },
+    { "type": "command", "value": "/remote-env" },
+    { "type": "command", "value": "/mobile" },
+    { "type": "command", "value": "/desktop" },
+    { "type": "command", "value": "/install-github-app" },
+    { "type": "command", "value": "/install-slack-app" },
+    { "type": "command", "value": "/oauth-refresh" }
+  ],
+  "timeout_ms": 120000
+}

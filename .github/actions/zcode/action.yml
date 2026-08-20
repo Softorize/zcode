@@ -1,0 +1,89 @@
+name: zcode
+description: Build zcode from the current checkout and run a CLI command.
+
+inputs:
+  command:
+    description: Full zcode command tail, for example `review branch main`
+    required: true
+  cwd:
+    description: Working directory to run from
+    required: false
+    default: .
+  provider:
+    description: Optional provider override
+    required: false
+    default: ""
+  model:
+    description: Optional model override
+    required: false
+    default: ""
+  agent:
+    description: Optional agent override
+    required: false
+    default: ""
+  extra_flags:
+    description: Trusted shell-quoted CLI flags appended before the command
+    required: false
+    default: ""
+
+outputs:
+  result:
+    description: Captured stdout from zcode
+    value: ${{ steps.run.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      with:
+        version: 0.16.0
+    - id: run
+      shell: bash
+      working-directory: ${{ inputs.cwd }}
+      env:
+        ZCODE_ACTION_AGENT: ${{ inputs.agent }}
+        ZCODE_ACTION_COMMAND: ${{ inputs.command }}
+        ZCODE_ACTION_EXTRA_FLAGS: ${{ inputs.extra_flags }}
+        ZCODE_ACTION_MODEL: ${{ inputs.model }}
+        ZCODE_ACTION_PROVIDER: ${{ inputs.provider }}
+      run: |
+        set -euo pipefail
+        zig build -Doptimize=ReleaseSafe
+
+        cmd=(./zig-out/bin/zcode)
+        if [[ -n "${ZCODE_ACTION_PROVIDER}" ]]; then
+          cmd+=(--provider "${ZCODE_ACTION_PROVIDER}")
+        fi
+        if [[ -n "${ZCODE_ACTION_MODEL}" ]]; then
+          cmd+=(--model "${ZCODE_ACTION_MODEL}")
+        fi
+        if [[ -n "${ZCODE_ACTION_AGENT}" ]]; then
+          cmd+=(--agent "${ZCODE_ACTION_AGENT}")
+        fi
+
+        printf -v cmdline '%q ' "${cmd[@]}"
+        stdout_file="$(mktemp)"
+        stderr_file="$(mktemp)"
+        trap 'rm -f "${stdout_file}" "${stderr_file}"' EXIT
+
+        set +e
+        bash -lc "${cmdline}${ZCODE_ACTION_EXTRA_FLAGS} ${ZCODE_ACTION_COMMAND}" >"${stdout_file}" 2>"${stderr_file}"
+        status=$?
+        set -e
+
+        cat "${stdout_file}"
+        if [[ -s "${stderr_file}" ]]; then
+          cat "${stderr_file}" >&2
+        fi
+
+        delimiter="zcode_output_${RANDOM}_${RANDOM}"
+        while grep -Fqx "${delimiter}" "${stdout_file}"; do
+          delimiter="zcode_output_${RANDOM}_${RANDOM}"
+        done
+        {
+          echo "result<<${delimiter}"
+          cat "${stdout_file}"
+          echo "${delimiter}"
+        } >>"${GITHUB_OUTPUT}"
+
+        exit "${status}"

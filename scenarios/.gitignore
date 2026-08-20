@@ -1,0 +1,6 @@
+# Scenario captures are regenerable artifacts, not source.
+# Commit scenario definitions only. Reference and zcode captures can contain
+# machine-specific paths, account metadata, and regenerable third-party output.
+*/reference/
+*/zcode/
+*/diff.json

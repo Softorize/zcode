@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible problem in zcode
+title: "[bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use the `mock` provider when possible and include exact commands, config, and logs.
+  - type: input
+    id: version
+    attributes:
+      label: zcode version
+      description: Output of `zcode version`
+      placeholder: zcode 0.5.0+abcdef12
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: macOS 15.4 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider / model
+      placeholder: openai/gpt-5.4 or mock/mock-agent
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Redact tokens, secrets, session tokens, and private paths as needed.
+      render: shell

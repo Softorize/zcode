@@ -1,0 +1,42 @@
+name: zcode-issue-triage
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ZCODE_PROVIDER: openai
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - id: triage
+        shell: bash
+        run: |
+          output="$(bash scripts/github/triage_issue.sh)"
+          {
+            echo "body<<EOF"
+            echo "$output"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          ZCODE_TRIAGE: ${{ steps.triage.outputs.body }}
+        with:
+          script: |
+            const body = process.env.ZCODE_TRIAGE || "zcode triage produced no output.";
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `## zcode triage\n\n${body}`
+            });

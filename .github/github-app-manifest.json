@@ -1,0 +1,25 @@
+{
+  "name": "zcode",
+  "url": "__ZCODE_GITHUB_REPO_URL__",
+  "hook_attributes": {
+    "url": "__ZCODE_WEB_BASE_URL__/github/webhooks/zcode"
+  },
+  "redirect_url": "__ZCODE_WEB_BASE_URL__/github/apps/zcode/setup",
+  "callback_urls": [
+    "__ZCODE_WEB_BASE_URL__/github/apps/zcode/callback"
+  ],
+  "public": false,
+  "default_permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "metadata": "read"
+  },
+  "default_events": [
+    "issue_comment",
+    "pull_request",
+    "pull_request_review_comment",
+    "pull_request_review",
+    "issues"
+  ]
+}

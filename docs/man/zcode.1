@@ -1,0 +1,134 @@
+.TH ZCODE 1 "2026-04-24" "zcode 0.10.362+246e91ee.dirty" "User Commands"
+.SH NAME
+zcode \- Enterprise coding agent CLI
+.SH SYNOPSIS
+.B zcode
+[\fIOPTIONS\fR] [\fICOMMAND\fR] [\fIARGS\fR]
+.SH DESCRIPTION
+zcode is a command-line coding agent. It drives an LLM against a
+workspace, executes tools (shell, file edits, git, MCP servers) on
+the agent\(aqs behalf, and can run fully interactively or in a
+one-shot/JSON mode for scripting.
+.SH HELP OUTPUT
+.nf
+zcode - Enterprise coding agent CLI
+
+Getting started (60 seconds):
+  1. Provision a provider key:  zcode keychain set anthropic <your-key>
+  2. Try a one-shot prompt:     zcode run "list Zig files in src/"
+  3. Start an interactive session: zcode
+  4. Machine-readable output:   zcode exec --json "<prompt>" | jq .
+  5. Install shell completion:  zcode completion zsh > ~/.zfunc/_zcode
+
+Usage:
+  zcode                            Start interactive session
+  zcode --continue                 Resume most recent session
+  zcode -c "prompt"                Resume latest session with initial prompt
+  zcode --resume <id>              Resume session by ID
+  zcode version                    Print version
+  zcode run "<prompt>"             Run one-shot prompt
+  zcode exec --json "<prompt>"     Run one-shot and emit JSON
+  zcode models list|test [model]
+  zcode agents list|show [name]
+  zcode hooks list
+  zcode marketplace sources|add|remove|refresh [name] [url] [sha256]
+  zcode plugins list|show|marketplace [name]
+  zcode plugins install|uninstall|update <name>
+  zcode commands list|show|run|marketplace [name]
+  zcode commands install|uninstall|update <name>
+  zcode skills list|show|run [name]
+  zcode skill <name> [args]
+  zcode trust status|allow|revoke [path]
+  zcode trust hooks|hook-allow|hook-revoke [path]
+  zcode trust marketplace|marketplace-allow|marketplace-block|marketplace-unblock [prefix]
+  zcode providers login|logout|status [provider]
+  zcode session list|resume|compact [session_id]
+  zcode session export|checkpoint|checkpoints|restore|share|import|undo|fork [session_id|bundle]
+  zcode daemon start|status|stop
+  zcode daemon handoff <session_id> [label]
+  zcode mcp list|tools|resources|prompts|add|remove|test [server]
+  zcode mcp read <server> <uri>
+  zcode mcp prompt <server> <name> [json-args]
+  zcode mcp auth login|status|logout [server]
+  zcode policy show|validate
+  zcode api schema|serve
+  zcode review [working|commit <sha>|branch <base>]
+  zcode update                     Check for updates and self-update
+  zcode benchmark run
+Flags:
+  -m, --model <id>
+  -p, --provider <name>
+      --agent <name>
+      --profile <name>
+      --approval-mode <mode>      tiered-auto (default) | manual | strict
+      --sandbox <profile>         read-only | workspace-write | no-network | danger-full-access
+      --cwd <path>
+  -j, --json                      Emit a single JSON object on stdout (machine-readable mode)
+  -V, --version                   Print version and exit
+      --no-color                  Disable ANSI colors (also honors the NO_COLOR env var)
+      --no-fullscreen
+      --no-spinner
+      --no-thinking-summary
+      --no-stream
+      --preprocessor | --no-preprocessor
+      --preprocessor-provider <name>
+      --preprocessor-model <id|provider/id>
+      --preprocessor-base-url <url>
+      --preprocessor-api-key <key>
+      --preprocessor-max-output-tokens <n>
+      --prompt-label <text>
+      --transcript-max-lines <n>
+      --append-system-prompt <text>         Inline text appended to system prompt for this run
+      --append-system-prompt-file <path>    Read append-system-prompt from a file
+      --strict
+      --approve-high
+  -y, --yolo                      Auto-approve high-risk tool calls (use with care)
+  -v, --verbose                   Log extra diagnostic info to stderr
+  -q, --quiet                     Suppress non-essential output (spinner, thinking summary)
+      --log-level <level>         debug | info | warn (default) | error
+      --log-format <text|json>    Log format on stderr (json is aggregator-friendly)
+      --accessible                Screen-reader friendly: no color, no spinner, no fullscreen, no reasoning-summary animation
+      --list-env                  Print every environment variable zcode reads, with current value (secrets redacted)
+  -c, --continue                  Resume most recent session
+  -r, --resume <id>               Resume specific session by ID
+
+Exit codes:
+  0    Success.
+  1    Runtime error (provider failure, tool error, non-config problem).
+  2    Invalid configuration, flags, or arguments; strict-mode violation.
+  130  Interrupted by user (SIGINT / Ctrl+C).
+.fi
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Runtime error (provider failure, tool error, non-configuration problem).
+.TP
+.B 2
+Invalid configuration, flags, or arguments; strict-mode violation.
+.TP
+.B 130
+Interrupted by user (SIGINT / Ctrl+C).
+.SH FILES
+.TP
+.B ~/.zcode/config.toml
+User configuration file.
+.TP
+.B /etc/zcode/managed.toml
+System-level managed config (overrides user config).
+.TP
+.B ~/.zcode/logs/audit-*.jsonl
+HMAC-chained audit log.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+If set (non-empty), suppresses ANSI color output.
+.TP
+.B ZCODE_*
+All zcode-consumed environment variables are listed by \fBzcode --list-env\fR.
+.SH REPORTING BUGS
+https://github.com/Softorize/zcode/issues
+.SH SEE ALSO
+\fBgit\fR(1), \fBjq\fR(1)
