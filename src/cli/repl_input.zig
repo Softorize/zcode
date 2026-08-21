@@ -51,16 +51,49 @@ pub const TerminalRawMode = struct {
     pub fn disable(self: *TerminalRawMode) void {
         if (!self.enabled) return;
         const fd = std.Io.File.stdin().handle;
-        std.posix.tcsetattr(fd, .NOW, self.saved) catch {};
         const stdout_h = std.Io.File.stdout().handle;
+        // Write the protocol resets while the terminal is STILL in raw mode, so
+        // nothing the terminal says in reply can be echoed by the line
+        // discipline.
         // Disable any mouse reporting that might have been left on by
         // a prior version of zcode in the same TTY.
         _ = std.c.write(stdout_h, ("\x1b[?1006l\x1b[?1000l").ptr, ("\x1b[?1006l\x1b[?1000l").len);
         // Disable Kitty keyboard protocol
         _ = std.c.write(stdout_h, ("\x1b[<u").ptr, ("\x1b[<u").len);
+        // Discard anything still sitting unread in the tty input buffer BEFORE
+        // handing the line discipline back with ECHO and ICANON on. Startup
+        // fires an async XTVERSION probe (CSI > 0 q) whose DCS answer arrives
+        // whenever the terminal gets round to it; on a short-lived session
+        // (declining the trust gate, an early error) that answer can still be
+        // in flight at teardown. Restoring the termios first -- which is what
+        // this used to do -- lets the kernel echo those bytes onto the user's
+        // shell prompt as literal text like `ghostty 1.3.1`, and leaves them in
+        // the shell's line buffer as if they had been typed.
+        drainPendingInput(fd);
+        std.posix.tcsetattr(fd, .NOW, self.saved) catch {};
         self.enabled = false;
     }
 };
+
+/// Discard whatever is already buffered on `fd`, without blocking. Bounded so a
+/// terminal that streams input forever cannot wedge shutdown -- anything past
+/// the cap is left for the shell, which is strictly better than never
+/// returning. Called with the tty still in raw mode; see `TerminalRawMode.disable`.
+fn drainPendingInput(fd: std.posix.fd_t) void {
+    var scratch: [256]u8 = undefined;
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        var poll_fds = [1]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&poll_fds, 0) catch return;
+        if (ready == 0) return;
+        const n = std.posix.read(fd, &scratch) catch return;
+        if (n == 0) return;
+    }
+}
 
 pub const InputEvent = enum {
     none,

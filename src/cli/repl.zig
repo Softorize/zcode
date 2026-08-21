@@ -5929,6 +5929,23 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
     // window. Best-effort. See ADR 0009.
     defer kairos_lock.clearPresence(allocator, options_in.status_workspace);
 
+    // Declining the trust gate used to return silently. Everything the gate
+    // drew lives on the alternate screen, so tearing that screen down took the
+    // explanation with it and the user landed back at their shell prompt with
+    // no output at all -- indistinguishable from "zcode did not start". Say
+    // what happened, on the normal screen, and name the way forward.
+    //
+    // This defer is declared BEFORE the terminal-cleanup defer below so that
+    // LIFO ordering runs it AFTER the alternate screen is gone; printing any
+    // earlier just writes into a buffer that is about to be discarded.
+    var trust_declined = false;
+    defer if (trust_declined) {
+        const msg = "zcode: exited without starting -- this folder is not trusted.\n" ++
+            "  Run zcode again and choose \"Yes, proceed\" to trust it for future sessions,\n" ++
+            "  or trust it up front with: zcode trust allow .\n";
+        _ = std.c.write(std.Io.File.stderr().handle, msg.ptr, msg.len);
+    };
+
     // Force-stop the sleep guard on REPL exit (background-svc-07 cleanup
     // hook). The caffeinate `-w <pid>` tie already kills the child when
     // zcode dies, but this also joins the restart thread cleanly on a
@@ -6008,7 +6025,9 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
         if (try runTrustGate(allocator, options.status_workspace, options.bottom_margin_rows)) {
             // Declined: exit the REPL cleanly. The terminal-cleanup defers above
             // restore the screen; returning here matches the reference's
-            // gracefulShutdown on decline (no tool ever runs).
+            // gracefulShutdown on decline (no tool ever runs). The flag makes
+            // the exit explain itself once the alternate screen is torn down.
+            trust_declined = true;
             return;
         }
     }
