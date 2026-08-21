@@ -246,20 +246,65 @@ fn realUserHome() ?[]const u8 {
     return std.mem.span(dir);
 }
 
-/// Build the `security add-generic-password` argument vector. The secret
-/// is deliberately NOT part of this vector -- it is fed on stdin via the
-/// trailing `-w` flag. Factored out so tests can assert the argv never
-/// carries the secret. `account` and `kc_path` are borrowed by the
-/// returned slice array.
-fn macosSetArgv(account: []const u8, kc_path: []const u8) [9][]const u8 {
+/// Build the `security add-generic-password` argument vector for the
+/// stdin path. The secret is deliberately NOT part of this vector -- it
+/// is fed on stdin via the trailing bare `-w` flag. Factored out so
+/// tests can assert the argv never carries the secret. `account` is
+/// borrowed by the returned slice array.
+///
+/// `-w` MUST be the final element. `security add-generic-password`
+/// parses `-w` as taking an optional value, so ANY argument that follows
+/// it is consumed as the password. An earlier version of this function
+/// appended the login-keychain path after `-w`, which meant every secret
+/// was silently replaced by the literal string
+/// "/Users/<you>/Library/Keychains/login.keychain-db" -- and `security`
+/// still exited 0, so the corruption was invisible until the value was
+/// read back and failed to parse.
+///
+/// That is also why there is no keychain positional here: with a bare
+/// `-w` it is unrepresentable. We accept the default keychain, and
+/// `setMacos` keeps `macosSetArgvExplicitPath` as a fallback for the
+/// contexts where the default-keychain lookup fails (-25307).
+fn macosSetArgv(account: []const u8) [8][]const u8 {
     return [_][]const u8{
         "/usr/bin/security", "add-generic-password",
         "-s",                service_name,
         "-a",                account,
         "-U", // update if exists
-        "-w", // read password from stdin (no value follows)
-        kc_path,
+        "-w", // read password from stdin; MUST stay last
     };
+}
+
+/// Fallback argv that names the keychain explicitly. `-w` takes the
+/// secret as its value here, so the secret IS visible in this process's
+/// argument vector -- only used when the stdin form above fails, which
+/// means the default-keychain lookup did not resolve.
+fn macosSetArgvExplicitPath(
+    account: []const u8,
+    secret: []const u8,
+    kc_path: []const u8,
+) [10][]const u8 {
+    return [_][]const u8{
+        "/usr/bin/security", "add-generic-password",
+        "-s",                service_name,
+        "-a",                account,
+        "-U",                "-w",
+        secret,              kc_path,
+    };
+}
+
+/// `security` prompts twice for a stdin password ("password data for new
+/// item:" then "retype password for new item:") and compares the two
+/// lines. Send the secret twice, each newline-terminated; a single copy
+/// leaves the retype unsatisfied and `security` stores nothing.
+/// Caller owns the returned memory.
+fn macosStdinPayload(allocator: std.mem.Allocator, secret: []const u8) Error![]u8 {
+    const buf = allocator.alloc(u8, (secret.len + 1) * 2) catch return Error.OutOfMemory;
+    @memcpy(buf[0..secret.len], secret);
+    buf[secret.len] = '\n';
+    @memcpy(buf[secret.len + 1 ..][0..secret.len], secret);
+    buf[buf.len - 1] = '\n';
+    return buf;
 }
 
 fn setMacos(allocator: std.mem.Allocator, account: []const u8, secret: []const u8) Error!void {
@@ -267,16 +312,31 @@ fn setMacos(allocator: std.mem.Allocator, account: []const u8, secret: []const u
     // duplicates. Errors from delete are ignored.
     _ = deleteMacos(allocator, account) catch {};
 
-    const kc_path = try loginKeychainPath(allocator);
-    defer allocator.free(kc_path);
+    // Prefer the stdin form: the secret never appears in the process
+    // argument vector where another user's `ps` / process monitor could
+    // observe it. A secret containing a newline cannot survive the
+    // line-oriented prompt protocol, so those go straight to the
+    // explicit-path form.
+    if (std.mem.indexOfAny(u8, secret, "\r\n") == null) {
+        if (setMacosStdin(allocator, account, secret)) |_| {
+            return;
+        } else |err| switch (err) {
+            // Retrying with the path spelled out will not unlock a
+            // locked keychain -- surface it so the caller can show the
+            // unlock hint instead of masking it as a store failure.
+            Error.KeychainLocked => return err,
+            else => {},
+        }
+    }
 
-    // Pass the secret on stdin, NOT on argv. `add-generic-password -w`
-    // with no following value reads the password from stdin (when stdin
-    // is a pipe it does not prompt), so the secret never appears in the
-    // process argument vector where another user's `ps` / process monitor
-    // could observe it. This mirrors the Linux `secret-tool store` stdin
-    // path above.
-    const argv = macosSetArgv(account, kc_path);
+    return setMacosExplicitPath(allocator, account, secret);
+}
+
+fn setMacosStdin(allocator: std.mem.Allocator, account: []const u8, secret: []const u8) Error!void {
+    const argv = macosSetArgv(account);
+
+    const payload = try macosStdinPayload(allocator, secret);
+    defer allocator.free(payload);
 
     var child = std.process.spawn(rt.io, .{
         .argv = &argv,
@@ -285,12 +345,34 @@ fn setMacos(allocator: std.mem.Allocator, account: []const u8, secret: []const u
         .stderr = .ignore,
     }) catch return Error.BackendUnavailable;
     if (child.stdin) |stdin_file| {
-        stdin_file.writeStreamingAll(rt.io, secret) catch {};
+        stdin_file.writeStreamingAll(rt.io, payload) catch {};
         stdin_file.close(rt.io);
         child.stdin = null;
     }
     const term = child.wait(rt.io) catch return Error.StoreFailed;
     switch (term) {
+        .exited => |code| {
+            if (code == macos_keychain_locked_exit) return Error.KeychainLocked;
+            if (code != 0) return Error.StoreFailed;
+        },
+        else => return Error.StoreFailed,
+    }
+}
+
+fn setMacosExplicitPath(allocator: std.mem.Allocator, account: []const u8, secret: []const u8) Error!void {
+    const kc_path = try loginKeychainPath(allocator);
+    defer allocator.free(kc_path);
+
+    const argv = macosSetArgvExplicitPath(account, secret, kc_path);
+    const result = std.process.run(allocator, rt.io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return Error.BackendUnavailable;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
         .exited => |code| {
             if (code == macos_keychain_locked_exit) return Error.KeychainLocked;
             if (code != 0) return Error.StoreFailed;
@@ -686,19 +768,48 @@ test "macos set argv never carries the secret" {
     // the secret. Pure argv-construction check -- runs on every platform.
     const secret = "sk-super-secret-token-value"; // sast: allow
     const account = "zcode-test-argv";
-    const kc_path = "/Users/example/Library/Keychains/login.keychain-db";
 
-    const argv = macosSetArgv(account, kc_path);
+    const argv = macosSetArgv(account);
     for (argv) |arg| {
         try testing.expect(!std.mem.eql(u8, arg, secret));
         try testing.expect(std.mem.indexOf(u8, arg, secret) == null);
     }
 
-    // The trailing flag must be a bare `-w` (read from stdin) with no
-    // password value following it.
-    try testing.expectEqualStrings("-w", argv[argv.len - 2]);
-    try testing.expectEqualStrings(kc_path, argv[argv.len - 1]);
     try testing.expectEqualStrings(account, argv[5]);
+}
+
+test "macos set argv ends with a bare -w so stdin supplies the password" {
+    // Regression guard. `security add-generic-password` treats `-w` as
+    // taking an optional value: whatever follows it on argv BECOMES the
+    // password. A previous version appended the login-keychain path here,
+    // so every stored secret was silently overwritten with that path
+    // while `security` exited 0 -- the corruption only surfaced later, as
+    // an unparseable value on read-back. Nothing may follow `-w`.
+    const argv = macosSetArgv("zcode-test-argv");
+    try testing.expectEqualStrings("-w", argv[argv.len - 1]);
+}
+
+test "macos stdin payload repeats the secret for the retype prompt" {
+    // `security` asks for the password twice and compares the two lines;
+    // sending one copy leaves the retype unsatisfied and stores nothing.
+    const secret = "sk-super-secret-token-value"; // sast: allow
+    const payload = try macosStdinPayload(testing.allocator, secret);
+    defer testing.allocator.free(payload);
+
+    try testing.expectEqualStrings(secret ++ "\n" ++ secret ++ "\n", payload);
+}
+
+test "macos explicit-path fallback puts the keychain after the secret" {
+    // The fallback form spells the keychain out, which is only legal
+    // because `-w` consumes the secret as its value first. Order matters:
+    // secret then keychain path, both trailing.
+    const secret = "sk-super-secret-token-value"; // sast: allow
+    const kc_path = "/Users/example/Library/Keychains/login.keychain-db";
+
+    const argv = macosSetArgvExplicitPath("zcode-test-argv", secret, kc_path);
+    try testing.expectEqualStrings("-w", argv[argv.len - 3]);
+    try testing.expectEqualStrings(secret, argv[argv.len - 2]);
+    try testing.expectEqualStrings(kc_path, argv[argv.len - 1]);
 }
 
 test "macos locked-keychain exit code maps to a distinct error" {
