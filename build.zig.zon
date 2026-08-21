@@ -1,6 +1,6 @@
 .{
     .name = .zcode,
-    .version = "0.12.47",
+    .version = "0.12.48",
     .fingerprint = 0x2311e0f7747bc9a1,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

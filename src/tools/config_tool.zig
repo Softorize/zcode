@@ -32,21 +32,34 @@ pub const Kind = enum {
     enumerated,
 };
 
-/// One row of the supported-settings allowlist. `field_name` is the persisted
-/// config-file key (config.toml). `options` is only meaningful for `.enumerated`.
+/// One row of the supported-settings allowlist. `options` is only meaningful
+/// for `.enumerated`.
 pub const Setting = struct {
-    /// Model-facing key (also the persisted config-file key).
+    /// Model-facing key, as `/config` and the model refer to it.
     key: []const u8,
     kind: Kind,
     options: []const []const u8 = &.{},
+    /// The config.toml key this setting persists to, when it differs from the
+    /// model-facing `key`. `theme` and `model` are the short names the UI
+    /// speaks; `config_parse.applyKeyValue` only knows them as `ui_theme` and
+    /// `default_model`. Persisting under the short name wrote a key that could
+    /// never be read back: the setting was silently lost on the next launch and
+    /// zcode warned "unknown key 'theme' (ignored)" about a line it had written
+    /// itself.
+    config_key: ?[]const u8 = null,
+
+    /// The key to write into config.toml.
+    pub fn configKey(self: Setting) []const u8 {
+        return self.config_key orelse self.key;
+    }
 };
 
 /// The full set of settings the model may read/write. Intentionally tiny: only
 /// safe-to-mutate runtime settings the `/config`, `/model`, and `/permissions`
 /// REPL commands already surface. No secrets, no api keys, no tokens.
 pub const supported = [_]Setting{
-    .{ .key = "theme", .kind = .theme },
-    .{ .key = "model", .kind = .string },
+    .{ .key = "theme", .kind = .theme, .config_key = "ui_theme" },
+    .{ .key = "model", .kind = .string, .config_key = "default_model" },
     .{ .key = "approval_mode", .kind = .enumerated, .options = &.{ "tiered-auto", "manual", "strict" } },
     .{ .key = "output_style", .kind = .string },
 };
@@ -168,7 +181,7 @@ pub fn applyWrite(
     const previous = try allocator.dupe(u8, target.*);
     try cfg.setOwnedString(allocator, target, stored);
 
-    config_parse.persistUserConfigField(allocator, setting.key, stored) catch |err| {
+    config_parse.persistUserConfigField(allocator, setting.configKey(), stored) catch |err| {
         // Non-fatal: the in-memory mutation already took effect, matching the
         // REPL path which also degrades gracefully when persistence fails.
         std.log.warn("config tool: failed to persist '{s}': {s}", .{ setting.key, @errorName(err) });
@@ -244,6 +257,23 @@ pub fn run(
 
 const testing = std.testing;
 const rt = @import("zcode_runtime");
+
+test "every persisted config key round-trips through the parser" {
+    // Regression guard. The config tool used to persist under its model-facing
+    // key, so `/config set theme light` wrote `theme = light` -- a key
+    // applyKeyValue does not recognize. The setting was dropped on the next
+    // launch and zcode warned about a line it had written itself, forever.
+    // Every key we write must be one the parser accepts.
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+
+    for (supported) |setting| {
+        config_parse.applyKeyValue(testing.allocator, &cfg, setting.configKey(), "x") catch |err| {
+            std.debug.print("config key '{s}' is not readable by applyKeyValue: {s}\n", .{ setting.configKey(), @errorName(err) });
+            return err;
+        };
+    }
+}
 
 test "config read returns current value and is read-only" {
     rt.installForTest();
