@@ -26,6 +26,7 @@ const mcp_client = @import("mcp/client.zig");
 const browser_bridge_mod = @import("mcp/browser_bridge.zig");
 
 const session_mgmt = @import("session_mgmt.zig");
+const provider_login = @import("provider_login.zig");
 const sdk_headless = @import("sdk/headless.zig");
 const sdk_output = @import("sdk/output.zig");
 const sdk_stdout_guard = @import("sdk/stdout_guard.zig");
@@ -1180,7 +1181,21 @@ fn dispatch(
             if (err == error.BrokenPipe) std.process.exit(0);
             return err;
         },
-        .providers_login => try session_mgmt.cmdProvidersLogin(opts.subject orelse cfg.default_provider, stdout),
+        .login => try provider_login.cmdLogin(
+            allocator,
+            cfg,
+            if (opts.login_method) |flag| provider_login.Method.fromFlag(flag) else null,
+            stdout,
+        ),
+        // `providers login` predates `zcode login` and used to just print an
+        // env-var name. Route it at the real flow so the two are not two
+        // different answers to the same question.
+        .providers_login => try provider_login.cmdLogin(
+            allocator,
+            cfg,
+            if (opts.login_method) |flag| provider_login.Method.fromFlag(flag) else null,
+            stdout,
+        ),
         .providers_logout => try session_mgmt.cmdProvidersLogout(opts.subject orelse cfg.default_provider, stdout),
         .providers_status => try session_mgmt.cmdProvidersStatus(allocator, cfg, stdout),
         .keychain_set => try session_mgmt.cmdKeychainSet(allocator, opts.subject, opts.prompt, stdout),
@@ -1746,6 +1761,8 @@ comptime {
     _ = @import("providers/circuit_breaker.zig");
     _ = @import("providers/extractors.zig");
     _ = @import("providers/mod.zig");
+    _ = @import("provider_login.zig");
+    _ = @import("core/oauth_loopback.zig");
     _ = @import("review_flow.zig");
     _ = @import("core/cost.zig");
     _ = @import("core/model_usage.zig");

@@ -5,9 +5,10 @@ const rng = @import("../core/rng.zig");
 const clock = @import("../core/clock.zig");
 const http_common = @import("../providers/common.zig");
 const egress = @import("../core/egress.zig");
+const oauth_loopback = @import("../core/oauth_loopback.zig");
 
-const default_callback_port: u16 = 8765;
-const default_timeout_seconds: i32 = 120;
+const default_callback_port: u16 = oauth_loopback.default_callback_port;
+const default_timeout_seconds: i32 = oauth_loopback.default_timeout_seconds;
 const http_timeout_ms: u32 = 20_000;
 
 pub const OAuthResult = struct {
@@ -751,69 +752,15 @@ fn parseBearerChallenge(allocator: std.mem.Allocator, header: []const u8) !Unaut
     return out;
 }
 
-fn openBrowserUrl(allocator: std.mem.Allocator, url: []const u8) !void {
-    const argv = switch (@import("builtin").os.tag) {
-        .macos => [_][]const u8{ "open", url },
-        .linux => [_][]const u8{ "xdg-open", url },
-        .windows => [_][]const u8{ "rundll32", "url.dll,FileProtocolHandler", url },
-        else => return error.UnsupportedPlatform,
-    };
-    const result = try std.process.run(allocator, rt.io, .{
-        .argv = &argv,
-        .stdout_limit = .limited(8 * 1024),
-        .stderr_limit = .limited(8 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (!(result.term == .exited and result.term.exited == 0)) return error.McpOAuthBrowserOpenFailed;
-}
+const openBrowserUrl = oauth_loopback.openBrowserUrl;
 
-fn acceptWithTimeout(server: *std.Io.net.Server, timeout_ms: i32) !std.Io.net.Stream {
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = server.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&poll_fds, timeout_ms);
-    if (ready <= 0) return error.McpOAuthTimeout;
-    const accepted = try server.accept(rt.io);
-    return accepted;
-}
+const acceptWithTimeout = oauth_loopback.acceptWithTimeout;
 
-fn readHttpRequest(allocator: std.mem.Allocator, stream: std.Io.net.Stream) ![]u8 {
-    var out = std_io.StringBuilder.init(allocator);
-    defer out.deinit();
+const readHttpRequest = oauth_loopback.readHttpRequest;
 
-    var buf: [1024]u8 = undefined;
-    while (true) {
-        const n = try std_io.streamRead(stream, &buf);
-        if (n == 0) break;
-        try out.appendSlice(buf[0..n]);
-        if (std.mem.indexOf(u8, out.items(), "\r\n\r\n") != null) break;
-        if (out.items().len > 16 * 1024) return error.HttpHeaderTooLarge;
-    }
-    return out.toOwnedSlice();
-}
+const requestQuery = oauth_loopback.requestQuery;
 
-fn requestQuery(request: []const u8) ?[]const u8 {
-    const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse request.len;
-    const first_line = request[0..first_line_end];
-    const first_space = std.mem.indexOfScalar(u8, first_line, ' ') orelse return null;
-    const second_space = std.mem.lastIndexOfScalar(u8, first_line, ' ') orelse return null;
-    if (second_space <= first_space) return null;
-    const target = first_line[first_space + 1 .. second_space];
-    const query_idx = std.mem.indexOfScalar(u8, target, '?') orelse return null;
-    return target[query_idx + 1 ..];
-}
-
-fn getQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
-    }
-    return null;
-}
+const getQueryParam = oauth_loopback.getQueryParam;
 
 fn parseCallbackPayload(allocator: std.mem.Allocator, query: []const u8) !CallbackPayload {
     if (getQueryParam(query, "error")) |value| {
@@ -856,77 +803,17 @@ fn parseCallbackPayload(allocator: std.mem.Allocator, query: []const u8) !Callba
     } };
 }
 
-fn percentDecodeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out = std_io.StringBuilder.init(allocator);
-    defer out.deinit();
+const percentDecodeAlloc = oauth_loopback.percentDecodeAlloc;
 
-    var i: usize = 0;
-    while (i < input.len) : (i += 1) {
-        if (input[i] == '%' and i + 2 < input.len) {
-            const hi = std.fmt.charToDigit(input[i + 1], 16) catch {
-                try out.append(input[i]);
-                continue;
-            };
-            const lo = std.fmt.charToDigit(input[i + 2], 16) catch {
-                try out.append(input[i]);
-                continue;
-            };
-            try out.append(@as(u8, @intCast((hi << 4) | lo)));
-            i += 2;
-            continue;
-        }
-        if (input[i] == '+') {
-            try out.append(' ');
-            continue;
-        }
-        try out.append(input[i]);
-    }
+const urlEncodeAlloc = oauth_loopback.urlEncodeAlloc;
 
-    return out.toOwnedSlice();
-}
+const randomUrlToken = oauth_loopback.randomUrlToken;
 
-fn urlEncodeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out = std_io.StringBuilder.init(allocator);
-    defer out.deinit();
-    for (input) |ch| {
-        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
-            try out.append(ch);
-        } else {
-            try out.writer().print("%{X:0>2}", .{ch});
-        }
-    }
-    return out.toOwnedSlice();
-}
+const pkceChallenge = oauth_loopback.pkceChallenge;
 
-fn randomUrlToken(allocator: std.mem.Allocator, byte_len: usize) ![]u8 {
-    const bytes = try allocator.alloc(u8, byte_len);
-    defer allocator.free(bytes);
-    rng.secureBytes(bytes);
-    return base64UrlNoPadAlloc(allocator, bytes);
-}
+const base64UrlNoPadAlloc = oauth_loopback.base64UrlNoPadAlloc;
 
-fn pkceChallenge(allocator: std.mem.Allocator, verifier: []const u8) ![]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    return base64UrlNoPadAlloc(allocator, &digest);
-}
-
-fn base64UrlNoPadAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const encoded_len = std.base64.url_safe.Encoder.calcSize(bytes.len);
-    const buf = try allocator.alloc(u8, encoded_len);
-    errdefer allocator.free(buf);
-    const written = std.base64.url_safe.Encoder.encode(buf, bytes);
-    var unpadded_len = written.len;
-    while (unpadded_len > 0 and buf[unpadded_len - 1] == '=') unpadded_len -= 1;
-    return allocator.realloc(buf, unpadded_len);
-}
-
-fn writeHttpResponse(stream: std.Io.net.Stream, body: []const u8) !void {
-    var header: [256]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&header, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
-    try std_io.streamWriteAll(stream, prefix);
-    try std_io.streamWriteAll(stream, body);
-}
+const writeHttpResponse = oauth_loopback.writeHttpResponse;
 
 fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;

@@ -16,6 +16,7 @@ pub const CommandKind = enum {
     models_list,
     models_test,
     providers_login,
+    login,
     providers_logout,
     providers_status,
     session_list,
@@ -178,6 +179,8 @@ pub const CliOptions = struct {
     command: CommandKind = .repl,
     prompt: ?[]const u8 = null,
     subject: ?[]const u8 = null,
+    /// Which `zcode login` path was named on the command line (`--local`, ...).
+    login_method: ?[]const u8 = null,
     /// session export <id> md|markdown -> emit Markdown instead of JSON.
     markdown: bool = false,
     model: ?[]const u8 = null,
@@ -719,6 +722,16 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
                 };
                 options._owned_append_system_prompt = bytes;
                 options.append_system_prompt = bytes;
+            } else if (std.mem.eql(u8, arg, "--anthropic") or
+                std.mem.eql(u8, arg, "--openrouter") or
+                std.mem.eql(u8, arg, "--local") or
+                std.mem.eql(u8, arg, "--oauth") or
+                std.mem.eql(u8, arg, "--browser"))
+            {
+                // `zcode login --local` and friends. Kept in its own field so a
+                // stray `--local` on some other command cannot be mistaken for
+                // that command's subject.
+                options.login_method = arg[2..];
             } else if (std.mem.eql(u8, arg, "--continue")) {
                 options.command = .session_continue;
             } else if (std.mem.eql(u8, arg, "--resume") or std.mem.startsWith(u8, arg, "--resume=")) {
@@ -861,8 +874,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
                 \\  status              Print each provider with its configured=true/false
                 \\                      and where the key was resolved from (env, keychain,
                 \\                      config, default).
-                \\  login [provider]    Print the env-var name to export for [provider]
-                \\                      (or the default provider when omitted).
+                \\  login [provider]    Interactive sign-in: API key, local model, or
+                \\                      browser OAuth. Same as `zcode login`.
                 \\  logout [provider]   Print the env-var name to unset.
                 \\
                 \\Providers are provisioned via either the keychain (`zcode keychain set`)
@@ -887,6 +900,16 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
             return options;
         }
         return error.UnknownSubcommand;
+    }
+    if (std.mem.eql(u8, head, "login")) {
+        // `zcode login` with no argument asks; the flags let scripts and the
+        // docs name one path directly.
+        options.command = .login;
+        // `zcode login local` reads as well as `zcode login --local`; accept both.
+        if (options.login_method == null and positional.items.len > 1) {
+            options.login_method = positional.items[1];
+        }
+        return options;
     }
     if (std.mem.eql(u8, head, "session")) {
         if (positional.items.len < 2) {
