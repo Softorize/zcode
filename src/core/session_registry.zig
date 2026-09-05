@@ -129,6 +129,42 @@ pub const Entry = struct {
         if (self.log_path) |s| allocator.free(s);
         if (self.waiting_for) |s| allocator.free(s);
     }
+
+    /// sessions-storage-07: serialize with the reference's camelCase key
+    /// names (`sessionId`, `startedAt`, `updatedAt`, `logPath`, `waitingFor`
+    /// -- edualc/src/utils/concurrentSessions.ts:76-92) instead of Zig's
+    /// default snake_case field-name passthrough, so a registry file zcode
+    /// writes matches what the reference (and any tool built against its
+    /// shape) expects. `pid`/`cwd`/`kind`/`name`/`status` are already
+    /// single-word and need no renaming. `readFile` below accepts EITHER
+    /// spelling on read (camelCase preferred, snake_case as a fallback) so
+    /// an in-flight registry file written by a pre-upgrade zcode binary --
+    /// or a test fixture that hand-writes the legacy shape, e.g.
+    /// `bg_cmds.zig`'s `writeRawEntry` -- still parses correctly.
+    pub fn jsonStringify(self: Entry, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("pid");
+        try jws.write(self.pid);
+        try jws.objectField("sessionId");
+        try jws.write(self.session_id);
+        try jws.objectField("cwd");
+        try jws.write(self.cwd);
+        try jws.objectField("startedAt");
+        try jws.write(self.started_ts);
+        try jws.objectField("updatedAt");
+        try jws.write(self.updated_ts);
+        try jws.objectField("kind");
+        try jws.write(self.kind);
+        try jws.objectField("name");
+        try jws.write(self.name);
+        try jws.objectField("logPath");
+        try jws.write(self.log_path);
+        try jws.objectField("status");
+        try jws.write(self.status);
+        try jws.objectField("waitingFor");
+        try jws.write(self.waiting_for);
+        try jws.endObject();
+    }
 };
 
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
@@ -466,20 +502,24 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) !?Entry {
     const pid_i = getInteger(obj, "pid") orelse return null;
     const cwd_src = getString(obj, "cwd") orelse return null;
 
+    // sessions-storage-07: prefer the reference's camelCase keys, falling
+    // back to zcode's pre-camelCase snake_case keys for one release so an
+    // already-written registry file (or a hand-written test fixture, e.g.
+    // bg_cmds.zig's writeRawEntry) still parses.
     var entry = Entry{
         .pid = @intCast(pid_i),
         .cwd = try allocator.dupe(u8, cwd_src),
-        .started_ts = getInteger(obj, "started_ts") orelse 0,
-        .updated_ts = getInteger(obj, "updated_ts") orelse 0,
+        .started_ts = getIntegerEither(obj, "startedAt", "started_ts") orelse 0,
+        .updated_ts = getIntegerEither(obj, "updatedAt", "updated_ts") orelse 0,
         .kind = if (getString(obj, "kind")) |k| SessionKind.fromString(k) else .interactive,
         .status = if (getString(obj, "status")) |s| SessionStatus.fromString(s) else .idle,
     };
     errdefer entry.deinit(allocator);
 
-    if (getString(obj, "session_id")) |s| entry.session_id = try allocator.dupe(u8, s);
+    if (getStringEither(obj, "sessionId", "session_id")) |s| entry.session_id = try allocator.dupe(u8, s);
     if (getString(obj, "name")) |s| entry.name = try allocator.dupe(u8, s);
-    if (getString(obj, "log_path")) |s| entry.log_path = try allocator.dupe(u8, s);
-    if (getString(obj, "waiting_for")) |s| entry.waiting_for = try allocator.dupe(u8, s);
+    if (getStringEither(obj, "logPath", "log_path")) |s| entry.log_path = try allocator.dupe(u8, s);
+    if (getStringEither(obj, "waitingFor", "waiting_for")) |s| entry.waiting_for = try allocator.dupe(u8, s);
 
     return entry;
 }
@@ -515,6 +555,16 @@ fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+/// sessions-storage-07: try the reference's camelCase key first, then
+/// zcode's pre-camelCase snake_case key.
+fn getStringEither(obj: std.json.ObjectMap, camel: []const u8, snake: []const u8) ?[]const u8 {
+    return getString(obj, camel) orelse getString(obj, snake);
+}
+
+fn getIntegerEither(obj: std.json.ObjectMap, camel: []const u8, snake: []const u8) ?i64 {
+    return getInteger(obj, camel) orelse getInteger(obj, snake);
 }
 
 /// Best-effort WSL probe: WSL sets WSL_DISTRO_NAME / WSL_INTEROP. On WSL the
@@ -830,6 +880,88 @@ test "pidFromFilename strict guard" {
     try testing.expectEqual(@as(?i32, null), pidFromFilename("notes.md"));
     try testing.expectEqual(@as(?i32, null), pidFromFilename(".json"));
     try testing.expectEqual(@as(?i32, null), pidFromFilename("12a.json"));
+}
+
+// sessions-storage-07: the registry file's on-disk keys match the reference
+// (camelCase), not zcode's old snake_case.
+test "register writes camelCase keys (sessionId/startedAt/updatedAt/logPath/waitingFor), not snake_case" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    setRegistryRoot(root_z);
+    defer clearRegistryRoot();
+
+    try register(alloc, .{ .kind = .interactive, .cwd = "/work/proj", .name = "myproj", .session_id = "sess-1" });
+    defer unregister(alloc);
+
+    const dir = try registryDir(alloc);
+    defer alloc.free(dir);
+    const path = try pidFilePath(alloc, dir, currentPid());
+    defer alloc.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, alloc, .limited(64 * 1024));
+    defer alloc.free(bytes);
+
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"sessionId\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"startedAt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"updatedAt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"logPath\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"waitingFor\"") != null);
+
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"session_id\"") == null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"started_ts\"") == null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"updated_ts\"") == null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"log_path\"") == null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"waiting_for\"") == null);
+
+    // And it still round-trips through the reader.
+    const parsed = (try read(alloc, currentPid())).?;
+    defer parsed.deinit(alloc);
+    try testing.expectEqualStrings("sess-1", parsed.session_id.?);
+}
+
+// sessions-storage-07: an in-flight registry file written by a pre-upgrade
+// zcode binary (or a fixture like bg_cmds.zig's writeRawEntry) uses the old
+// snake_case keys; the reader must still parse it correctly for one release.
+test "readFile falls back to legacy snake_case keys" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    setRegistryRoot(root_z);
+    defer clearRegistryRoot();
+
+    const dir = try registryDir(alloc);
+    defer alloc.free(dir);
+    try paths.ensureDir(dir);
+
+    const pid: i32 = 987654;
+    const path = try pidFilePath(alloc, dir, pid);
+    defer alloc.free(path);
+    const file = try std.Io.Dir.cwd().createFile(rt.io, path, .{ .truncate = true });
+    defer file.close(rt.io);
+    try file.writeStreamingAll(rt.io,
+        \\{"pid":987654,"cwd":"/legacy","started_ts":111,"updated_ts":222,"kind":"bg","session_id":"legacy-sess","log_path":"/legacy.log","waiting_for":"tool"}
+    );
+
+    const entry = (try read(alloc, pid)).?;
+    defer entry.deinit(alloc);
+
+    try testing.expectEqualStrings("/legacy", entry.cwd);
+    try testing.expectEqual(@as(i64, 111), entry.started_ts);
+    try testing.expectEqual(@as(i64, 222), entry.updated_ts);
+    try testing.expectEqual(SessionKind.bg, entry.kind);
+    try testing.expectEqualStrings("legacy-sess", entry.session_id.?);
+    try testing.expectEqualStrings("/legacy.log", entry.log_path.?);
+    try testing.expectEqualStrings("tool", entry.waiting_for.?);
 }
 
 fn fileExists(path: []const u8) bool {

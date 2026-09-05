@@ -111,6 +111,32 @@ pub fn claudeHomePathAlloc(allocator: std.mem.Allocator, rel: []const u8) ![]u8 
     return std.fs.path.join(allocator, &.{ home, rel });
 }
 
+/// config-layout-missed-149: the reference's OS-standard enterprise
+/// managed-settings.json install path -- an admin-owned, unprivileged-user-
+/// unwritable location distinct from zcode's own user-writable
+/// `{zcode_home}/policy/settings.json` (which `settings_sources.zig`'s
+/// `.policy` source already reads, and which a non-admin user can freely
+/// edit -- defeating the point of a managed tier the user themselves cannot
+/// override). Returns null on a platform with no defined reference path
+/// (only macOS/Linux/Windows are, per the reference's own deployment docs).
+///
+/// `ZCODE_MANAGED_SETTINGS_JSON` overrides the OS default for CI/testing,
+/// mirroring `config_parse.resolveManagedConfigPath`'s
+/// `ZCODE_MANAGED_CONFIG` override for the same reason: the real path is a
+/// fixed absolute system location that test fixtures must never touch.
+pub fn managedSettingsJsonPath(allocator: std.mem.Allocator) !?[]u8 {
+    if (@import("env.zig").getenv("ZCODE_MANAGED_SETTINGS_JSON")) |p| {
+        const trimmed = std.mem.trim(u8, p, " \t\r\n");
+        if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+    }
+    return switch (@import("builtin").os.tag) {
+        .macos => try allocator.dupe(u8, "/Library/Application Support/ClaudeCode/managed-settings.json"),
+        .linux => try allocator.dupe(u8, "/etc/claude-code/managed-settings.json"),
+        .windows => try allocator.dupe(u8, "C:\\Program Files\\ClaudeCode\\managed-settings.json"),
+        else => null,
+    };
+}
+
 pub fn workspaceConfigPath(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
     return workspacePathAlloc(allocator, cwd, "config.toml");
 }
@@ -189,4 +215,32 @@ test "claudeHomePathAlloc joins onto HOME/.claude" {
     const expected = try std.fs.path.join(alloc, &.{ home, ".claude", "settings.json" });
     defer alloc.free(expected);
     try testing.expectEqualStrings(expected, settings);
+}
+
+// config-layout-missed-149: OS-standard enterprise managed-settings.json path.
+test "managedSettingsJsonPath resolves a platform default on macOS/Linux/Windows" {
+    const alloc = testing.allocator;
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+
+    const path = try managedSettingsJsonPath(alloc);
+    defer if (path) |p| alloc.free(p);
+
+    switch (@import("builtin").os.tag) {
+        .macos => try testing.expectEqualStrings("/Library/Application Support/ClaudeCode/managed-settings.json", path.?),
+        .linux => try testing.expectEqualStrings("/etc/claude-code/managed-settings.json", path.?),
+        .windows => try testing.expectEqualStrings("C:\\Program Files\\ClaudeCode\\managed-settings.json", path.?),
+        else => try testing.expect(path == null),
+    }
+}
+
+test "managedSettingsJsonPath honors the ZCODE_MANAGED_SETTINGS_JSON test override" {
+    const alloc = testing.allocator;
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("ZCODE_MANAGED_SETTINGS_JSON", "/tmp/fake-managed-settings.json");
+
+    const path = (try managedSettingsJsonPath(alloc)).?;
+    defer alloc.free(path);
+    try testing.expectEqualStrings("/tmp/fake-managed-settings.json", path);
 }

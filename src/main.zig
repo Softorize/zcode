@@ -196,6 +196,7 @@ comptime {
     _ = @import("core/hooks_lifecycle_test.zig");
     _ = @import("core/hooks_runtime_wire_test.zig");
     _ = @import("core/settings_sources.zig");
+    _ = @import("core/status_line.zig");
     _ = @import("core/config_migrations.zig");
     _ = @import("core/mcp_name.zig");
     _ = @import("core/model_alias.zig");
