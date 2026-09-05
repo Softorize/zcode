@@ -656,6 +656,16 @@ pub const ToolExecContext = struct {
     /// `approval_handler` and the stdin fallback in `effectiveApproval`. Null at
     /// every local (non-host-driven) call site so the gate is unchanged there.
     sdk_relay: ?ApprovalHandler = null,
+    /// hooks-permissions-09: the session id threaded onto every hook's stdin
+    /// payload (reference `Se` base schema's `session_id`). Empty at every
+    /// non-main call site (tests, forks that don't care) so the field is
+    /// simply omitted from the JSON rather than emitted blank -- see
+    /// `hook_io.HookBaseFields`.
+    session_id: []const u8 = "",
+    /// hooks-permissions-09: the session's on-disk transcript path
+    /// (`AgentRuntime.transcript_path`), threaded the same way as
+    /// `session_id` above.
+    transcript_path: []const u8 = "",
 };
 
 /// Resolve the approval-mode string the gate evaluates under: a live permission
@@ -1064,6 +1074,7 @@ fn segmentedBashPermission(
         },
         .deny => {
             const output = try std.fmt.allocPrint(ctx.allocator, "denied by permission rule: {s}", .{verdict.reason});
+            firePermissionDeniedHook(ctx, name, args, output);
             const trace = try buildToolTrace(ctx.allocator, name, args, risk, .denied, false, 0, output);
             logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
             return trace;
@@ -1074,6 +1085,7 @@ fn segmentedBashPermission(
             }
             const message = try buildSegmentedAskMessage(ctx.allocator, name, args, risk, verdict.reason, verdict.suggestions);
             defer ctx.allocator.free(message);
+            firePermissionRequestHook(ctx, name, args, message);
 
             var stdin_prompt_token: u8 = 0;
             const approver = effectiveApproval(ctx, &stdin_prompt_token);
@@ -1095,6 +1107,7 @@ fn segmentedBashPermission(
             }
             if (!approval.approved) {
                 const output = try std.fmt.allocPrint(ctx.allocator, "permission rule requires approval: {s}", .{verdict.reason});
+                firePermissionDeniedHook(ctx, name, args, output);
                 const trace = try buildToolTrace(ctx.allocator, name, args, risk, approval.state, false, 0, output);
                 logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
                 return trace;
@@ -1221,6 +1234,9 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
         .cwd = ctx.cwd,
         .tool_name = effective_name,
         .tool_args = args,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .permission_mode = effectiveApprovalMode(ctx),
     });
     defer pre_hook.deinit(ctx.allocator);
 
@@ -1252,6 +1268,7 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
             else
                 try std.fmt.allocPrint(ctx.allocator, "pre-tool-use hook asks before running tool\n{s}", .{tool_description});
             defer ctx.allocator.free(message);
+            firePermissionRequestHook(ctx, effective_name, args, message);
             const approval = try approval_mod.evaluate(
                 "manual",
                 risk,
@@ -1270,6 +1287,7 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
             }
             if (!approval.approved) {
                 const output = try ctx.allocator.dupe(u8, approval.reason);
+                firePermissionDeniedHook(ctx, effective_name, args, output);
                 const trace = try buildToolTrace(ctx.allocator, effective_name, args, risk, approval.state, false, 0, output);
                 logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
                 return trace;
@@ -1297,6 +1315,7 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
             switch (decided.action) {
                 .deny => {
                     const output = try formatPermissionRuleReason(ctx.allocator, "denied by permission rule", matched_rule);
+                    firePermissionDeniedHook(ctx, effective_name, args, output);
                     const trace = try buildToolTrace(ctx.allocator, effective_name, args, risk, .denied, false, 0, output);
                     logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
                     return trace;
@@ -1308,6 +1327,11 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
                     if (ctx.session_approved_tools.contains(effective_name)) {
                         return runApprovedToolTrace(ctx, effective_name, args, risk, .session_approved, start, &pre_hook);
                     }
+                    {
+                        const req_reason = try formatPermissionRuleReason(ctx.allocator, "permission rule requires approval", matched_rule);
+                        defer ctx.allocator.free(req_reason);
+                        firePermissionRequestHook(ctx, effective_name, args, req_reason);
+                    }
                     const approval = try promptForPermissionRule(ctx, matched_rule, effective_name, args, risk);
                     if (approval.state == .session_approved) {
                         const key = try ctx.allocator.dupe(u8, effective_name);
@@ -1316,6 +1340,7 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
                     }
                     if (!approval.approved) {
                         const output = try formatPermissionRuleReason(ctx.allocator, "permission rule requires approval", matched_rule);
+                        firePermissionDeniedHook(ctx, effective_name, args, output);
                         const trace = try buildToolTrace(ctx.allocator, effective_name, args, risk, approval.state, false, 0, output);
                         logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
                         return trace;
@@ -1369,6 +1394,11 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
 
     if (!approval.approved) {
         const output = try ctx.allocator.dupe(u8, approval.reason);
+        // hooks-permissions-01: mode/tier-driven denial (the generic path --
+        // no explicit rule matched, so the effective permission mode itself
+        // either refused to prompt in a non-interactive session or the user
+        // declined an interactive prompt).
+        firePermissionDeniedHook(ctx, effective_name, args, output);
         const trace = try buildToolTrace(ctx.allocator, effective_name, args, risk, approval.state, false, 0, output);
         logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
         return trace;
@@ -1422,6 +1452,51 @@ fn runHooksWithTrustPrompt(allocator: std.mem.Allocator, cwd: []const u8, ask_us
     return hooks_mod.run(allocator, hook_ctx);
 }
 
+/// hooks-permissions-01: fire the `PermissionRequest` lifecycle hook
+/// immediately before the user is actually about to be prompted for a tool
+/// call (reference: "Run before permission prompt"). Best-effort and
+/// side-effect only -- a `PermissionRequest` hook cannot itself veto the
+/// prompt (the reference's `permission_suggestions` output only offers the
+/// UI alternate choices; it is not modeled here), so a failure or a blocking
+/// hook here never changes what happens next. `reason` is the same
+/// human-readable context already shown to the human approver, so a
+/// configured hook sees exactly what the user is being asked to approve.
+fn firePermissionRequestHook(ctx: ToolExecContext, tool_name: []const u8, tool_args: []const u8, reason: []const u8) void {
+    var result = hooks_mod.run(ctx.allocator, .{
+        .event = .permission_request,
+        .cwd = ctx.cwd,
+        .tool_name = tool_name,
+        .tool_args = tool_args,
+        .reason = reason,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .permission_mode = effectiveApprovalMode(ctx),
+    }) catch return;
+    result.deinit(ctx.allocator);
+}
+
+/// hooks-permissions-01: fire the `PermissionDenied` lifecycle hook whenever a
+/// tool call's outcome resolves to denied -- by an explicit deny rule, by the
+/// user declining an interactive prompt, or by the effective permission mode
+/// refusing to prompt at all in a non-interactive session. Best-effort and
+/// side-effect only, mirroring `firePermissionRequestHook` -- the tool is
+/// already denied by the time this fires, so a hook here cannot change the
+/// outcome, only observe/log/notify it (matching the reference: PermissionDenied
+/// has no documented block-the-denial semantics of its own).
+fn firePermissionDeniedHook(ctx: ToolExecContext, tool_name: []const u8, tool_args: []const u8, reason: []const u8) void {
+    var result = hooks_mod.run(ctx.allocator, .{
+        .event = .permission_denied,
+        .cwd = ctx.cwd,
+        .tool_name = tool_name,
+        .tool_args = tool_args,
+        .reason = reason,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .permission_mode = effectiveApprovalMode(ctx),
+    }) catch return;
+    result.deinit(ctx.allocator);
+}
+
 fn toolExecErrorTrace(
     ctx: ToolExecContext,
     name: []const u8,
@@ -1433,9 +1508,39 @@ fn toolExecErrorTrace(
 ) !ToolTrace {
     const end = clock.nowSeconds();
     const output = try std.fmt.allocPrint(ctx.allocator, "tool execution error: {s}", .{@errorName(err)});
+    // hooks-permissions-01: a thrown dispatch-layer error is the harness-level
+    // "tool failed to run" case the reference's PostToolUseFailure documents
+    // (as opposed to a tool that ran fine and merely returned an
+    // application-level non-zero-exit/error result in its own output text,
+    // which stays a normal PostToolUse). This path previously fired NO hook
+    // of either kind, so a configured PostToolUseFailure hook silently never
+    // saw the one case that most unambiguously is a tool failure.
+    firePostToolUseFailureHook(ctx, name, args, output);
     const trace = try buildToolTrace(ctx.allocator, name, args, risk, approval_state, false, (end - start) * 1000, output);
     logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, end, 1);
     return trace;
+}
+
+/// hooks-permissions-01: see `toolExecErrorTrace`'s call site. Best-effort and
+/// side-effect only (like `firePermissionDeniedHook`): the trace/output the
+/// caller returns is unaffected by a blocking hook outcome here -- the tool
+/// call has already unrecoverably failed by the time this runs, so there is
+/// nothing left to gate. `error_text` doubles as both `tool_output` and (via
+/// `HookContext.reason`, threaded into the payload's `reason`/`error`-shaped
+/// fields by `buildEventPayload`) the failure detail a hook script inspects.
+fn firePostToolUseFailureHook(ctx: ToolExecContext, tool_name: []const u8, tool_args: []const u8, error_text: []const u8) void {
+    var result = hooks_mod.runEvent(ctx.allocator, .{
+        .event = .post_tool_use_failure,
+        .cwd = ctx.cwd,
+        .tool_name = tool_name,
+        .tool_args = tool_args,
+        .tool_output = error_text,
+        .tool_success = false,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .permission_mode = effectiveApprovalMode(ctx),
+    }) catch return;
+    result.deinit(ctx.allocator);
 }
 
 fn runApprovedToolTrace(
@@ -1482,6 +1587,9 @@ fn runApprovedToolTrace(
             .cwd = ctx.cwd,
             .tool_name = name,
             .tool_args = args,
+            .session_id = ctx.session_id,
+            .transcript_path = ctx.transcript_path,
+            .permission_mode = effectiveApprovalMode(ctx),
         });
         break :blk &owned_pre_hook.?;
     };
@@ -1556,13 +1664,24 @@ fn runApprovedToolTrace(
     });
     defer post_plugin.deinit(ctx.allocator);
 
+    // hooks-permissions-01: `executed == false` here means the execution
+    // gates (empty-workspace / bash_security / ...) refused to run the tool
+    // at all -- the reference's PostToolUseFailure case -- as opposed to the
+    // tool having genuinely run and produced output (including a non-zero
+    // shell exit, which is application-level and still a normal
+    // PostToolUse). A thrown Zig error from dispatch is handled separately
+    // by `toolExecErrorTrace`'s own `firePostToolUseFailureHook` call, since
+    // that path never reaches here.
     var post_hook = try runHooksWithTrustPrompt(ctx.allocator, ctx.cwd, ctx.ask_user_fn, ctx.ask_user_ctx, .{
-        .event = .post_tool_use,
+        .event = if (executed) .post_tool_use else .post_tool_use_failure,
         .cwd = ctx.cwd,
         .tool_name = name,
         .tool_args = effective_args,
         .tool_output = gate_output,
         .tool_success = executed,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .permission_mode = effectiveApprovalMode(ctx),
     });
     defer post_hook.deinit(ctx.allocator);
 
@@ -5337,6 +5456,178 @@ test "hooks-20: PreToolUse updatedInput rewrites the tool args before execution"
     // The executed trace records the rewritten args, not the model's.
     try testing.expect(std.mem.indexOf(u8, trace.args, "rewritten.txt") != null);
     try testing.expect(std.mem.indexOf(u8, trace.args, "original.txt") == null);
+}
+
+test "hooks-permissions-01: PermissionDenied hook fires when a deny rule blocks a Bash call" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "denied.txt" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PermissionDenied\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"touch '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "tiered-auto");
+    cfg.mcp_tool_bridge_enabled = false;
+    alloc.free(cfg.sandbox);
+    cfg.sandbox = try alloc.dupe(u8, "danger-full-access");
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    var rules = permission_rules_mod.Store.init(alloc);
+    defer rules.deinit();
+    try rules.addRule(.deny, .global, "Bash", "", "test", 0, "user");
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        // Non-interactive: a rule deny still fires PermissionDenied even though
+        // there is nobody to prompt.
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = &rules,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+        .session_id = "sess-permdenied-1",
+    };
+
+    var trace = try executeToolCall(ctx, "Bash", "command=echo hi");
+    defer trace.deinit(alloc);
+    try testing.expectEqual(types.ApprovalState.denied, trace.approval_state);
+
+    std.Io.Dir.cwd().access(rt.io, sentinel, .{}) catch |err| {
+        std.debug.print("PermissionDenied hook sentinel missing: {s} ({any})\n", .{ sentinel, err });
+        return error.PermissionDeniedHookDidNotRun;
+    };
+}
+
+test "hooks-permissions-01: PostToolUseFailure fires with an error field when the dispatch layer throws" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    const captured = try std.fs.path.join(alloc, &.{ root, "posttoolusefailure.json" });
+    defer alloc.free(captured);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PostToolUseFailure\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"PostToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"echo SHOULD_NOT_FIRE\"}}]}}]}}}}",
+        .{captured},
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+
+    const policy_mod = @import("policy/policy.zig");
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+
+    const logger_mod = @import("core/logger.zig");
+    var audit = try logger_mod.AuditLogger.init(alloc, root);
+    defer audit.deinit();
+
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = root,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = null,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+        .session_id = "sess-failure-1",
+        .transcript_path = "/tmp/sessions/sess-failure-1.jsonl",
+    };
+
+    // Exercises the exact call site `toolExecErrorTrace` uses
+    // (hooks-permissions-01): a real dispatch-layer error, not a normal
+    // tool call that merely returned an application-level error string.
+    firePostToolUseFailureHook(ctx, "Bash", "command=false", "tool execution error: SomeDispatchError");
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("PostToolUseFailure hook did not capture stdin: {s} ({any})\n", .{ captured, err });
+        return error.PostToolUseFailureHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("PostToolUseFailure", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("Bash", parsed.value.object.get("tool_name").?.string);
+    try testing.expect(parsed.value.object.get("error") != null);
+    try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("error").?.string, "SomeDispatchError") != null);
+    try testing.expectEqualStrings("sess-failure-1", parsed.value.object.get("session_id").?.string);
+    try testing.expectEqualStrings("/tmp/sessions/sess-failure-1.jsonl", parsed.value.object.get("transcript_path").?.string);
 }
 
 test "logToolInvocationRecord increments the tool_executions_total counter" {

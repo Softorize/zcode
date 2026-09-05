@@ -201,7 +201,7 @@ test "background-svc-09: Notification hook runs and never blocks (exit 2)" {
     };
 }
 
-test "background-svc-09: Notification matcher selects on message field" {
+test "hooks-permissions-10: Notification matcher selects on notification_type, not the free-text message" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -216,18 +216,22 @@ test "background-svc-09: Notification matcher selects on message field" {
     const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
     defer alloc.free(cwd);
 
-    // The Notification matcher tests against the message field (hooks.zig:115)
-    // via a glob (hook_matcher.matchesField -> globMatch). A "*ready*" matcher
-    // matches "zcode ready" but not "working".
+    // hooks-permissions-10: the reference documents the Notification matcher
+    // target as the notification's TYPE (a stable category like "idle"), not
+    // its free-text message body -- a matcher configured against message
+    // text would be fragile (the message varies per turn: elapsed time,
+    // verb, ...). A matcher against the type is exact-string, not a glob
+    // over prose.
     try writeFileMakingDirs(tmp.dir, ".zcode/settings.json",
-        \\{"hooks":{"Notification":[{"matcher":"*ready*","hooks":[{"type":"command","command":"echo MATCHED_NOTIF"}]}]}}
+        \\{"hooks":{"Notification":[{"matcher":"idle","hooks":[{"type":"command","command":"echo MATCHED_NOTIF"}]}]}}
     );
 
-    var miss = try hooks.runEvent(alloc, .{ .event = .notification, .cwd = cwd, .message = "working" });
+    var miss = try hooks.runEvent(alloc, .{ .event = .notification, .cwd = cwd, .message = "zcode ready · idle for 45s", .notification_type = "permission_prompt" });
     defer miss.deinit(alloc);
     try testing.expect(!miss.ran);
 
-    var hit = try hooks.runEvent(alloc, .{ .event = .notification, .cwd = cwd, .message = "zcode ready" });
+    // The message text itself no longer drives the match -- only the type does.
+    var hit = try hooks.runEvent(alloc, .{ .event = .notification, .cwd = cwd, .message = "totally different wording", .notification_type = "idle" });
     defer hit.deinit(alloc);
     try testing.expect(hit.ran);
     try testing.expect(std.mem.indexOf(u8, hit.output, "MATCHED_NOTIF") != null);

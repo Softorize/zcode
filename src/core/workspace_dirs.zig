@@ -19,6 +19,7 @@ const rt = @import("zcode_runtime");
 const rng = @import("rng.zig");
 const xdg = @import("xdg.zig");
 const paths = @import("paths.zig");
+const permission_rules = @import("permission_rules.zig");
 
 const filename = "workspace-dirs.txt";
 
@@ -66,6 +67,45 @@ pub fn load(allocator: std.mem.Allocator) ![][]u8 {
 pub fn freeList(allocator: std.mem.Allocator, list: [][]u8) void {
     for (list) |item| allocator.free(item);
     allocator.free(list);
+}
+
+/// config-layout-13: `load()` plus `.claude/settings.json`'s
+/// `permissions.additionalDirectories` (every disk source, unioned -- see
+/// `permission_rules.readAdditionalDirectoriesFromSettings`), so a
+/// team-checked-in additional-directory declaration widens the workspace
+/// exactly like the persisted `/add-dir` list does, with no extra user action.
+/// Deduplicated against the persisted list and against itself. `load()` itself
+/// is untouched (its existing callers -- context.zig, the `/add-dir` render
+/// path -- see only the persisted list, matching their current behavior);
+/// this is a new, additive entry point for session bootstrap.
+pub fn loadWithSettings(allocator: std.mem.Allocator, cwd: []const u8, flag_path: ?[]const u8) ![][]u8 {
+    const persisted = try load(allocator);
+    defer freeList(allocator, persisted);
+
+    const from_settings = try permission_rules.readAdditionalDirectoriesFromSettings(allocator, cwd, flag_path);
+    defer {
+        for (from_settings) |d| allocator.free(d);
+        allocator.free(from_settings);
+    }
+
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    try out.ensureUnusedCapacity(allocator, persisted.len + from_settings.len);
+    for (persisted) |p| out.appendAssumeCapacity(try allocator.dupe(u8, p));
+    for (from_settings) |d| {
+        var dup = false;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, d)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) out.appendAssumeCapacity(try allocator.dupe(u8, d));
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn writeList(allocator: std.mem.Allocator, list: []const []const u8) !void {
@@ -283,4 +323,36 @@ test "render output lists a registered directory by number" {
     defer testing.allocator.free(rendered);
     try testing.expect(std.mem.indexOf(u8, rendered, tmp_path) != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "additional workspace directories:") != null);
+}
+
+test "config-layout-13: loadWithSettings unions the persisted list with settings.json additionalDirectories" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("test_helpers.zig");
+    const cwd = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    // A persisted /add-dir entry (points at the tmp dir itself, which exists).
+    const added = try add(testing.allocator, cwd);
+    defer _ = remove(testing.allocator, cwd) catch {};
+    try testing.expect(added);
+
+    // A settings.json additionalDirectories entry, workspace-scoped to cwd.
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"permissions\":{\"additionalDirectories\":[\"/from/settings/only\"]}}",
+    });
+
+    const merged = try loadWithSettings(testing.allocator, cwd, null);
+    defer freeList(testing.allocator, merged);
+
+    var has_persisted = false;
+    var has_settings = false;
+    for (merged) |d| {
+        if (std.mem.eql(u8, d, cwd)) has_persisted = true;
+        if (std.mem.eql(u8, d, "/from/settings/only")) has_settings = true;
+    }
+    try testing.expect(has_persisted);
+    try testing.expect(has_settings);
 }

@@ -59,6 +59,7 @@ const budget_control_mod = @import("core/budget_control.zig");
 const structured_output_mod = @import("tools/structured_output.zig");
 const model_usage_mod = @import("core/model_usage.zig");
 const hooks_mod = @import("core/hooks.zig");
+const hook_io_mod = @import("core/hook_io.zig");
 const plugins_mod = @import("core/plugins.zig");
 const async_hook_registry = @import("core/async_hook_registry.zig");
 const agent_registry_mod = @import("core/agent_registry.zig");
@@ -366,11 +367,83 @@ const McpInstructionDelta = struct {
     removed_count: usize = 0,
 };
 
+/// config-layout-missed-148: the CLI-flag-vs-settings.json precedence for
+/// `AgentRuntime.permission_mode_override`'s initial value, factored out as a
+/// pure function (no IO) so the precedence itself is unit-testable without a
+/// full `AgentRuntime` (whose settings.json reads are unconditionally skipped
+/// under the test binary -- see the `is_test` guard at the one call site).
+///
+/// `cfg_approval_mode` is `cfg.approval_mode` (`Config.approval_mode`): it
+/// only ever holds a reference mode spelling (acceptEdits/plan/
+/// bypassPermissions/dontAsk/auto/default) when the user passed
+/// `--approval-mode`/`--permission-mode` with a reference value (see
+/// `core/config_parse.applyCliOverrides` -- CLI-absent leaves it at
+/// `Config.init`'s "tiered-auto" default, one of zcode's own legacy names).
+/// So "does cfg_approval_mode name a reference mode" doubles, without extra
+/// plumbing, as "did the user explicitly ask for one via the CLI" -- an
+/// explicit CLI flag always wins over `from_settings`. `from_settings` is the
+/// pre-resolved `permission_rules.resolveDefaultMode` result (null when no
+/// settings.json source sets `permissions.defaultMode`, or under test).
+///
+/// Known, accepted approximation: a user who explicitly types a LEGACY name
+/// (e.g. `--approval-mode manual`) is indistinguishable here from one who
+/// never passed the flag at all, so a configured `defaultMode` still wins in
+/// that specific case. Getting that exactly right needs a dedicated "was this
+/// explicit" bit threaded through `Config`, out of scope for this fix.
+fn resolveInitialPermissionMode(cfg_approval_mode: []const u8, from_settings: ?permission_decision_mod.Mode) ?permission_decision_mod.Mode {
+    if (permission_decision_mod.isReferenceModeName(cfg_approval_mode)) {
+        return permission_decision_mod.modeFromString(cfg_approval_mode);
+    }
+    return from_settings;
+}
+
 fn resolvePermissionRulesPath(allocator: std.mem.Allocator) ![]u8 {
     if (@import("builtin").is_test) return allocator.dupe(u8, "");
     var path_set = try paths_mod.resolve(allocator);
     defer path_set.deinit(allocator);
     return allocator.dupe(u8, path_set.permission_rules_path);
+}
+
+/// config-layout-13: union `cfg.additional_directories` -- the wp4 CLI
+/// carrier for repeated `--add-dir <path>` flags, comma-joined by
+/// `cli.args.appendCommaJoined` -- into `base` (already the persisted
+/// `/add-dir` list unioned with settings.json's `permissions
+/// .additionalDirectories`, per `workspace_dirs.loadWithSettings`).
+/// Consumes (frees) `base` and returns a new owned slice; on error `base`
+/// is left untouched so the caller's `catch base` fallback stays valid.
+/// Empty entries (an empty `cfg.additional_directories`, or a stray comma)
+/// contribute nothing. Deduplicated against `base` and against itself.
+fn unionCliAdditionalDirectories(allocator: std.mem.Allocator, base: [][]u8, cli_joined: []const u8) ![][]u8 {
+    if (cli_joined.len == 0) return base;
+
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    try out.ensureUnusedCapacity(allocator, base.len);
+    for (base) |p| out.appendAssumeCapacity(try allocator.dupe(u8, p));
+
+    var it = std.mem.splitScalar(u8, cli_joined, ',');
+    while (it.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var dup = false;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, trimmed)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try out.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+    // Take ownership of the new slice BEFORE freeing `base` so a failure in
+    // `toOwnedSlice` (the only fallible step left) leaves `base` intact for
+    // the caller's `catch base` fallback -- freeing it first then failing
+    // would hand the caller a dangling slice.
+    const owned = try out.toOwnedSlice(allocator);
+    workspace_dirs_mod.freeList(allocator, base);
+    return owned;
 }
 
 /// True for WebFetch / WebSearch / HttpRequest. agent_tools classifies
@@ -542,6 +615,13 @@ pub const AgentRuntime = struct {
     strict: bool,
     yolo_mode: bool,
     session_id: []u8,
+    /// hooks-permissions-09: the session's on-disk transcript path (reference
+    /// `transcript_path` base hook field), computed once from `session_id` at
+    /// construction. `store.sessionPath` only fails on a malformed
+    /// `session_id`, which `store.createSessionId()`'s own output never is --
+    /// see the `catch` at the one construction site for the (unreachable in
+    /// practice) fallback.
+    transcript_path: []u8,
     history: agent_history.History,
     snapshot: types.SessionSnapshot,
     approval_handler: ?ApprovalHandler,
@@ -771,6 +851,12 @@ pub const AgentRuntime = struct {
     ///   - session_end_fired: SessionEnd fires once at deinit; guards a double
     ///     fire if deinit is reached twice.
     session_start_fired: bool = false,
+    /// hooks-permissions-02: Setup fires alongside SessionStart (the
+    /// reference's `ALWAYS_EMITTED_HOOK_EVENTS` groups them as the two
+    /// always-on lifecycle events); this guards its own once-only firing so
+    /// the two stay independently idempotent even if a future caller fires
+    /// them from different points.
+    setup_fired: bool = false,
     session_end_fired: bool = false,
 
     /// Phase 11 Task 6 (sessions-06): set once we have attempted AI-title
@@ -894,7 +980,19 @@ pub const AgentRuntime = struct {
         errdefer workspace_dirs_mod.freeList(allocator, additional_directories);
         if (!@import("builtin").is_test) {
             const empty: [][]u8 = &.{};
-            additional_directories = workspace_dirs_mod.load(allocator) catch empty;
+            // config-layout-13: also union in settings.json's
+            // `permissions.additionalDirectories` so a checked-in team
+            // declaration widens the workspace without a `/add-dir` ever
+            // having been run.
+            const from_settings = workspace_dirs_mod.loadWithSettings(allocator, cwd, null) catch empty;
+            // config-layout-13: consume the wp4 CLI carrier `cfg.additional_directories`
+            // (a comma-joined list built from repeated `--add-dir <path>` flags,
+            // src/main.zig / src/cli/args.zig) directly now that it exists,
+            // unioning single-invocation `--add-dir` roots in alongside the
+            // persisted `/add-dir` list and settings.json's array. Deduplicated
+            // against `from_settings` (which is itself already deduplicated
+            // against the persisted list).
+            additional_directories = unionCliAdditionalDirectories(allocator, from_settings, cfg.additional_directories) catch from_settings;
         }
 
         // bash-shell-02: source the user's rc once at session start and
@@ -910,6 +1008,16 @@ pub const AgentRuntime = struct {
         if (!@import("builtin").is_test) {
             shell_snapshot_path = shell_snapshot_mod.createForSession(allocator) catch null;
         }
+
+        // hooks-permissions-09: session_id is computed as a local so
+        // transcript_path (its derived on-disk path) can be built from it
+        // before the struct literal below. `store.sessionPath` only fails on
+        // a malformed session_id, which our own freshly-minted one never is;
+        // the empty-string fallback keeps `AgentRuntime.init` infallible on
+        // this account rather than surfacing an unreachable-in-practice error.
+        const session_id = try store.createSessionId();
+        errdefer allocator.free(session_id);
+        const transcript_path = store.sessionPath(session_id) catch try allocator.dupe(u8, "");
 
         return .{
             .allocator = allocator,
@@ -927,20 +1035,29 @@ pub const AgentRuntime = struct {
             .auto_approve_high = auto_approve_high,
             .strict = strict,
             .yolo_mode = yolo_mode,
-            .session_id = try store.createSessionId(),
+            .session_id = session_id,
+            .transcript_path = transcript_path,
             .history = agent_history.History.init(allocator, store),
             .snapshot = try allocEmptySnapshot(allocator),
             .approval_handler = null,
             .ask_user_ctx = null,
             .ask_user_fn = null,
-            // Seed the live permission mode from cfg.approval_mode only when the
-            // config carries a Claude Code reference mode name. Legacy modes
-            // (tiered-auto/manual/strict) leave this null so the gate keeps
-            // using cfg.approval_mode byte-for-byte (no regression).
-            .permission_mode_override = if (permission_decision_mod.isReferenceModeName(cfg.approval_mode))
-                permission_decision_mod.modeFromString(cfg.approval_mode)
-            else
-                null,
+            // Seed the live permission mode: an explicit reference-mode CLI
+            // flag wins; otherwise config-layout-missed-148's
+            // `.claude/settings.json` `permissions.defaultMode`; otherwise
+            // null (the gate keeps using cfg.approval_mode's legacy
+            // tiered-auto/manual/strict engine byte-for-byte -- no
+            // regression). See `resolveInitialPermissionMode`'s doc comment
+            // for why this precedence is correct without threading an extra
+            // "was this explicit" bit through Config, and why it is distinct
+            // from (and never reads) `cfg.default_mode`, the unrelated
+            // AutoMode-dialog TOML key. The settings.json read itself is
+            // behind the is_test guard like every other disk read in this
+            // constructor so unit tests stay hermetic.
+            .permission_mode_override = resolveInitialPermissionMode(
+                cfg.approval_mode,
+                if (!@import("builtin").is_test) permission_rules_mod.resolveDefaultMode(allocator, cwd, null) else null,
+            ),
             .requested_mode = null,
             .pending_plan_markdown = null,
             .session_approved_tools = std.StringHashMap(void).init(allocator),
@@ -1091,6 +1208,7 @@ pub const AgentRuntime = struct {
             self.allocator.free(p);
         }
         self.allocator.free(self.session_id);
+        self.allocator.free(self.transcript_path);
         self.allocator.free(self.active_provider);
         self.allocator.free(self.active_model);
         self.allocator.free(self.preprocessor_provider);
@@ -1359,9 +1477,39 @@ pub const AgentRuntime = struct {
         const self: *AgentRuntime = @ptrCast(@alignCast(ctx));
         if (std.mem.eql(u8, method, "sampling/createMessage"))
             return try agent_history.handleMcpSamplingRequest(self.buildMcpContext(), params_json);
-        if (std.mem.eql(u8, method, "elicitation/create"))
-            return try agent_history.handleMcpElicitationRequest(self.buildMcpContext(), params_json);
+        if (std.mem.eql(u8, method, "elicitation/create")) {
+            // hooks-permissions-03: fire Elicitation immediately before the
+            // actual prompt (agent_history.handleMcpElicitationRequest owns
+            // the real approve/deny UX -- this wrapper is the one owned
+            // "hook emission point" call site around it, per this package's
+            // agent_runtime.zig ownership scope) and ElicitationResult right
+            // after it resolves, carrying the request/response JSON as the
+            // lifecycle `message` field (the closest existing generic
+            // carrier; Elicitation has no reference-documented matcher
+            // target to wire a dedicated discriminator against).
+            self.fireElicitationHook(.elicitation, params_json);
+            const result = try agent_history.handleMcpElicitationRequest(self.buildMcpContext(), params_json);
+            self.fireElicitationHook(.elicitation_result, result);
+            return result;
+        }
         return null;
+    }
+
+    /// See `mcpBridgeHandleRequest`'s elicitation/create branch. Best-effort
+    /// and non-blocking: elicitation already has its own real approve/deny
+    /// UX via the MCP protocol itself, so a hook here observes rather than
+    /// gates (matching `fireNotificationHook`/`firePostToolBatchHook`).
+    fn fireElicitationHook(self: *AgentRuntime, event: hooks_mod.HookEvent, payload_json: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = event,
+            .cwd = self.cwd,
+            .message = payload_json,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
     }
 
     fn mcpBridgeHandleNotification(ctx: *anyopaque, allocator: std.mem.Allocator, server_name: []const u8, method: []const u8, params_json: []const u8) anyerror!void {
@@ -1475,6 +1623,7 @@ pub const AgentRuntime = struct {
         // the last turn so their additionalContext lands before this prompt.
         if (self.depth == 0) {
             self.maybeFireSessionStart();
+            self.maybeFireSetup();
             self.drainAsyncHooks();
         }
 
@@ -2733,6 +2882,13 @@ pub const AgentRuntime = struct {
                 var round_had_action_tool_attempt = false;
                 var round_had_failed_action_tool = false;
                 var round_had_successful_action_tool = false;
+                // hooks-permissions-04: `traces` accumulates across the WHOLE
+                // turn (every round), so mark where this round's entries
+                // begin now -- both the parallel batch pass below and the
+                // sequential loop append into the same list -- and fire
+                // PostToolBatch once after both have finished, covering
+                // every call this round regardless of which pass ran it.
+                const round_trace_start = traces.items.len;
 
                 // Parallel execution pass: batch read-only tools and run concurrently.
                 // Track which call indices were executed in parallel to skip them
@@ -2952,6 +3108,17 @@ pub const AgentRuntime = struct {
                     if (self.strict and agent_tools.isStrictViolationTrace(trace)) {
                         strict_violation_any = true;
                     }
+                }
+
+                // hooks-permissions-04: PostToolBatch fires exactly once here,
+                // after every tool call this round (parallel batch + sequential
+                // alike) has resolved and its own PostToolUse/PostToolUseFailure
+                // hook has already run, and BEFORE any round-level continue/
+                // break decision below sends the turn back to the model. Only
+                // fires when the round actually ran at least one tool (matching
+                // the reference: an empty batch is not a batch).
+                if (traces.items.len > round_trace_start) {
+                    self.firePostToolBatchHook(traces.items[round_trace_start..]);
                 }
 
                 if (strict_violation_any) {
@@ -4030,6 +4197,18 @@ pub const AgentRuntime = struct {
         return "default";
     }
 
+    /// hooks-permissions-09: the effective `permission_mode` string threaded
+    /// onto every hook's stdin payload (reference `Se` base schema). Mirrors
+    /// `agent_tools.effectiveApprovalMode`'s precedence (a live reference-mode
+    /// override wins, else the persisted config mode byte-for-byte, which may
+    /// be a zcode legacy name like "tiered-auto") -- kept as a small, separate
+    /// helper here (rather than exported from agent_tools.zig) since lifecycle
+    /// hooks fire from this file, not through a ToolExecContext.
+    fn effectiveLivePermissionModeString(self: *const AgentRuntime) []const u8 {
+        if (self.permission_mode_override) |mode| return permission_decision_mod.modeToString(mode);
+        return self.cfg.approval_mode;
+    }
+
     fn mergeFileFocus(self: *AgentRuntime, new_paths: []const []const u8) !void {
         var merged = std.array_list.Managed([]const u8).init(self.allocator);
         // Track whether ownership has been transferred into the snapshot.
@@ -5014,6 +5193,8 @@ pub const AgentRuntime = struct {
             .web_fetch_ctx = self.buildWebFetchContext(),
             .auto_mem_dir = self.auto_mem_dir_restriction,
             .session_mem_file = self.session_mem_file_restriction,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
         };
     }
 
@@ -5321,6 +5502,20 @@ pub const AgentRuntime = struct {
         if (outcome.reason) |r| self.allocator.free(r);
     }
 
+    /// hooks-permissions-02: fire Setup exactly once, lazily, alongside
+    /// SessionStart (the reference documents both as
+    /// `ALWAYS_EMITTED_HOOK_EVENTS` -- always-on, once-per-session lifecycle
+    /// events). Setup carries no event-specific discriminating field (unlike
+    /// SessionStart's `source`); its stdout is still injected as additional
+    /// context via `fireLifecycleHook`, matching every other lifecycle event.
+    pub fn maybeFireSetup(self: *AgentRuntime) void {
+        if (!hooksLiveEnabled()) return;
+        if (self.setup_fired) return;
+        self.setup_fired = true;
+        const outcome = self.fireLifecycleHook(.{ .event = .setup, .cwd = self.cwd });
+        if (outcome.reason) |r| self.allocator.free(r);
+    }
+
     /// Fire SessionEnd once at teardown. Reason "exit". Best-effort: a block has
     /// no meaning at teardown, so the outcome is discarded.
     fn fireSessionEnd(self: *AgentRuntime) void {
@@ -5357,8 +5552,81 @@ pub const AgentRuntime = struct {
             .cwd = self.cwd,
             .message = message,
             .title = title,
+            // hooks-permissions-10: this is the only fireNotificationHook call
+            // site today, and it fires exactly when a long turn has just
+            // finished and the assistant is waiting on the user again -- the
+            // reference's "idle" notification_type category. A settings.json
+            // Notification hook's matcher now tests against this, not the
+            // free-text message (see hooks.matchFieldFor).
+            .notification_type = "idle",
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-04: fire `PostToolBatch` once for a resolved round of
+    /// tool calls (`round_traces` is this round's slice of `traces`, both the
+    /// parallel-batch and sequential entries -- see the call site). Best-
+    /// effort and non-blocking by construction: PostToolBatch is
+    /// observability-only in the reference (its own per-tool PostToolUse/
+    /// PostToolUseFailure hooks already had the chance to gate/rewrite each
+    /// call; this event exists purely so a hook can see the whole batch shape
+    /// at once), so a block/error outcome here is discarded, matching
+    /// `fireNotificationHook`. `tool_use_id` is left empty on every element:
+    /// zcode's tool-call parsing (`core.parse_helpers.ToolCall`) does not
+    /// carry a per-call id today, unlike the reference's native tool_use
+    /// blocks -- a real gap, but a separate, much larger one (threading an id
+    /// through the whole parse/dispatch/trace pipeline) than this event's
+    /// wiring.
+    fn firePostToolBatchHook(self: *AgentRuntime, round_traces: []const ToolTrace) void {
+        if (!hooksLiveEnabled()) return;
+        const tool_calls_json = self.buildPostToolBatchJson(round_traces) catch return;
+        defer self.allocator.free(tool_calls_json);
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .post_tool_batch,
+            .cwd = self.cwd,
+            .tool_calls_json = tool_calls_json,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// Assemble `round_traces` into the `tool_calls` JSON array
+    /// `hook_io.buildPostToolBatchPayload` expects. Each element embeds
+    /// `tool_input`/`tool_response` as a nested object when the trace's
+    /// `args`/`output` already parse as JSON (matching every other tool-event
+    /// payload builder's raw-vs-string rule), else as a JSON string. Caller
+    /// owns the returned slice.
+    fn buildPostToolBatchJson(self: *AgentRuntime, round_traces: []const ToolTrace) ![]u8 {
+        var out = std_io.StringBuilder.init(self.allocator);
+        errdefer out.deinit();
+        const w = out.writer();
+        try w.writeAll("[");
+        for (round_traces, 0..) |t, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.print("{{\"tool_name\":{f},\"tool_input\":", .{std.json.fmt(t.name, .{})});
+            if (hook_io_mod.isValidJson(self.allocator, t.args)) {
+                try w.writeAll(t.args);
+            } else {
+                try w.print("{f}", .{std.json.fmt(t.args, .{})});
+            }
+            try w.writeAll(",\"tool_use_id\":\"\"");
+            if (t.executed) {
+                try w.writeAll(",\"tool_response\":");
+                if (hook_io_mod.isValidJson(self.allocator, t.output)) {
+                    try w.writeAll(t.output);
+                } else {
+                    try w.print("{f}", .{std.json.fmt(t.output, .{})});
+                }
+            }
+            try w.writeAll("}");
+        }
+        try w.writeAll("]");
+        return out.toOwnedSlice();
     }
 
     /// Drain any finished background (async / asyncRewake) hooks and deliver
@@ -6473,6 +6741,23 @@ const SkillGuardHarness = struct {
     }
 };
 
+test "hooks-permissions-09: transcript_path is derived from session_id at construction" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    try testing.expect(h.runtime.transcript_path.len > 0);
+    try testing.expect(std.mem.indexOf(u8, h.runtime.transcript_path, h.runtime.session_id) != null);
+    try testing.expect(std.mem.endsWith(u8, h.runtime.transcript_path, ".jsonl"));
+}
+
 test "sdk-headless-06: live-control mutators change runtime state through the dispatcher" {
     const test_helpers = @import("core/test_helpers.zig");
     const alloc = testing.allocator;
@@ -6946,6 +7231,207 @@ test "skills-11: inline skill registers its frontmatter hooks on invocation" {
     try testing.expectEqual(hook_event_mod.Event.pre_tool_use, registered[0].event);
     try testing.expectEqualStrings("Bash(*)", registered[0].matcher);
     try testing.expectEqualStrings("echo SKILL_HOOK_SENTINEL", registered[0].body);
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode -- explicit CLI reference mode wins over settings.json" {
+    // cfg.approval_mode == "plan" only happens when the user explicitly typed
+    // --approval-mode/--permission-mode plan; a configured settings.json
+    // defaultMode of acceptEdits must NOT override it.
+    const result = resolveInitialPermissionMode("plan", permission_decision_mod.Mode.acceptEdits);
+    try testing.expectEqual(permission_decision_mod.Mode.plan, result.?);
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode falls back to settings.json when approval_mode is a legacy name" {
+    // cfg.approval_mode == "tiered-auto" (zcode's built-in default, or an
+    // explicit legacy-mode CLI flag) means no reference-mode CLI flag was
+    // given -- settings.json's defaultMode applies.
+    const result = resolveInitialPermissionMode("tiered-auto", permission_decision_mod.Mode.bypassPermissions);
+    try testing.expectEqual(permission_decision_mod.Mode.bypassPermissions, result.?);
+
+    const manual_result = resolveInitialPermissionMode("manual", permission_decision_mod.Mode.dontAsk);
+    try testing.expectEqual(permission_decision_mod.Mode.dontAsk, manual_result.?);
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode is null when neither source sets it" {
+    try testing.expect(resolveInitialPermissionMode("tiered-auto", null) == null);
+    try testing.expect(resolveInitialPermissionMode("strict", null) == null);
+}
+
+test "hooks-permissions-04: PostToolBatch fires exactly once for a resolved round with both tool_calls present" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |h| {
+            if (alloc.dupeZ(u8, h)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "post_tool_batch.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PostToolBatch\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer alloc.free(settings);
+    try skillGuardWriteFile(tmp.dir, ".zcode/settings.json", settings);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    hooks_test_override = true;
+    defer hooks_test_override = false;
+
+    // A round with two parallel-eligible tool calls, mirroring what the
+    // parallel-batch pass would have appended into `traces` this round.
+    var round_traces = [_]ToolTrace{
+        .{
+            .name = try alloc.dupe(u8, "Read"),
+            .args = try alloc.dupe(u8, "{\"path\":\"a.txt\"}"),
+            .risk = .LOW,
+            .approval_state = .auto_approved,
+            .executed = true,
+            .duration_ms = 5,
+            .output = try alloc.dupe(u8, "file contents"),
+        },
+        .{
+            .name = try alloc.dupe(u8, "Glob"),
+            .args = try alloc.dupe(u8, "{\"pattern\":\"*.zig\"}"),
+            .risk = .LOW,
+            .approval_state = .auto_approved,
+            .executed = true,
+            .duration_ms = 3,
+            .output = try alloc.dupe(u8, "src/main.zig"),
+        },
+    };
+    defer for (&round_traces) |*t| t.deinit(alloc);
+
+    h.runtime.firePostToolBatchHook(&round_traces);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, sentinel, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("PostToolBatch hook did not fire: {s} ({any})\n", .{ sentinel, err });
+        return error.PostToolBatchHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("PostToolBatch", parsed.value.object.get("hook_event_name").?.string);
+    const calls = parsed.value.object.get("tool_calls").?.array;
+    try testing.expectEqual(@as(usize, 2), calls.items.len);
+    try testing.expectEqualStrings("Read", calls.items[0].object.get("tool_name").?.string);
+    try testing.expectEqualStrings("Glob", calls.items[1].object.get("tool_name").?.string);
+    // The parallel Read call's tool_input round-trips as a nested object (it
+    // was valid JSON), not a re-escaped string.
+    try testing.expectEqualStrings("a.txt", calls.items[0].object.get("tool_input").?.object.get("path").?.string);
+
+    // Exactly once: the hook wrote the payload exactly one time (a stray
+    // second firing would double the file's line count / duplicate content,
+    // which the single parseFromSlice call above would already have failed
+    // on if the file held two concatenated JSON objects).
+}
+
+fn hooksPermissions03DummyAskUser(ctx: *anyopaque, allocator: std.mem.Allocator, question: []const u8, choices: []const []const u8) anyerror![]u8 {
+    _ = ctx;
+    _ = question;
+    _ = choices;
+    return allocator.dupe(u8, "accept");
+}
+
+test "hooks-permissions-03: Elicitation fires before the MCP prompt and ElicitationResult fires after" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |h| {
+            if (alloc.dupeZ(u8, h)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    const elicit_sentinel = try std.fs.path.join(alloc, &.{ root, "elicitation.json" });
+    defer alloc.free(elicit_sentinel);
+    const result_sentinel = try std.fs.path.join(alloc, &.{ root, "elicitation_result.json" });
+    defer alloc.free(result_sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"Elicitation\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"ElicitationResult\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ elicit_sentinel, result_sentinel },
+    );
+    defer alloc.free(settings);
+    try skillGuardWriteFile(tmp.dir, ".zcode/settings.json", settings);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+    hooks_test_override = true;
+    defer hooks_test_override = false;
+
+    // Interactive with a working (unused, since this schema-less request
+    // short-circuits to "accept" before ever prompting) ask_user_fn so
+    // handleMcpElicitationRequest's access-check passes.
+    h.runtime.interactive = true;
+    var dummy_ctx: u8 = 0;
+    h.runtime.ask_user_fn = hooksPermissions03DummyAskUser;
+    h.runtime.ask_user_ctx = @ptrCast(&dummy_ctx);
+
+    const params_json = "{\"message\":\"need info\"}";
+    const result = try AgentRuntime.mcpBridgeHandleRequest(@ptrCast(&h.runtime), alloc, "elicitation/create", params_json);
+    defer if (result) |r| alloc.free(r);
+    try testing.expect(result != null);
+
+    const elicit_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, elicit_sentinel, alloc, .limited(4096)) catch |err| {
+        std.debug.print("Elicitation hook did not fire: {any}\n", .{err});
+        return error.ElicitationHookDidNotRun;
+    };
+    defer alloc.free(elicit_bytes);
+    var elicit_parsed = try std.json.parseFromSlice(std.json.Value, alloc, elicit_bytes, .{});
+    defer elicit_parsed.deinit();
+    try testing.expectEqualStrings("Elicitation", elicit_parsed.value.object.get("hook_event_name").?.string);
+    try testing.expect(std.mem.indexOf(u8, elicit_parsed.value.object.get("message").?.string, "need info") != null);
+
+    const result_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, result_sentinel, alloc, .limited(4096)) catch |err| {
+        std.debug.print("ElicitationResult hook did not fire: {any}\n", .{err});
+        return error.ElicitationResultHookDidNotRun;
+    };
+    defer alloc.free(result_bytes);
+    var result_parsed = try std.json.parseFromSlice(std.json.Value, alloc, result_bytes, .{});
+    defer result_parsed.deinit();
+    try testing.expectEqualStrings("ElicitationResult", result_parsed.value.object.get("hook_event_name").?.string);
+    try testing.expect(std.mem.indexOf(u8, result_parsed.value.object.get("message").?.string, "accept") != null);
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

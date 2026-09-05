@@ -13,6 +13,7 @@ const settings_sources = @import("settings_sources.zig");
 const session_env = @import("session_env.zig");
 const hook_exec_prompt = @import("hook_exec_prompt.zig");
 const hook_exec_http = @import("hook_exec_http.zig");
+const hook_exec_mcp_tool = @import("hook_exec_mcp_tool.zig");
 const async_hook_registry = @import("async_hook_registry.zig");
 const hooks_snapshot = @import("hooks_snapshot.zig");
 const session_hooks = @import("session_hooks.zig");
@@ -45,6 +46,12 @@ pub fn computeTimeoutMs(hook_type: hook_config.HookType, timeout_s: ?u32) u64 {
         .prompt => hook_exec_prompt.PROMPT_TIMEOUT_MS,
         .agent => hook_exec_prompt.AGENT_TIMEOUT_MS,
         .http => hook_exec_http.HTTP_TIMEOUT_MS,
+        // hooks-permissions-missed-163: a script file is a local process, same
+        // default budget as a command.
+        .script => COMMAND_HOOK_TIMEOUT_MS,
+        // hooks-permissions-06: an MCP tool call is a network round-trip to an
+        // already-connected server; matches the http hook default.
+        .mcp_tool => hook_exec_http.HTTP_TIMEOUT_MS,
     };
 }
 
@@ -90,30 +97,62 @@ pub const HookContext = struct {
     // payload as `task_id`/`task_subject`; the matcher tests against the subject.
     task_id: []const u8 = "",
     task_subject: []const u8 = "",
+    // hooks-permissions-10: Notification's required, separate category field
+    // (distinct from `message`, the free-text body). See hook_io.LifecycleFields'
+    // doc comment.
+    notification_type: []const u8 = "",
+    // hooks-permissions-09: the reference's always-present base fields (`Se`
+    // schema: session_id/transcript_path/permission_mode/agent_id/prompt_id on
+    // EVERY hook call). Populated by the two owned emission-point files
+    // (agent_runtime.zig / agent_tools.zig); every other caller (including
+    // every pre-existing test) leaves these at their zero value, which
+    // `hook_io.writeBaseFields` treats as "omit the field" so no existing
+    // payload shape changes.
+    session_id: []const u8 = "",
+    transcript_path: []const u8 = "",
+    permission_mode: []const u8 = "",
+    agent_id: []const u8 = "",
+    prompt_id: []const u8 = "",
+    // hooks-permissions-09: per-event tool extensions. `tool_use_id` is
+    // documented on every tool-shaped event (pre/post/post-failure/
+    // permission-request/permission-denied); `duration_ms` on
+    // post-tool-use/post-tool-use-failure only (the caller simply never sets
+    // it for other events).
+    tool_use_id: []const u8 = "",
+    duration_ms: ?u64 = null,
+    // hooks-permissions-04: `PostToolBatch`-only. A pre-built, already-valid
+    // JSON array literal -- see `hook_io.buildPostToolBatchPayload`'s doc
+    // comment for why the caller (not this module) assembles each element.
+    tool_calls_json: []const u8 = "",
 };
 
-/// True for the 3 tool events that have an on-disk `.sh` file form and a
-/// `tool_name`/`tool_args` payload. Everything else is a non-tool lifecycle
-/// event that dispatches purely via settings.json and matches on a single
+/// True for the tool-shaped events: the 3 original events with an on-disk
+/// `.sh` file form and a `tool_name`/`tool_args` payload, plus (hooks-
+/// permissions-01) `PermissionRequest`/`PermissionDenied`, which the
+/// reference documents as matching on "Tool name" exactly like PreToolUse/
+/// PostToolUse (bundled hooks doc table) even though they have no on-disk
+/// file form of their own. Everything else is a non-tool lifecycle event
+/// that dispatches purely via settings.json and matches on a single
 /// discriminating field instead of a tool name.
 fn isToolEvent(event: HookEvent) bool {
     return switch (event) {
-        .pre_tool_use, .post_tool_use, .post_tool_use_failure => true,
+        .pre_tool_use, .post_tool_use, .post_tool_use_failure, .permission_request, .permission_denied => true,
         else => false,
     };
 }
 
 /// The single field value a non-tool event's `matcher` is tested against
 /// (`hook_matcher.matchesField`). SessionStart matches its `source`,
-/// UserPromptSubmit its `prompt`, Notification its `message`, PreCompact its
-/// `trigger`, SessionEnd its `reason`. Events without a meaningful
-/// discriminator return "" (which `matchesField` treats as "match unless the
-/// matcher is a concrete value").
+/// UserPromptSubmit its `prompt`, Notification its `notification_type`
+/// (hooks-permissions-10 -- the reference's documented matcher target, not
+/// the free-text `message`), PreCompact its `trigger`, SessionEnd its
+/// `reason`. Events without a meaningful discriminator return "" (which
+/// `matchesField` treats as "match unless the matcher is a concrete value").
 fn matchFieldFor(ctx: HookContext) []const u8 {
     return switch (ctx.event) {
         .session_start => ctx.source,
         .user_prompt_submit => ctx.prompt,
-        .notification => ctx.message,
+        .notification => ctx.notification_type,
         .pre_compact => ctx.trigger,
         .session_end => ctx.reason,
         // TaskCreated / TaskCompleted match against the task subject so a hook
@@ -123,20 +162,58 @@ fn matchFieldFor(ctx: HookContext) []const u8 {
     };
 }
 
+/// hooks-permissions-09: assemble `ctx`'s always-present base fields into the
+/// shape both builders share. Shared by the tool and lifecycle branches below
+/// so the two payload shapes stay in sync.
+fn baseFieldsFor(ctx: HookContext) hook_io.HookBaseFields {
+    return .{
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .permission_mode = ctx.permission_mode,
+        .agent_id = ctx.agent_id,
+        .prompt_id = ctx.prompt_id,
+    };
+}
+
 /// Build the per-event stdin payload. Tool events use the tool builder;
 /// non-tool events use the lifecycle builder, emitting only their relevant
 /// discriminating field(s).
 fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
     const name = hook_event.canonicalName(ctx.event);
+    // hooks-permissions-04: PostToolBatch has neither a single tool_name/
+    // tool_input pair (it is NOT `isToolEvent`, matched like Setup/
+    // StopFailure on an empty discriminator) nor a lifecycle-style single
+    // field -- its own `tool_calls` array shape, built separately.
+    if (ctx.event == .post_tool_batch) {
+        return hook_io.buildPostToolBatchPayload(allocator, ctx.cwd, ctx.tool_calls_json, baseFieldsFor(ctx));
+    }
     if (isToolEvent(ctx.event)) {
         // PostToolUse / PostToolUseFailure carry the tool's response on stdin so
         // hooks can inspect it (reference: hooks.ts:3465 `tool_response`). PreToolUse
-        // has no response yet, so pass null (no `tool_response` field emitted).
+        // (and PermissionRequest/PermissionDenied, which fire before/without a
+        // tool result) have no response yet, so pass null.
         const response: ?[]const u8 = switch (ctx.event) {
             .post_tool_use, .post_tool_use_failure => ctx.tool_output,
             else => null,
         };
-        return hook_io.buildToolEventPayloadFull(allocator, name, ctx.tool_name, ctx.tool_args, ctx.cwd, response, ctx.tool_success);
+        // hooks-permissions-09: duration_ms is documented only for
+        // PostToolUse/PostToolUseFailure ("Tool execution time in
+        // milliseconds"); every other tool-shaped event never sets it.
+        const duration_ms: ?u64 = switch (ctx.event) {
+            .post_tool_use, .post_tool_use_failure => ctx.duration_ms,
+            else => null,
+        };
+        return hook_io.buildToolEventPayloadFull(
+            allocator,
+            name,
+            ctx.tool_name,
+            ctx.tool_args,
+            ctx.cwd,
+            response,
+            ctx.tool_success,
+            baseFieldsFor(ctx),
+            .{ .tool_use_id = ctx.tool_use_id, .reason = ctx.reason, .duration_ms = duration_ms },
+        );
     }
     var fields: hook_io.LifecycleFields = .{};
     switch (ctx.event) {
@@ -145,6 +222,7 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
         .notification => {
             fields.message = nonEmptyOrNull(ctx.message);
             fields.title = nonEmptyOrNull(ctx.title);
+            fields.notification_type = nonEmptyOrNull(ctx.notification_type);
         },
         .pre_compact => fields.trigger = nonEmptyOrNull(ctx.trigger),
         .session_end => fields.reason = nonEmptyOrNull(ctx.reason),
@@ -152,9 +230,15 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
             fields.task_id = nonEmptyOrNull(ctx.task_id);
             fields.task_subject = nonEmptyOrNull(ctx.task_subject);
         },
+        // hooks-permissions-03: Elicitation/ElicitationResult carry the raw
+        // MCP `elicitation/create` request params / response JSON as
+        // `message` -- see agent_runtime.fireElicitationHook's doc comment
+        // for why this reuses the generic carrier rather than a dedicated
+        // field.
+        .elicitation, .elicitation_result => fields.message = nonEmptyOrNull(ctx.message),
         else => {},
     }
-    return hook_io.buildLifecycleEventPayload(allocator, name, ctx.cwd, fields);
+    return hook_io.buildLifecycleEventPayload(allocator, name, ctx.cwd, fields, baseFieldsFor(ctx));
 }
 
 fn nonEmptyOrNull(s: []const u8) ?[]const u8 {
@@ -349,6 +433,24 @@ pub fn runTaskCreatedHook(
     // otherwise fall back to whatever the hook wrote on stdout.
     const reason = result.stop_reason orelse result.output;
     return .{ .blocked = true, .message = try allocator.dupe(u8, reason) };
+}
+
+/// hooks-permissions-02: fire the `TaskCompleted` lifecycle hook when a task
+/// transitions into a resolved (done/completed) status. Unlike
+/// `runTaskCreatedHook` (which can veto the just-created task, mirroring the
+/// reference's create-then-maybe-delete flow), `TaskCompleted` has no
+/// documented block-and-undo semantics of its own -- the task has already
+/// finished, there is nothing left to unwind -- so this is fire-and-forget:
+/// callers do not act on the result, matching `runSetupHook`/
+/// `runStopFailureHook` below.
+pub fn runTaskCompletedHook(allocator: std.mem.Allocator, cwd: []const u8, task_id: []const u8, task_subject: []const u8) void {
+    var result = run(allocator, .{
+        .event = .task_completed,
+        .cwd = cwd,
+        .task_id = task_id,
+        .task_subject = task_subject,
+    }) catch return;
+    result.deinit(allocator);
 }
 
 pub fn run(allocator: std.mem.Allocator, ctx: HookContext) !HookRunResult {
@@ -627,12 +729,11 @@ fn processDef(
         if (path) |p| removeOnceHook(allocator, p, engine_event, def) catch {};
     }
 
-    // Task 6 (hooks-02): dispatch by hook type. command runs locally;
-    // prompt/agent query an LLM with the payload as `$ARGUMENTS`; http
-    // is wired in Task 7 (skipped here, so a settings.json http hook is
-    // a no-op rather than a crash until that task lands).
+    // Task 6 (hooks-02): dispatch by hook type. command/script run locally;
+    // prompt/agent query an LLM with the payload as `$ARGUMENTS`; http POSTs
+    // it; mcp_tool invokes an already-configured MCP server's tool.
     switch (def.hook_type) {
-        .command => {},
+        .command, .script => {},
         .prompt, .agent => {
             ran.* = true;
             var outcome = (if (def.hook_type == .agent)
@@ -649,11 +750,56 @@ fn processDef(
                 const reason = outcome.reason orelse "";
                 allocator.free(last_output.*);
                 last_output.* = try allocator.dupe(u8, reason);
+                // hooks-permissions-08: `continueOnBlock` (prompt hooks only)
+                // downgrades a block into a continuable signal -- the turn
+                // proceeds with the reason surfaced as additional context
+                // instead of stopping.
+                const continue_on_block = def.hook_type == .prompt and def.continue_on_block;
+                return .{
+                    .ran = true,
+                    .blocked = !continue_on_block,
+                    .output = last_output.*,
+                    .continue_run = if (continue_on_block) true else null,
+                    .stop_reason = try dupeOpt(allocator, reason),
+                    .additional_context = if (continue_on_block) try dupeOpt(allocator, reason) else null,
+                };
+            }
+            return null;
+        },
+        .mcp_tool => {
+            // hooks-permissions-06: invoke an already-configured MCP server's
+            // tool. No live registry hookup is wired at this call site (see
+            // hook_exec_mcp_tool.zig's header note), so this degrades to a
+            // documented non-blocking error rather than silently doing
+            // nothing -- but the type is fully parsed/dispatched, unlike
+            // before where it was silently dropped at parse time.
+            ran.* = true;
+            const fields = [_]hook_exec_mcp_tool.Field{
+                .{ .path = "tool_name", .value = ctx.tool_name },
+                .{ .path = "tool_input", .value = ctx.tool_args },
+            };
+            const mcp_timeout_ms = computeTimeoutMs(def.hook_type, def.timeout_s);
+            var outcome = hook_exec_mcp_tool.runMcpToolHook(allocator, def, &fields, mcp_timeout_ms, null, null) catch return null;
+            defer outcome.deinit(allocator);
+            if (outcome.blocked) {
+                const reason = outcome.reason orelse "";
+                allocator.free(last_output.*);
+                last_output.* = try allocator.dupe(u8, reason);
                 return .{
                     .ran = true,
                     .blocked = true,
                     .output = last_output.*,
                     .stop_reason = try dupeOpt(allocator, reason),
+                };
+            }
+            if (outcome.additional_context) |ac| {
+                allocator.free(last_output.*);
+                last_output.* = try allocator.dupe(u8, "");
+                return .{
+                    .ran = true,
+                    .blocked = false,
+                    .output = last_output.*,
+                    .additional_context = try dupeOpt(allocator, ac),
                 };
             }
             return null;
@@ -732,7 +878,11 @@ fn processDef(
     // non-blocking error (continue to the next hook), matching the
     // reference's cancelled/abort outcome.
     const cmd_timeout_ms = computeTimeoutMs(def.hook_type, def.timeout_s);
-    const run_res = runCommandWithStdin(allocator, def.body, ctx.cwd, zcode_home, payload, engine_event, cmd_timeout_ms) catch return null;
+    // hooks-permissions-07 / -missed-163: a `script` hook, or a `command` hook
+    // carrying exec-form `args`, is spawned directly (no shell) so its args
+    // are never re-parsed by a shell -- see runCommandWithStdin's doc comment.
+    const direct_spawn = def.hook_type == .script or def.args.len > 0;
+    const run_res = runCommandWithStdin(allocator, def.body, def.args, direct_spawn, ctx.cwd, zcode_home, payload, engine_event, cmd_timeout_ms) catch return null;
     defer allocator.free(run_res.stdout);
     if (run_res.timed_out) {
         // Task 16: a timed-out hook reports a `cancelled` response (reference
@@ -878,15 +1028,25 @@ fn onceEntryMatches(entry: std.json.Value, def: hook_config.HookDef, group_match
         .prompt => "prompt",
         .http => "http",
         .agent => "agent",
+        .mcp_tool => "mcp_tool",
+        .script => "script",
     };
     if (!std.mem.eql(u8, type_str, want_type)) return false;
-    const body_key = switch (def.hook_type) {
-        .command => "command",
-        .http => "url",
-        .prompt, .agent => "prompt",
-    };
-    const body_str = jsonStr(entry.object.get(body_key), "");
-    if (!std.mem.eql(u8, body_str, def.body)) return false;
+    if (def.hook_type == .mcp_tool) {
+        // mcp_tool has no single "body" string; match on server+tool identity.
+        if (!std.mem.eql(u8, jsonStr(entry.object.get("server"), ""), def.mcp_server)) return false;
+        if (!std.mem.eql(u8, jsonStr(entry.object.get("tool"), ""), def.mcp_tool)) return false;
+    } else {
+        const body_key = switch (def.hook_type) {
+            .command => "command",
+            .http => "url",
+            .prompt, .agent => "prompt",
+            .script => if (entry.object.get("file") != null) "file" else "script",
+            .mcp_tool => unreachable,
+        };
+        const body_str = jsonStr(entry.object.get(body_key), "");
+        if (!std.mem.eql(u8, body_str, def.body)) return false;
+    }
     if (!std.mem.eql(u8, jsonStr(entry.object.get("if"), ""), def.if_cond)) return false;
     if (!std.mem.eql(u8, group_matcher, def.matcher)) return false;
     return true;
@@ -922,16 +1082,29 @@ fn writeSettingsAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []
 
 const CommandResult = struct { exit_code: u8, stdout: []u8, timed_out: bool = false };
 
-/// Run `sh -c "<command> < <tmp>"` with `payload` written to the temp file so
-/// the hook receives it on stdin. Uses the one-shot runner (captures stdout,
-/// no manual pipe pumping). Temp file uses a hex-only name so no shell quoting
-/// is needed; it is removed afterward.
+/// Run a command hook with `payload` written to a temp file so the hook
+/// receives it on stdin. Uses the one-shot runner (captures stdout, no manual
+/// pipe pumping). Temp file uses a hex-only name so no shell quoting is
+/// needed; it is removed afterward.
+///
+/// Two spawn forms, selected by `direct`:
+///   - `direct == false` (the default `command` form): `sh -c "<command> <
+///     <tmp>"` -- `command` is a full shell string.
+///   - `direct == true` (hooks-permissions-07's exec form, and every `script`
+///     hook): `command` is resolved as an executable and spawned with `args`
+///     as its argv, delivered via `sh -c 'exec "$0" "$@" < <tmp>' <command>
+///     <args...>`. Each of `command`/`args` is bound to `sh`'s positional
+///     parameters as a literal argv element -- never interpolated into the
+///     script text -- so quotes/$/backticks in an argument never reach the
+///     shell parser (the documented exec-form security property). `sh` is
+///     still the process spawned (so the stdin-redirect trick keeps working
+///     unchanged), but it never re-parses `command`/`args` as script text.
 ///
 /// Task 8 (hooks-08): `timeout_ms` bounds the wall-clock the hook may take. On
 /// expiry `std.process.run` reaps the child internally (CLAUDE.md: do NOT
 /// `wait()` after a kill) and returns `error.Timeout`, which we surface as a
 /// `timed_out` result (a non-blocking outcome, not a block).
-fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: []const u8, home: []const u8, payload: []const u8, event: HookEvent, timeout_ms: u64) !CommandResult {
+fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, args: []const []const u8, direct: bool, cwd: []const u8, home: []const u8, payload: []const u8, event: HookEvent, timeout_ms: u64) !CommandResult {
     const nonce = clock.nowNanos();
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.hook-input-{x}.json", .{ home, nonce });
     defer allocator.free(tmp_path);
@@ -947,8 +1120,20 @@ fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: [
     // which would otherwise split the redirect target and inject a stray argv.
     // PRD #534 review fix. (A single quote in the home path is not escaped, but
     // that is vanishingly rare and would only fail the hook, not misbehave.)
-    const full = try std.fmt.allocPrint(allocator, "{s} < '{s}'", .{ command, tmp_path });
+    const full = if (direct)
+        try std.fmt.allocPrint(allocator, "exec \"$0\" \"$@\" < '{s}'", .{tmp_path})
+    else
+        try std.fmt.allocPrint(allocator, "{s} < '{s}'", .{ command, tmp_path });
     defer allocator.free(full);
+
+    var argv_storage: std.ArrayList([]const u8) = .empty;
+    defer argv_storage.deinit(allocator);
+    if (direct) {
+        try argv_storage.appendSlice(allocator, &.{ "sh", "-c", full, command });
+        try argv_storage.appendSlice(allocator, args);
+    } else {
+        try argv_storage.appendSlice(allocator, &.{ "sh", "-c", full });
+    }
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
@@ -972,7 +1157,7 @@ fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: [
     // already reaped the killed child (no manual wait); surface it as a
     // non-blocking timed_out result so a hung hook cannot stall the agent.
     const result = std.process.run(allocator, rt.io, .{
-        .argv = &.{ "sh", "-c", full },
+        .argv = argv_storage.items,
         .cwd = .{ .path = cwd },
         .environ_map = &env_map,
         .stdout_limit = .limited(64 * 1024),

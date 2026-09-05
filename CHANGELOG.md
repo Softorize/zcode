@@ -268,6 +268,18 @@ All notable changes to `zcode` should be documented in this file.
 - Add `/import <codex|gemini> [--dry-run]` and a shared `core/import_agent_config.zig`: imports a Codex CLI or Gemini CLI project's instructions file and configured MCP servers into `CLAUDE.md` / `.mcp.json`. A top-level `zcode import` CLI subcommand shares the same importer (not yet wired into `cli/args.zig`).
 - Add `/skill-doctor`: lists every loaded skill with its scope, used/unused status (from the existing skill-usage tracker), and an approximate context cost.
 - Add `/reload-skills`: re-scans `.zcode/skills` / `.claude/skills` and reports the current skill listing (skill discovery already re-scans disk on every call, so this is a user-facing confirmation of that).
+- wp5b-permissions-hooks (2.1.261 permissions/hooks parity):
+  - Fire `PermissionRequest` before an interactive permission prompt and `PermissionDenied` whenever a tool call is denied (by a permission rule, by a PreToolUse hook's forced ask, or by the effective permission mode itself in a non-interactive session), and fire `PostToolUseFailure` (instead of `PostToolUse`) when the execution gates refuse to run a tool at all or the dispatch layer throws -- all three were parsed but never constructed anywhere.
+  - Fire `Setup` once per session (alongside `SessionStart`) and `TaskCompleted` once when a task transitions into a resolved (done/completed) status; `StopFailure` is not wired (see notes).
+  - Fire `PostToolBatch` exactly once after every tool call in a round (parallel-batch and sequential alike) has resolved, before the next model request, carrying the round's `tool_calls` as a JSON array.
+  - Fire `Elicitation` before an MCP `elicitation/create` prompt and `ElicitationResult` after it resolves.
+  - Add the six 2.1.261 hook events zcode's `Event` enum was entirely missing: `PostToolBatch`, `UserPromptExpansion`, `PreModelSwitch`, `PostModelSwitch`, `DirectoryAdded`, `MessageDisplay`.
+  - Every hook's stdin JSON now carries the reference's always-present base fields when known: `session_id`, `transcript_path`, `permission_mode`, `agent_id`, `prompt_id`, plus per-event `tool_use_id`/`duration_ms`/`reason`.
+  - Fix the `Notification` hook's matcher to test against a new `notification_type` category field (e.g. `"idle"`) instead of the free-text message body, matching the reference.
+  - Add the `auto` permission mode (settings.json `permissions.defaultMode`, `--permission-mode auto`/`--approval-mode auto`, and the Shift+Tab-adjacent mode machinery); zcode has no cloud classifier, so it is a documented approximation of ask-on-tier. `--permission-mode auto` no longer silently degrades to `tiered-auto`.
+  - Add the `mcp_tool` hook type (invokes an already-configured MCP server's tool; the live registry bridge is invocation-ready but not yet wired to a real MCP client) and the `script` hook type (runs a named script file), plus command-hook exec-form `args` (shell-less spawn) and `continueOnBlock` for prompt hooks.
+  - Add per-tool permission-rule content validation (`WebFetch` requires a `domain:` prefix, `WebSearch` rejects wildcards) and `~`/`~/` tilde-expansion for file-pattern-tool rule content (`Read`, `Write`, `Edit`, `Glob`, `NotebookRead`, `NotebookEdit`, `Cd`).
+  - `.claude/settings.json`'s `permissions.additionalDirectories` and `permissions.defaultMode` now take effect (unioned with the persisted `/add-dir` list and the `--add-dir` CLI flag; layered under an explicit reference-mode CLI flag).
 
 ## 0.6.30
 

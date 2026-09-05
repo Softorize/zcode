@@ -189,6 +189,8 @@ comptime {
     _ = @import("core/hook_config.zig");
     _ = @import("core/hook_exec_prompt.zig");
     _ = @import("core/hook_exec_http.zig");
+    _ = @import("core/hook_exec_mcp_tool.zig");
+    _ = @import("core/permission_rule_validation.zig");
     _ = @import("core/async_hook_registry.zig");
     _ = @import("core/hooks_snapshot.zig");
     _ = @import("core/session_hooks.zig");
