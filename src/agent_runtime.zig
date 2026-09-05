@@ -1969,6 +1969,7 @@ pub const AgentRuntime = struct {
                     &self.git_capture_cache,
                     working_context,
                     prompt_mode,
+                    !self.interactive,
                 );
                 defer built.envelope.deinit();
 
@@ -6020,6 +6021,7 @@ pub const AgentRuntime = struct {
             &self.git_capture_cache,
             working_context,
             @enumFromInt(@intFromEnum(effective_mode)),
+            !self.interactive,
         );
         defer built.envelope.deinit();
 

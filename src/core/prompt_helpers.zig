@@ -194,6 +194,16 @@ pub fn renderDynamicSystemPolicy(
     session_system_prompt: []const u8,
     preferred_language: []const u8,
     prompt_mode: types.PromptMode,
+    /// system-prompt-missed-74: true when this turn is running
+    /// non-interactively (headless / `--print`, no user watching in real
+    /// time). Mirrors Claude Code 2.1.261, which only emits the "You are
+    /// operating autonomously" paragraph in that case -- an interactive REPL
+    /// session already has a human present to ask, so injecting the
+    /// autonomy paragraph there would just tell the model to stop asking a
+    /// user who is, in fact, available. The "before ending your turn" and
+    /// "before running a command that changes system state" paragraphs are
+    /// unconditional (both interactive and headless sessions benefit).
+    is_headless: bool,
 ) ![]u8 {
     var out = std_io.StringBuilder.init(allocator);
     defer out.deinit();
@@ -305,6 +315,25 @@ pub fn renderDynamicSystemPolicy(
             "If the user approved a recommendation, said continue, or said implement, do not stop after announcing intent. Call the required Read/Edit/Write/Bash/Todo tools in the same response. Intent without a matching tool call is incomplete execution.\n" ++
             "If you need to mutate files, move from inspection to Edit/Write/MultiEdit as soon as the target and exact change are known. Avoid repeated read-only loops unless the next read answers a specific missing fact.\n" ++
             "Important facts from tool results may be compacted or budgeted away later. Preserve decisions, blockers, file paths, and verification outcomes in your assistant message or task state.\n",
+    );
+
+    // system-prompt-missed-74: ported from cc_system_prompt_2.1.261.md's
+    // autonomy paragraph (only when running non-interactively -- see the
+    // is_headless doc comment above), plus the always-on "before ending
+    // your turn" self-check and "before running a state-changing command"
+    // evidence check. These are distinct from -- and layered on top of --
+    // the narrower "Execution continuity" guidance above, which only
+    // covers continuing after explicit user approval.
+    if (is_headless) {
+        try out.writer().writeAll(
+            "\nYou are operating autonomously. The user is not watching in real time and cannot answer questions mid-task, so asking 'Want me to...?' or 'Shall I...?' will block the work. For reversible actions that follow from the original request, proceed without asking. Stop only for destructive actions or genuine scope changes the user must decide. Offering follow-ups after the task is done is fine; asking permission before doing the work is not.\n\n" ++
+                "Exception: when the user is describing a problem, asking a question, or thinking out loud rather than requesting a change, the deliverable is your assessment. Report your findings and stop. Don't apply a fix until they ask for one.\n",
+        );
+    }
+
+    try out.writer().writeAll(
+        "\nBefore ending your turn, check your last paragraph. If it is a plan, an analysis, a question, a list of next steps, or a promise about work you have not done ('I'll...', 'let me know when...'), do that work now with tool calls. That includes retrying after errors and gathering missing information yourself. Do not stop because the context or session is long. End your turn only when the task is complete or you are blocked on input only the user can provide.\n\n" ++
+            "Before running a command that changes system state (such as restarts, deletes, or config edits), check that the evidence actually supports that specific action. A signal that pattern-matches to a known failure may have a different cause.\n",
     );
 
     if (cfg.append_system_prompt.len > 0) {
@@ -1101,6 +1130,7 @@ test "renderDynamicSystemPolicy injects Today's date into the prompt" {
         "",
         "",
         .execution,
+        false,
     );
     defer allocator.free(rendered);
 
@@ -1155,6 +1185,7 @@ test "renderDynamicSystemPolicy loads MEMORY.md index under its header" {
         "",
         "",
         .execution,
+        false,
     );
     defer allocator.free(rendered);
 
@@ -1194,6 +1225,7 @@ test "renderDynamicSystemPolicy emits the empty-index fallback when MEMORY.md is
         "",
         "",
         .execution,
+        false,
     );
     defer allocator.free(rendered);
 
@@ -1221,6 +1253,7 @@ test "renderDynamicSystemPolicy injects Language section when session override i
         "",
         "Spanish",
         .execution,
+        false,
     );
     defer allocator.free(rendered);
 
@@ -1251,6 +1284,7 @@ test "renderDynamicSystemPolicy falls back to cfg.preferred_language when sessio
         "",
         "", // empty override -> use cfg
         .execution,
+        false,
     );
     defer allocator.free(rendered);
 
@@ -1276,6 +1310,7 @@ test "renderDynamicSystemPolicy omits Language section when no preference is set
         "",
         "",
         .execution,
+        false,
     );
     defer allocator.free(rendered);
 
@@ -1306,6 +1341,7 @@ test "renderDynamicSystemPolicy includes the memory taxonomy when the gate is on
             "",
             "",
             .execution,
+            false,
         );
         defer allocator.free(rendered);
 
@@ -1330,6 +1366,7 @@ test "renderDynamicSystemPolicy includes the memory taxonomy when the gate is on
             "",
             "",
             .execution,
+            false,
         );
         defer allocator.free(rendered);
 
@@ -1355,6 +1392,7 @@ test "renderDynamicSystemPolicy injects planning-mode contract only when mode is
         "",
         "",
         .execution,
+        false,
     );
     defer allocator.free(exec_rendered);
     try testing.expect(std.mem.indexOf(u8, exec_rendered, "PLAN MODE IS ACTIVE") == null);
@@ -1369,6 +1407,7 @@ test "renderDynamicSystemPolicy injects planning-mode contract only when mode is
         "",
         "",
         .planning,
+        false,
     );
     defer allocator.free(plan_rendered);
     // Contract header, the five required plan sections, and the
@@ -1399,6 +1438,7 @@ test "renderDynamicSystemPolicy injects review-mode contract only when mode is r
         "",
         "",
         .execution,
+        false,
     );
     defer allocator.free(exec_rendered);
     try testing.expect(std.mem.indexOf(u8, exec_rendered, "REVIEW MODE IS ACTIVE") == null);
@@ -1413,6 +1453,7 @@ test "renderDynamicSystemPolicy injects review-mode contract only when mode is r
         "",
         "",
         .review,
+        false,
     );
     defer allocator.free(review_rendered);
     try testing.expect(std.mem.indexOf(u8, review_rendered, "REVIEW MODE IS ACTIVE") != null);
@@ -1561,4 +1602,74 @@ test "buildCompactedHistory wraps the summary in the continuation directive" {
     // The tail is preserved verbatim after the directive.
     try testing.expectEqualStrings("do the thing", out[1].content);
     try testing.expectEqualStrings("did the thing", out[2].content);
+}
+
+test "renderDynamicSystemPolicy always includes the before-ending-turn and system-state-change checks (system-prompt-missed-74)" {
+    const allocator = testing.allocator;
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const rendered = try renderDynamicSystemPolicy(
+        allocator,
+        &cfg,
+        &policy,
+        "/tmp/zcode-test",
+        "hello",
+        "default",
+        "",
+        "",
+        .execution,
+        false,
+    );
+    defer allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "Before ending your turn") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "changes system state") != null);
+    // Not headless: the autonomy paragraph must NOT be present.
+    try testing.expect(std.mem.indexOf(u8, rendered, "operating autonomously") == null);
+}
+
+test "renderDynamicSystemPolicy includes the autonomy paragraph only when is_headless is true (system-prompt-missed-74)" {
+    const allocator = testing.allocator;
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const headless_rendered = try renderDynamicSystemPolicy(
+        allocator,
+        &cfg,
+        &policy,
+        "/tmp/zcode-test",
+        "hello",
+        "default",
+        "",
+        "",
+        .execution,
+        true,
+    );
+    defer allocator.free(headless_rendered);
+
+    try testing.expect(std.mem.indexOf(u8, headless_rendered, "operating autonomously") != null);
+    try testing.expect(std.mem.indexOf(u8, headless_rendered, "Want me to") != null);
+    // Still unconditional even when headless.
+    try testing.expect(std.mem.indexOf(u8, headless_rendered, "Before ending your turn") != null);
+
+    const interactive_rendered = try renderDynamicSystemPolicy(
+        allocator,
+        &cfg,
+        &policy,
+        "/tmp/zcode-test",
+        "hello",
+        "default",
+        "",
+        "",
+        .execution,
+        false,
+    );
+    defer allocator.free(interactive_rendered);
+
+    try testing.expect(std.mem.indexOf(u8, interactive_rendered, "operating autonomously") == null);
 }
