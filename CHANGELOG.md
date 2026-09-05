@@ -327,6 +327,10 @@ All notable changes to `zcode` should be documented in this file.
   - The persistent stream-json session now detects a real mid-session skill/command-list change (e.g. the agent `cd`s into a subdirectory with its own `.claude/skills`, or writes a new skill file) and pushes a `{"type":"system","subtype":"commands_changed",...}` line with the full new list, per the reference's "clients should REPLACE their cached command list" contract.
   - Add the hidden `--enable-auth-status` flag (parses, intentionally omitted from `--help`); the corresponding `auth_status` SDK message serializer was already wired.
   - `verbose = true`/`false` is now a recognized `config.toml` key (previously rejected as an unknown key); `--verbose` continues to override it for a single run, and the merged value now actually reaches every verbosity gate in the process (previously the config default was computed but silently discarded).
+- wp1a-commands-surface fixes (verifier follow-up):
+  - `/pause-memory` (+ `/memory-pause`, `/toggle-memory`) now genuinely suppresses the automemory taxonomy/`MEMORY.md`-index system-prompt sections for the rest of the session, not just an inert env flag: `core/memory_gate.zig`'s `isAutoMemoryEnabled` -- the single gate every automemory call site already consults -- checks the session pause flag as its highest-priority condition.
+  - `/debug <issue>` now actually restricts its investigation to read-only tools: it dispatches in review mode, which strips mutating tool schemas (Edit/Write/Bash/etc.) from what the model is offered and rejects any mutating tool call outright, instead of only asking the model nicely via prompt text.
+  - `/context` now appends the effective auto-compact threshold (including any `/autocompact` session override) to its report, so a changed threshold is externally verifiable without re-invoking `/autocompact` itself.
 
 ## 0.6.30
 

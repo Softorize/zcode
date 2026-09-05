@@ -1375,6 +1375,67 @@ test "renderDynamicSystemPolicy includes the memory taxonomy when the gate is on
     }
 }
 
+// commands-21: /pause-memory (src/repl_commands.zig) sets ZCODE_AUTOMEMORY_PAUSED
+// via env.setOverride. Prove end-to-end that a subsequent turn's rendered
+// system prompt genuinely drops the automemory section while paused, and
+// that it comes back once the flag is cleared (the /pause-memory toggle-back
+// path) -- not just that memory_gate.isAutoMemoryEnabled() flips in
+// isolation.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "renderDynamicSystemPolicy omits the memory taxonomy while /pause-memory is active" {
+    const allocator = testing.allocator;
+    defer _ = unsetenv("ZCODE_AUTOMEMORY_PAUSED");
+
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+
+    // Simulate /pause-memory: set the same env override the REPL command sets.
+    _ = setenv("ZCODE_AUTOMEMORY_PAUSED", "1", 1);
+    {
+        const rendered = try renderDynamicSystemPolicy(
+            allocator,
+            &cfg,
+            &policy,
+            "/tmp/zcode-test",
+            "hello",
+            "default",
+            "",
+            "",
+            .execution,
+            false,
+        );
+        defer allocator.free(rendered);
+
+        try testing.expect(std.mem.indexOf(u8, rendered, "## Types of memory") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Saving a memory is a two-step process") == null);
+    }
+
+    // Simulate /pause-memory again (toggle-back, clears the override): the
+    // taxonomy is injected again on the next turn.
+    _ = unsetenv("ZCODE_AUTOMEMORY_PAUSED");
+    {
+        const rendered = try renderDynamicSystemPolicy(
+            allocator,
+            &cfg,
+            &policy,
+            "/tmp/zcode-test",
+            "hello",
+            "default",
+            "",
+            "",
+            .execution,
+            false,
+        );
+        defer allocator.free(rendered);
+
+        try testing.expect(std.mem.indexOf(u8, rendered, "## Types of memory") != null);
+    }
+}
+
 test "renderDynamicSystemPolicy injects planning-mode contract only when mode is planning" {
     const allocator = testing.allocator;
     var cfg = try config_mod.Config.init(allocator);

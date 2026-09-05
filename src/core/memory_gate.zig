@@ -22,7 +22,14 @@ const config = @import("config.zig");
 const memory = @import("memory.zig");
 
 /// Whether auto-memory features are enabled. Enabled by default. Priority
-/// chain (first defined wins), porting paths.ts:30-55:
+/// chain (first defined wins), porting paths.ts:30-55, plus a zcode-native
+/// session-scoped pause on top (commands-21, /pause-memory):
+///   0. ZCODE_AUTOMEMORY_PAUSED truthy => OFF for this session. This is set
+///      by the /pause-memory (+/memory-pause, /toggle-memory) REPL command
+///      (src/repl_commands.zig) via env.setOverride and takes priority over
+///      everything below -- it is an explicit, session-scoped user action
+///      that should suppress automemory regardless of settings/env disable
+///      state, and does not persist past the process.
 ///   1. ZCODE_DISABLE_AUTO_MEMORY / CLAUDE_CODE_DISABLE_AUTO_MEMORY env:
 ///      truthy => OFF, defined-falsy => ON (the explicit env always wins).
 ///   2. ZCODE_SIMPLE / CLAUDE_CODE_SIMPLE (--bare) truthy => OFF.
@@ -34,6 +41,11 @@ const memory = @import("memory.zig");
 /// SIMPLE and before the setting, exactly as paths.ts does, so a defined-falsy
 /// ZCODE_DISABLE_AUTO_MEMORY=0 forces ON even when the setting says false.
 pub fn isAutoMemoryEnabled(cfg: *const config.Config) bool {
+    // 0. Session-scoped /pause-memory toggle. Highest priority: an explicit
+    // in-session command always wins.
+    if (env.isEnvTruthy("ZCODE_AUTOMEMORY_PAUSED")) {
+        return false;
+    }
     // 1. Explicit disable env (with claude alias). Truthy wins => OFF.
     if (envTruthyEither("ZCODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_DISABLE_AUTO_MEMORY")) {
         return false;
@@ -260,6 +272,32 @@ fn clearGateEnv() void {
     _ = unsetenv("CLAUDE_CODE_SIMPLE");
     _ = unsetenv("ZCODE_MEMORY_PATH_OVERRIDE");
     _ = unsetenv("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE");
+    _ = unsetenv("ZCODE_AUTOMEMORY_PAUSED");
+}
+
+test "isAutoMemoryEnabled: /pause-memory session override beats everything else" {
+    clearGateEnv();
+    defer clearGateEnv();
+
+    var cfg = try config.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+
+    // Baseline: default ON.
+    try testing.expect(isAutoMemoryEnabled(&cfg));
+
+    // The /pause-memory toggle (repl_commands.zig sets this via
+    // env.setOverride) forces OFF even though nothing else is disabled.
+    _ = setenv("ZCODE_AUTOMEMORY_PAUSED", "1", 1);
+    try testing.expect(!isAutoMemoryEnabled(&cfg));
+
+    // It wins even over an explicit setting that says "on".
+    cfg.auto_memory_enabled = true;
+    try testing.expect(!isAutoMemoryEnabled(&cfg));
+
+    // Clearing it (the /pause-memory toggle-back path) restores the
+    // underlying decision.
+    _ = unsetenv("ZCODE_AUTOMEMORY_PAUSED");
+    try testing.expect(isAutoMemoryEnabled(&cfg));
 }
 
 test "isAutoMemoryEnabled honors the env disable flag over the setting" {
