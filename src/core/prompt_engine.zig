@@ -10,6 +10,7 @@ const compaction = @import("compaction.zig");
 const tokenizer = @import("tokenizer.zig");
 const policy_mod = @import("../policy/policy.zig");
 const prompt_helpers = @import("prompt_helpers.zig");
+const system_prompt = @import("system_prompt.zig");
 const skills_mod = @import("skills.zig");
 const env_mod = @import("env.zig");
 
@@ -960,6 +961,37 @@ test "renderSystemPromptPacket includes the session-specific guidance tips (syst
     // Never claim the ultrareview command exists -- zcode has no such
     // command yet.
     try testing.expect(std.mem.indexOf(u8, rendered, "ultrareview") == null);
+}
+
+test "renderSystemPromptPacket never leaks Claude Code or Anthropic identity (identity-leak)" {
+    // End-to-end identity check: builds the real static prefix (system_prompt.zig)
+    // and folds it through the full dynamic system-reminder pipeline
+    // (renderSystemPromptPacket), then asserts the combined rendered system
+    // prompt never claims zcode IS Claude Code or Anthropic. This is the
+    // pipeline the CLI actually uses (`prompt inspect --json`), so a leak
+    // introduced in either the static sections or any dynamic
+    // system-reminder block is caught here.
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const static_prefix = try system_prompt.renderStaticPrefix(a, true);
+
+    const env = types.PromptEnvelope{
+        .system_policy = static_prefix,
+        .instruction_stack = &.{},
+        .user_turn = "hi",
+        .tool_schemas = &.{},
+        .history = &.{},
+        .context_blocks = &.{},
+        .budget_plan = types.BudgetPlan.init(100, 10, 10),
+        .cache_hints = &.{},
+    };
+
+    const rendered = try renderSystemPromptPacket(a, &env);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Anthropic") == null);
 }
 
 test "renderPromptPacket builds system and user packets" {
