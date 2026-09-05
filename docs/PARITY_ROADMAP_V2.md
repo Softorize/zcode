@@ -356,3 +356,21 @@ records an optional `origin_cwd` breadcrumb on the session snapshot record
 when a session's `origin_cwd` differs from the current cwd. The breadcrumb is
 purely informational - it never blocks a resume, prompts a `cd`, or toggles
 between project scopes.
+
+### Fork-context skills stay synchronous (bundled-skills-18)
+
+The reference defaults a `context: fork` skill invocation to running as a
+background/async sub-agent: the invoking turn gets an immediate handle back
+and the forked skill's result streams in later. zcode's `context: fork`
+skills (see `agent_runtime.zig`'s `runForkedSkill`, gated by a depth guard)
+run as an isolated but SYNCHRONOUS sub-agent instead - the invoking turn
+blocks until the fork completes and its result is spliced back in directly,
+the same way a synchronous tool call resolves.
+
+This is a deliberate, not-yet-closed gap: zcode's background-agent
+infrastructure (the `Agent`/`AgentRun` tool, `background_threads`) already
+exists and is used by `batch`'s Phase 2 worker-spawning, but wiring a fork'd
+*skill* specifically onto that async path (rather than the tool-call path) is
+left for a follow-up pass. Until then, a `context: fork` skill is still
+correctly isolated (its own sub-agent, its own history) - it just is not yet
+non-blocking.

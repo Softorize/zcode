@@ -817,17 +817,19 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
     }
 
     if (std.mem.eql(u8, command, "/init")) {
-        // Drop a starter `ZCODE.md` in the current shell cwd with
-        // the section skeleton zcode (and reference claude-code)
-        // reads into the system prompt at startup. Refuses to
-        // overwrite an existing file so the user's edits can't be
-        // clobbered by an accidental re-run.
-        //
-        // The skeleton is intentionally sparse -- just section
-        // headers and short hint lines. The user (or a subsequent
-        // model turn) fills in the bodies based on the actual
-        // project.
-        return @as(?[]u8, try handleInitSkeleton(allocator, runtime));
+        // bundled-skills-06: 2.1.261's `/init` hands the MODEL a prompt that
+        // analyzes the actual codebase and writes CLAUDE.md itself
+        // (progressMessage "analyzing your codebase") -- it does not drop a
+        // static, empty-section skeleton. `runInitCommand` (below) already
+        // sends that model-driven INIT_PROMPT; route the live command through
+        // it. `handleInitSkeleton`'s static skeleton is kept only as the
+        // no-model fallback for the mock provider (which cannot itself
+        // analyze anything), so `--provider mock` sessions still get a usable
+        // starting file instead of a prompt no model will ever answer.
+        if (std.ascii.eqlIgnoreCase(runtime.active_provider, "mock")) {
+            return @as(?[]u8, try handleInitSkeleton(allocator, runtime));
+        }
+        return @as(?[]u8, try runInitCommand(allocator, runtime));
     }
 
     if (std.mem.eql(u8, command, "/pwd")) {
@@ -1606,9 +1608,23 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try std.fmt.allocPrint(allocator, "[plugin] {s}\n\n{s}", .{ plugin_result.output, review_output }));
     }
 
-    if (std.mem.eql(u8, command, "/security-review") or std.mem.eql(u8, command, "/security_review")) {
-        const prompt = try review_flow.buildSecurityReviewPrompt(allocator);
+    if (std.mem.eql(u8, command, "/security-review") or std.mem.eql(u8, command, "/security_review") or
+        std.mem.startsWith(u8, command, "/security-review ") or std.mem.startsWith(u8, command, "/security_review "))
+    {
+        // bundled-skills-04: route through the "security-review" bundled skill
+        // (phased sub-task methodology + HARD EXCLUSIONS + allowed-tools
+        // restriction) instead of the older, unrestricted review_flow prompt,
+        // so the REPL command and the Skill-tool-discoverable skill share one
+        // implementation.
+        const args = if (std.mem.startsWith(u8, command, "/security-review "))
+            std.mem.trim(u8, command["/security-review ".len..], " \t")
+        else if (std.mem.startsWith(u8, command, "/security_review "))
+            std.mem.trim(u8, command["/security_review ".len..], " \t")
+        else
+            "";
+        const prompt = try skills_mod.renderRun(allocator, runtime.cwd, "security-review", args, runtime.session_id);
         defer allocator.free(prompt);
+        skill_usage_mod.recordSkill(allocator, "security-review");
         return @as(?[]u8, try runtime.handlePromptWithModeAndReporter(prompt, null, .review));
     }
 
@@ -2256,32 +2272,10 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
 
     // ── Advanced workflow commands ──
 
-    if (std.mem.eql(u8, command, "/security-review") or std.mem.startsWith(u8, command, "/security-review ")) {
-        const scope = if (std.mem.startsWith(u8, command, "/security-review "))
-            std.mem.trim(u8, command["/security-review ".len..], " \t")
-        else
-            "";
-        var prompt_buf = std_io.StringBuilder.init(allocator);
-        defer prompt_buf.deinit();
-        try prompt_buf.writer().writeAll(
-            "Perform a thorough security audit of this codebase. Check for:\n" ++
-                "1. Command injection and shell escapes\n" ++
-                "2. Path traversal and symlink attacks\n" ++
-                "3. SQL injection, XSS, and OWASP Top 10\n" ++
-                "4. Hardcoded secrets, API keys, and credentials\n" ++
-                "5. Insecure deserialization\n" ++
-                "6. Authentication and authorization bypasses\n" ++
-                "7. Insecure cryptographic usage\n" ++
-                "8. Dependency vulnerabilities\n" ++
-                "9. Race conditions and TOCTOU bugs\n" ++
-                "10. Information disclosure in error messages\n\n" ++
-                "For each finding report: severity, file, line, description, and fix.\n",
-        );
-        if (scope.len > 0) try prompt_buf.writer().print("\nFocus on: {s}\n", .{scope});
-        const prompt = try prompt_buf.toOwnedSlice();
-        defer allocator.free(prompt);
-        return @as(?[]u8, try runtime.handlePrompt(prompt));
-    }
+    // (the older, unrestricted /security-review handler that lived here was
+    // dead code -- the eql-based check earlier in this dispatch chain always
+    // matched and returned first; bundled-skills-04 removed it rather than
+    // leaving an unreachable duplicate)
 
     // /btw <question>: a non-interrupting side question (commands-sweep-06).
     // Runs a one-shot model call with the current conversation as context but
@@ -2591,11 +2585,9 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try runtime.handlePrompt(prompt));
     }
 
-    // ── /init command ──
-
-    if (std.mem.eql(u8, command, "/init")) {
-        return @as(?[]u8, try runInitCommand(allocator, runtime));
-    }
+    // (the earlier /init check in this dispatch chain always matches and
+    // returns first, so a second "/init" branch here would be unreachable
+    // dead code -- bundled-skills-06 removed it)
 
     // ── /permissions command ──
 

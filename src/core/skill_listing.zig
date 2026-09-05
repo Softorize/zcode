@@ -305,6 +305,9 @@ fn testSpecScoped(name: []const u8, description: []const u8, when_to_use: []cons
         .version = @constCast(""),
         .aliases = &.{},
         .hooks_json = @constCast(""),
+        .disallowed_tools = &.{},
+        .argument_hint = @constCast(""),
+        .metadata_json = @constCast(""),
     };
 }
 
