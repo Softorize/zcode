@@ -688,9 +688,27 @@ pub const Client = struct {
 
     /// Resolve the project-traversal root (explicit test cwd, else process CWD).
     /// The returned slice is owned by the caller.
+    ///
+    /// regression fix: `std.process.currentPathAlloc` returns a NUL-terminated
+    /// `[:0]u8` (built via `dupeZ`, which allocates `len + 1` bytes and hands
+    /// back a slice reporting only `len`). `Allocator.free`'s `absorbSentinel`
+    /// decides how many bytes to actually free from the STATIC TYPE of the
+    /// value it is given -- so returning that `[:0]u8` straight through this
+    /// function's `![]u8` signature silently coerces away the sentinel type,
+    /// and every caller's ordinary `allocator.free(cwd)` (typed `[]u8`) then
+    /// frees one byte short of what was really allocated. That corrupted the
+    /// DebugAllocator's bookkeeping ("Allocation size N bytes does not match
+    /// free size N-1") on every scoped-config load -- i.e. on interactive REPL
+    /// startup and on every keystroke while composing a slash command,
+    /// per `repl_commands.zig`'s `renderPromptSuggestionMcp`. Dupe a plain,
+    /// non-sentinel copy HERE (inside the function that still has the correct
+    /// sentinel-aware type for the original) and free the original with its
+    /// real type, so its extra byte is accounted for correctly.
     fn scopedCwd(self: *Client) ![]u8 {
         if (self.scoped_cwd) |c| return self.allocator.dupe(u8, c);
-        return std.process.currentPathAlloc(rt.io, self.allocator);
+        const sentinel_cwd = try std.process.currentPathAlloc(rt.io, self.allocator);
+        defer self.allocator.free(sentinel_cwd);
+        return self.allocator.dupe(u8, sentinel_cwd);
     }
 
     /// Do the actual scoped-config load + merge and install the result into
@@ -3853,6 +3871,38 @@ fn buildRpcErrorEnvelopeAlloc(allocator: std.mem.Allocator, id_json: []const u8,
 }
 
 const testing = std.testing;
+
+test "scopedCwd's real-cwd path (self.scoped_cwd == null) frees cleanly under a DebugAllocator (regression)" {
+    // `testing.allocator` in this test binary is `smp_allocator`
+    // (rt.installForTest), which does not validate free-size against
+    // alloc-size the way `std.heap.DebugAllocator` does -- so this
+    // regression (a `[:0]u8` from `std.process.currentPathAlloc` silently
+    // coerced to `[]u8` across scopedCwd's return, then freed one byte
+    // short of what dupeZ actually allocated) was invisible to `zig build
+    // test` even though scopedCwd is exercised whenever a test never sets
+    // `scoped_cwd`. A dedicated DebugAllocator here is the only way this
+    // suite can reproduce the corruption at all; the exact "Allocation
+    // size N bytes does not match free size N-1" message this fix
+    // silences is confirmed in the accompanying commit's standalone repro.
+    var debug_gpa = std.heap.DebugAllocator(.{}).init;
+    defer std.debug.assert(debug_gpa.deinit() == .ok);
+    const allocator = debug_gpa.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(rt.io, "mcp");
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "mcp/servers.json", .data = "[]" });
+    const registry_path = try @import("../core/test_helpers.zig").tmpDirPath(allocator, &tmp, "mcp/servers.json");
+    defer allocator.free(registry_path);
+
+    var client = try Client.init(allocator, registry_path);
+    defer client.deinit();
+
+    // self.scoped_cwd is null here, so this takes the real
+    // std.process.currentPathAlloc path the bug lived in.
+    const cwd = try client.scopedCwd();
+    allocator.free(cwd);
+}
 
 test "free empty servers" {
     const allocator = testing.allocator;

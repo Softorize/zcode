@@ -1128,7 +1128,7 @@ fn dispatch(
     // anything else the flag is a no-op. The child re-invokes zcode without
     // `--bg`, self-registers with kind=bg, and captures its output to a log.
     if (opts.bg and (opts.command == .repl or opts.command == .run or opts.command == .exec)) {
-        try bg_cmds.spawnBackground(allocator, rt.argv, cwd, stdout);
+        try bg_cmds.spawnBackground(allocator, rt.argv, cwd, stdout, null);
         return;
     }
 
@@ -1467,11 +1467,30 @@ fn dispatch(
             break :blk;
         },
         .session_list => try session_mgmt.cmdSessionList(allocator, store, cwd, opts.all_projects, stdout),
-        .session_resume => session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session) catch |err| switch (err) {
-            // session_cmds printed the targeted message already; exit
-            // 2 cleanly without the Zig error trace.
-            error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
-            else => return err,
+        .session_resume => blk: {
+            // commands-12: a `/background`/`/bg` (or bare `--bg`) spawner sets
+            // ZCODE_SESSION_KIND=bg in this child's env before re-invoking it
+            // as `--resume <id>`. That child's stdin is `.ignore`'d (there is
+            // no terminal to read from anymore), so it must never enter the
+            // ordinary interactive resume path -- `cmdSessionResume` blocks
+            // reading stdin the instant there is no queued input, which
+            // crashes with EndOfStream. Route it to the headless variant
+            // instead: answer the queued `ZCODE_BG_INITIAL_PROMPT` (if any)
+            // and idle, never touching stdin.
+            const session_kind_mod = @import("core/session_registry.zig");
+            if (opts.subject != null and session_kind_mod.SessionKind.fromEnv(allocator) == .bg) {
+                const env_mod2 = @import("core/env.zig");
+                const queued = env_mod2.getOwned(allocator, "ZCODE_BG_INITIAL_PROMPT") catch null;
+                defer if (queued) |q| allocator.free(q);
+                try session_mgmt.resumeSessionHeadless(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject.?, queued, auto_approve_high, opts.strict, yolo_mode, opts.agent);
+                break :blk;
+            }
+            session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session) catch |err| switch (err) {
+                // session_cmds printed the targeted message already; exit
+                // 2 cleanly without the Zig error trace.
+                error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
+                else => return err,
+            };
         },
         .session_continue => try session_mgmt.cmdSessionContinue(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.prompt, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session),
         .session_compact => session_mgmt.cmdSessionCompact(allocator, cfg, store, opts.subject, stdout) catch |err| switch (err) {
@@ -1803,6 +1822,21 @@ fn dispatch(
             const script = try completion.render(allocator, shell);
             defer allocator.free(script);
             try stdout.writeAll(script);
+        },
+        // cli-flags-29: `zcode import [codex|gemini] [--dry-run] [--yes]`.
+        // `--dry-run`/`--yes` were already parsed generically above (into
+        // opts.dry_run/opts.yolo); forward them plus the source name (if
+        // any) into the thin argv-shaped entry point import_agent_config.zig
+        // already exposes.
+        .import_agent_config => {
+            const import_agent_config = @import("core/import_agent_config.zig");
+            var forwarded: std.array_list.Managed([]const u8) = .init(allocator);
+            defer forwarded.deinit();
+            if (opts.subject) |s| try forwarded.append(s);
+            if (opts.dry_run) try forwarded.append("--dry-run");
+            if (opts.yolo) try forwarded.append("--yes");
+            const code = try import_agent_config.runImportSubcommand(allocator, cwd, forwarded.items);
+            if (code != 0) std.process.exit(code);
         },
     }
 }

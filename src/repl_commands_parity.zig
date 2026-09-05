@@ -135,20 +135,17 @@ fn handleBackground(allocator: std.mem.Allocator, runtime: *AgentRuntime, prompt
     var out = std_io.StringBuilder.init(allocator);
     defer out.deinit();
 
-    bg_cmds.spawnBackground(allocator, argv, runtime.cwd, out.writer()) catch |err| {
+    // commands-12 fix: forward `[prompt]` for real, via ZCODE_BG_INITIAL_PROMPT
+    // (spawnBackground sets it in the child env) -- the detached child answers
+    // it headlessly (see session_mgmt.resumeSessionHeadless, routed to by
+    // main.zig's `.session_resume` dispatch when ZCODE_SESSION_KIND=bg) rather
+    // than requiring the user to paste it in by hand.
+    bg_cmds.spawnBackground(allocator, argv, runtime.cwd, out.writer(), if (prompt_arg.len > 0) prompt_arg else null) catch |err| {
         return try std.fmt.allocPrint(allocator, "failed to send this session to the background: {s}", .{@errorName(err)});
     };
     try out.writer().writeAll("this terminal is now free -- the session keeps running detached.\n");
     if (prompt_arg.len > 0) {
-        // The reference queues `[prompt]` as the resumed session's first
-        // message. zcode's `--resume` re-invocation has no flag to seed an
-        // initial prompt (adding one is CLI-surface work owned by a different
-        // package), so this is the honest, scoped-down substitute: tell the
-        // user where to paste it.
-        try out.writer().print(
-            "note: \"{s}\" was not forwarded automatically -- paste it once you attach with `zcode --resume {s}` or `zcode logs <pid>`.\n",
-            .{ prompt_arg, runtime.session_id },
-        );
+        try out.writer().print("queued: \"{s}\" -- the detached session will answer it before idling.\n", .{prompt_arg});
     }
     return try out.toOwnedSlice();
 }
@@ -287,12 +284,22 @@ fn handleSubtask(allocator: std.mem.Allocator, runtime: *AgentRuntime, task: []c
         );
     }
 
-    var loaded = runtime.store.load(runtime.session_id) catch |err| {
-        return try std.fmt.allocPrint(allocator, "could not load this session's context for /subtask: {s}", .{@errorName(err)});
+    // commands-25 fix: a brand-new session (this is its very first command)
+    // has never been flushed to the store yet, so `store.load` genuinely has
+    // nothing to read -- that is not an error, it just means "no prior turns
+    // to embed". Only a load failure for a reason OTHER than "the file does
+    // not exist yet" is worth surfacing to the user.
+    var loaded: ?session_store_mod.LoadedSession = null;
+    defer if (loaded) |*l| l.deinit(allocator);
+    const history: []const types.HistoryTurn = blk: {
+        loaded = runtime.store.load(runtime.session_id) catch |err| switch (err) {
+            error.FileNotFound => break :blk &.{},
+            else => return try std.fmt.allocPrint(allocator, "could not load this session's context for /subtask: {s}", .{@errorName(err)}),
+        };
+        break :blk loaded.?.history;
     };
-    defer loaded.deinit(allocator);
 
-    const prompt = try buildSubtaskPrompt(allocator, task, loaded.history);
+    const prompt = try buildSubtaskPrompt(allocator, task, history);
     defer allocator.free(prompt);
 
     const config = agent_tool.AgentRunConfig{ .prompt = prompt, .run_in_background = true };
@@ -1045,6 +1052,14 @@ const DispatchTestHarness = struct {
 
         self.cfg = try config_mod.Config.init(allocator);
         errdefer self.cfg.deinit(allocator);
+        // Point at the deterministic offline mock provider/model so a test
+        // that reaches a provider-calling command (e.g. /subtask's
+        // background agent spawn) never touches the network. The default
+        // config's "anthropic" needs a real key.
+        allocator.free(self.cfg.default_provider);
+        self.cfg.default_provider = try allocator.dupe(u8, "mock");
+        allocator.free(self.cfg.default_model);
+        self.cfg.default_model = try allocator.dupe(u8, "mock-agent");
         self.policy = try policy_mod.Policy.init(allocator);
         errdefer self.policy.deinit();
         self.audit = try logger_mod.AuditLogger.init(allocator, self.logs_dir);
@@ -1199,6 +1214,27 @@ test "dispatch: /list-agents renders all three sections against a fresh workspac
     try testing.expect(std.mem.indexOf(u8, out, "Subagents") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Teammates") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Other zcode sessions") != null);
+}
+
+test "dispatch: /subtask works as the FIRST command of a brand-new session (commands-25)" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const harness = try DispatchTestHarness.init(alloc, root);
+    defer harness.deinit();
+
+    // depth == 0 (top-level session) and the session has never been flushed
+    // to the store yet (this IS its first command) -- store.load must hit
+    // FileNotFound. Before the fix, that bubbled up as "could not load this
+    // session's context for /subtask: FileNotFound" instead of proceeding
+    // with an empty parent-turn history.
+    const out = (try dispatch(alloc, &harness.runtime, "/subtask write a unit test for the retry loop")).?;
+    defer alloc.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "FileNotFound") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "could not load this session's context") == null);
 }
 
 test "dispatch: /subtask refuses to nest when depth > 0" {

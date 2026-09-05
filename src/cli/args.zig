@@ -132,6 +132,12 @@ pub const CommandKind = enum {
     help,
     completion,
     list_env,
+    // cli-flags-29: `zcode import [codex|gemini] [--dry-run] [--yes]` --
+    // imports config from another AI coding agent INTO zcode. Distinct from
+    // `session_import` (`zcode session import <bundle-path>`, which restores
+    // a previously-exported zcode session bundle -- a different feature that
+    // happens to share the English word "import").
+    import_agent_config,
 };
 
 /// settings-05: parsed `--setting-sources` selection. Gates which of the
@@ -1756,6 +1762,17 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
         if (positional.items.len < 2) return reportUsageError("logs", "<id|pid>", "logs <id|pid>");
         options.command = .logs;
         options.subject = positional.items[1];
+        return options;
+    }
+    if (std.mem.eql(u8, head, "import")) {
+        // cli-flags-29: `zcode import [codex|gemini] [--dry-run] [--yes]` --
+        // NOT `session import <bundle-path>` (session_import above), a
+        // different, already-existing feature that happens to share the
+        // word "import". `--dry-run`/`--yes` are parsed generically earlier
+        // in this function into options.dry_run/options.yolo; only the
+        // source name (if any) is left to capture here.
+        options.command = .import_agent_config;
+        options.subject = if (positional.items.len > 1) positional.items[1] else null;
         return options;
     }
     if (std.mem.eql(u8, head, "hooks")) {
@@ -3802,6 +3819,54 @@ test "parse logs without an id reports usage error" {
     const allocator = testing.allocator;
     const argv = [_][]const u8{"logs"};
     try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+}
+
+test "parse import codex --dry-run sets .import_agent_config, subject, and dry_run" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "import", "codex", "--dry-run" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.command == .import_agent_config);
+    try testing.expectEqualStrings("codex", opts.subject.?);
+    try testing.expect(opts.dry_run);
+    try testing.expect(!opts.yolo);
+}
+
+test "parse import gemini --yes sets .import_agent_config, subject, and yolo" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "import", "gemini", "--yes" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.command == .import_agent_config);
+    try testing.expectEqualStrings("gemini", opts.subject.?);
+    try testing.expect(opts.yolo);
+    try testing.expect(!opts.dry_run);
+}
+
+test "parse bare import leaves subject null (lists detected sources)" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{"import"};
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.command == .import_agent_config);
+    try testing.expect(opts.subject == null);
+}
+
+test "parse import does not collide with session import (distinct commands)" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "import", "codex" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .import_agent_config);
+    }
+    {
+        const argv = [_][]const u8{ "session", "import", "/tmp/bundle.json" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .session_import);
+        try testing.expectEqualStrings("/tmp/bundle.json", opts.subject.?);
+    }
 }
 
 test "parse --bg sets the bg flag" {
