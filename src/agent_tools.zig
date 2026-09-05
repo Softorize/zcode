@@ -412,7 +412,13 @@ pub fn isAskUserQuestionTool(name: []const u8) bool {
 }
 
 pub fn isAgentRunTool(name: []const u8) bool {
-    return std.mem.eql(u8, name, "AgentRun") or std.mem.eql(u8, name, "agent_run");
+    // tools-01 (wp2-tools-surface): the advertised schema name is now
+    // "Agent" (reference-exact), with "AgentRun"/"agent_run" kept as
+    // dispatch-only legacy synonyms -- this gate must recognize all three or
+    // a model calling "Agent" would fall through to tool_dispatch.zig's
+    // handleAgentRun stub (which deliberately errors, since the real
+    // spawn-with-retry logic only runs via this special-cased path).
+    return std.mem.eql(u8, name, "Agent") or std.mem.eql(u8, name, "AgentRun") or std.mem.eql(u8, name, "agent_run");
 }
 
 pub fn isTodoTool(name: []const u8) bool {

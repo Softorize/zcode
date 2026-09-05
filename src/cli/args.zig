@@ -47,6 +47,16 @@ pub const CommandKind = enum {
     ps,
     kill,
     logs,
+    // cli-flags-27: `stop`/`kill` (aliases of each other, matching the
+    // reference `stop|kill <id>`) SIGTERM a background session WITHOUT
+    // deleting its registry entry, so `attach`/`--resume` can reopen the
+    // same conversation later. `rm` is the destructive delete (SIGTERM +
+    // registry removal) that zcode's `kill` used to perform unconditionally.
+    attach,
+    rm,
+    doctor_general,
+    project_purge,
+    respawn,
     agents_list,
     agents_show,
     hooks_list,
@@ -249,6 +259,16 @@ pub const CliOptions = struct {
     /// into a fresh copy before the headless run, so the run does not mutate
     /// the original transcript. Only honored under the headless gate.
     fork_session: bool = false,
+    /// headless-sdk-02: `--session-id <uuid>` overrides the session id this
+    /// headless run uses (validated as a UUID at parse time -- the reference
+    /// rejects anything else with "must be a valid UUID"). Threaded into
+    /// sdk_headless.RunCaps.session_id_override. Only honored under the
+    /// headless gate.
+    session_id_override: ?[]const u8 = null,
+    /// headless-sdk-02: `--no-session-persistence` (only meaningful with
+    /// `--print`/headless mode) skips writing this run's session file to
+    /// disk. Threaded into sdk_headless.RunCaps.no_session_persistence.
+    no_session_persistence: bool = false,
     /// sdk-headless-14: `--thinking` / `--max-thinking-tokens N` sets the
     /// reserved reasoning-token budget for a headless run. `--thinking` with
     /// no value is a sentinel "on"; `--max-thinking-tokens N` (or
@@ -353,6 +373,149 @@ pub const CliOptions = struct {
     /// `json` (one JSON object per line with ts, level, ctx, msg).
     /// JSON is the expected format for log aggregators.
     log_format: ?[]const u8 = null,
+
+    // ── wp4-cli-flags additions ──────────────────────────────────────────
+    //
+    // Every flag below parses and lands in one of these fields; main.zig
+    // wires the field into `cfg`/behavior. Where the note in
+    // packages/wp4-cli-flags.json says a flag's *behavior* is owned by
+    // another parity package (permissions/sessions/sdk), the field here is
+    // the parse-time carrier only -- see the matching field doc in
+    // core/config.zig for exactly which package reads it next.
+
+    /// `--permission-mode <mode>`: reference-spelled alias for
+    /// `--approval-mode`. Both write into `approval_mode` (below); this
+    /// field just remembers that the reference spelling was used so
+    /// `--permission-mode auto`'s degraded-synonym stderr note can name the
+    /// flag the user actually typed.
+    used_permission_mode_flag: bool = false,
+    /// `--dangerously-skip-permissions`: zcode's reference-spelled alias for
+    /// `-y/--yolo` (fully wired: see the `yolo` field). Kept distinct so a
+    /// script written against either spelling works.
+    dangerously_skip_permissions: bool = false,
+    /// `--allow-dangerously-skip-permissions`: distinct from the above --
+    /// only *permits* bypass to be enabled later; never auto-approves by
+    /// itself. See `Config.allow_dangerously_skip_permissions`.
+    allow_dangerously_skip_permissions: bool = false,
+    /// `--add-dir <dir>` (repeatable), comma-joined. See
+    /// `Config.additional_directories`.
+    add_dir: ?[]const u8 = null,
+    _owned_add_dir: ?[]u8 = null,
+    /// `--allowedTools`/`--allowed-tools <tools...>`, comma-joined. See
+    /// `Config.allowed_tools`.
+    allowed_tools: ?[]const u8 = null,
+    _owned_allowed_tools: ?[]u8 = null,
+    /// `--disallowedTools`/`--disallowed-tools <tools...>`, comma-joined.
+    /// See `Config.disallowed_tools`.
+    disallowed_tools: ?[]const u8 = null,
+    _owned_disallowed_tools: ?[]u8 = null,
+    /// `--tools <tools...>`, comma-joined. "" disables every tool,
+    /// "default" (or the flag absent) means unrestricted. See
+    /// `Config.tools_allowlist`.
+    tools_flag: ?[]const u8 = null,
+    _owned_tools_flag: ?[]u8 = null,
+    /// `--betas <betas...>` (API beta headers, API-key auth only),
+    /// comma-joined.
+    betas: ?[]const u8 = null,
+    _owned_betas: ?[]u8 = null,
+    /// `--agents <json>`: inline custom agent definitions for this process
+    /// only (not persisted). Raw JSON text, validated as well-formed JSON
+    /// at parse time; the agent registry merge is done by whatever reads
+    /// this field.
+    agents_json: ?[]const u8 = null,
+    /// `--mcp-config <configs...>` (repeatable): each entry is either a
+    /// path to a JSON file or an inline JSON string. Parsed/validated at
+    /// parse time (see `parseMcpConfigEntries` test); the ephemeral-server
+    /// merge into the live MCP client is a follow-on.
+    mcp_config: []const []const u8 = &.{},
+    _owned_mcp_config: bool = false,
+    /// `--strict-mcp-config`: when set, only the servers named by
+    /// `--mcp-config` should be used, ignoring `.mcp.json`/managed config.
+    strict_mcp_config: bool = false,
+    /// `--plugin-dir <path>` (repeatable): load a plugin from a directory
+    /// or .zip for this session only.
+    plugin_dirs: []const []const u8 = &.{},
+    _owned_plugin_dirs: bool = false,
+    /// `--plugin-url <url>` (repeatable): fetch a plugin .zip for this
+    /// session only.
+    plugin_urls: []const []const u8 = &.{},
+    _owned_plugin_urls: bool = false,
+    /// `-w, --worktree[=name]`: create (or reuse) a git worktree for this
+    /// session before it starts. `worktree_name` is null for a bare
+    /// `--worktree`/`-w` (auto-generated name).
+    worktree_requested: bool = false,
+    worktree_name: ?[]const u8 = null,
+    /// `--tmux[=classic]`: gated on `--worktree`. null = flag absent;
+    /// "" = bare `--tmux` (native panes where available, else classic);
+    /// "classic" = force a plain `tmux new-session`.
+    tmux_mode: ?[]const u8 = null,
+    /// `--session-id <uuid>`: validated to look like a UUID at parse time.
+    /// See `Config.session_id`.
+    session_id: ?[]const u8 = null,
+    /// `--system-prompt <prompt>`: full replacement for the default system
+    /// prompt (distinct from `--append-system-prompt`, which layers on top
+    /// of it). `--system-prompt-file` reads the same into
+    /// `_owned_system_prompt`.
+    system_prompt: ?[]const u8 = null,
+    _owned_system_prompt: ?[]u8 = null,
+    /// `--safe-mode`: disable CLAUDE.md/skills/plugins/hooks/MCP/custom
+    /// commands-agents/output-styles/keybindings for this run. See
+    /// `Config.safe_mode`.
+    safe_mode: bool = false,
+    /// `-d, --debug [filter]`: enable debug-level logging, optionally
+    /// restricted to (or excluding, via a leading `!`) named categories.
+    /// `debug` is true whenever the flag or `--debug-file` was given.
+    debug: bool = false,
+    debug_filter: ?[]const u8 = null,
+    /// `--debug-file <path>`: redirect debug output to a file (implies
+    /// `--debug`).
+    debug_file: ?[]const u8 = null,
+    /// `--disable-slash-commands`: disable skills/custom slash commands for
+    /// this run (built-ins like /help remain).
+    disable_slash_commands: bool = false,
+    /// `--betas`/API-beta-only-for-now flags above already cover betas;
+    /// `--effort <level>` sets the startup reasoning-effort level for this
+    /// run without persisting it. "xhigh" (a level zcode's ReasoningEffort
+    /// enum does not model) is accepted and degraded to "max" with a
+    /// one-time stderr note, the same documented-degradation pattern as
+    /// `--permission-mode auto`.
+    effort: ?[]const u8 = null,
+    /// `--autocompact <auto|N[k]>`: overrides
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` for this process via
+    /// `core/env.zig`'s override map (wins over a real env var of the same
+    /// name, matching "an explicit flag beats ambient environment").
+    /// "auto" clears any such override.
+    autocompact: ?[]const u8 = null,
+    /// `--chrome`/`--no-chrome`: override `browser_bridge_enabled` for this
+    /// process only. null = flag absent (config file value stands).
+    chrome: ?bool = null,
+    /// `--fallback-model <model[,model...]>`: only valid with `--print`.
+    /// Overrides `cfg.fallback_model` for this run without persisting.
+    fallback_model: ?[]const u8 = null,
+    /// `--await-initialize`: only valid with `--input-format stream-json`.
+    /// See `Config.await_initialize`.
+    await_initialize: bool = false,
+    /// `--permission-prompts <host|none>`: only meaningful under
+    /// `--print`. See `Config.permission_prompts`.
+    permission_prompts: ?[]const u8 = null,
+    /// `--brief`: enable the (not-yet-implemented in zcode) SendUserMessage
+    /// agent-to-user-communication tool. Recorded so a future tools package
+    /// can gate that tool's registration on it; zcode's pre-existing
+    /// "Brief" tool (file-attach-as-context) is unrelated and unaffected.
+    brief: bool = false,
+    /// `--dry-run`: for `zcode project purge`, list what would be deleted
+    /// without deleting anything.
+    dry_run: bool = false,
+    /// `zcode install [target]`: optional pinned-version target
+    /// (stable|latest|an exact version string). `options.subject` also
+    /// carries it (dispatched as `.update`); this flag distinguishes
+    /// "install" from a bare "update" invocation for messaging purposes.
+    install_requested: bool = false,
+    /// `zcode respawn [id] [--all]`: restart background session(s) so they
+    /// run the current zcode version. `--all` targets every live `bg`
+    /// session instead of a single `[id]` (carried in `options.subject`).
+    respawn_all: bool = false,
+
     _owned_prompt: ?[]u8 = null,
 
     pub fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
@@ -371,10 +534,191 @@ pub const CliOptions = struct {
             self._owned_json_schema = null;
             self.json_schema = null;
         }
+        if (self._owned_add_dir) |owned| {
+            allocator.free(owned);
+            self._owned_add_dir = null;
+            self.add_dir = null;
+        }
+        if (self._owned_allowed_tools) |owned| {
+            allocator.free(owned);
+            self._owned_allowed_tools = null;
+            self.allowed_tools = null;
+        }
+        if (self._owned_disallowed_tools) |owned| {
+            allocator.free(owned);
+            self._owned_disallowed_tools = null;
+            self.disallowed_tools = null;
+        }
+        if (self._owned_tools_flag) |owned| {
+            allocator.free(owned);
+            self._owned_tools_flag = null;
+            self.tools_flag = null;
+        }
+        if (self._owned_betas) |owned| {
+            allocator.free(owned);
+            self._owned_betas = null;
+            self.betas = null;
+        }
+        if (self._owned_system_prompt) |owned| {
+            allocator.free(owned);
+            self._owned_system_prompt = null;
+            self.system_prompt = null;
+        }
+        if (self._owned_mcp_config) allocator.free(self.mcp_config);
+        if (self._owned_plugin_dirs) allocator.free(self.plugin_dirs);
+        if (self._owned_plugin_urls) allocator.free(self.plugin_urls);
     }
 };
 
+/// Append `value` to an owned, growable `[]const []const u8` list field
+/// (used for flags repeatable across multiple occurrences whose values may
+/// themselves contain commas, e.g. `--mcp-config`, so a comma-joined single
+/// string is not safe). The individual string values are borrowed (they
+/// point into argv, which outlives the parsed CliOptions); only the outer
+/// container is allocated, tracked by `owned_flag`, and freed in
+/// `CliOptions.deinit`.
+fn appendOwnedListValue(
+    allocator: std.mem.Allocator,
+    list: []const []const u8,
+    owned_flag: *bool,
+    value: []const u8,
+) ![]const []const u8 {
+    const next = try allocator.alloc([]const u8, list.len + 1);
+    @memcpy(next[0..list.len], list);
+    next[list.len] = value;
+    if (owned_flag.*) allocator.free(list);
+    owned_flag.* = true;
+    return next;
+}
+
+/// Accumulate `value` into a comma-joined owned string (used for
+/// repeatable/list flags whose values cannot themselves contain a comma,
+/// e.g. tool names or directory paths). First call dupes `value`; later
+/// calls grow the existing buffer with a "," separator.
+fn appendCommaJoined(allocator: std.mem.Allocator, owned: *?[]u8, value: []const u8) ![]const u8 {
+    if (owned.*) |old| {
+        const joined = try std.fmt.allocPrint(allocator, "{s},{s}", .{ old, value });
+        allocator.free(old);
+        owned.* = joined;
+    } else {
+        owned.* = try allocator.dupe(u8, value);
+    }
+    return owned.*.?;
+}
+
+/// True once per process: guards the `--permission-mode auto` /
+/// `--approval-mode auto` degraded-synonym note so a script that somehow
+/// passes the flag twice doesn't get the note twice.
+var printed_auto_degraded_note = false;
+
+/// cli-flags-01: normalize an `--approval-mode`/`--permission-mode` value.
+/// Every reference spelling (acceptEdits/plan/bypassPermissions/dontAsk and
+/// their hyphenated forms) and zcode's own three legacy modes pass through
+/// unchanged -- the engine already understands them (see
+/// `Config.isKnownApprovalMode`). "auto" has no zcode equivalent (no
+/// ant-only cloud classifier), so it degrades to "tiered-auto" with a
+/// one-time stderr note, per the wp4-cli-flags package notes.
+fn normalizeApprovalModeValue(raw: []const u8) ![]const u8 {
+    if (std.ascii.eqlIgnoreCase(raw, "auto")) {
+        if (!printed_auto_degraded_note) {
+            printed_auto_degraded_note = true;
+            std_io.stderrWriter().writeAll(
+                "note: --permission-mode auto has no zcode equivalent (no ant-only cloud classifier); using tiered-auto instead.\n",
+            ) catch {};
+        }
+        return "tiered-auto";
+    }
+    return raw;
+}
+
+/// True once per process: guards the `--effort xhigh` degraded-synonym note.
+var printed_xhigh_degraded_note = false;
+
+/// cli-flags-22: normalize an `--effort` value against zcode's
+/// ReasoningEffort set (auto/low/medium/high/max). "xhigh" is a level the
+/// reference supports that zcode's enum does not model; it degrades to
+/// "max" with a one-time stderr note. Anything else must already be a
+/// known level -- rejected otherwise so a typo doesn't silently no-op.
+fn normalizeEffortValue(raw: []const u8) ![]const u8 {
+    if (std.ascii.eqlIgnoreCase(raw, "xhigh")) {
+        if (!printed_xhigh_degraded_note) {
+            printed_xhigh_degraded_note = true;
+            std_io.stderrWriter().writeAll(
+                "note: --effort xhigh has no distinct zcode level; using max instead.\n",
+            ) catch {};
+        }
+        return "max";
+    }
+    const known = [_][]const u8{ "auto", "low", "medium", "high", "max" };
+    for (known) |k| {
+        if (std.ascii.eqlIgnoreCase(raw, k)) return raw;
+    }
+    try std_io.stderrWriter().print(
+        "error: invalid --effort '{s}'. Expected one of: low, medium, high, xhigh, max.\n",
+        .{raw},
+    );
+    return error.UsageErrorReported;
+}
+
+/// cli-flags-05: shallow validation for `--agents <json>`. Confirms the
+/// value parses as JSON and is a top-level object (Claude's own example is
+/// `{"reviewer": {"description": "...", "prompt": "..."}}`); does not
+/// require any particular per-agent shape since the actual merge into the
+/// agent registry is a follow-on for whichever package wires it.
+fn validateAgentsJson(raw: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch {
+        try std_io.stderrWriter().writeAll(
+            "error: --agents: value is not valid JSON.\n  - Expected an object like '{\"reviewer\":{\"description\":\"...\",\"prompt\":\"...\"}}'.\n",
+        );
+        return error.UsageErrorReported;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try std_io.stderrWriter().writeAll(
+            "error: --agents: value must be a JSON object mapping agent name -> definition.\n",
+        );
+        return error.UsageErrorReported;
+    }
+}
+
+/// cli-flags-06: validate one `--mcp-config` entry. Claude accepts either a
+/// path to a JSON file or an inline JSON string; a leading `{` is taken as
+/// inline JSON (validated as well-formed), anything else as a path that
+/// must exist and parse as JSON.
+fn validateMcpConfigEntry(allocator: std.mem.Allocator, raw: []const u8) !void {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+
+    if (trimmed.len > 0 and trimmed[0] == '{') {
+        var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, trimmed, .{}) catch {
+            try std_io.stderrWriter().print("error: --mcp-config: inline value is not valid JSON: {s}\n", .{trimmed});
+            return error.UsageErrorReported;
+        };
+        parsed.deinit();
+        return;
+    }
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, trimmed, allocator, .limited(1 * 1024 * 1024)) catch |err| {
+        try std_io.stderrWriter().print("error: --mcp-config: cannot read '{s}' as a file, and it does not look like inline JSON ({s}).\n", .{ trimmed, @errorName(err) });
+        return error.UsageErrorReported;
+    };
+    defer allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, bytes, .{}) catch {
+        try std_io.stderrWriter().print("error: --mcp-config: {s} does not contain valid JSON.\n", .{trimmed});
+        return error.UsageErrorReported;
+    };
+    parsed.deinit();
+}
+
 pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions {
+    // cli-flags-25: `claude -v` (with NO other arguments) prints the
+    // version and exits; zcode keeps `-v` bound to --verbose everywhere
+    // else (a documented divergence -- see printUsage). Checked before the
+    // general loop so `zcode -v` alone still matches Claude Code muscle
+    // memory without disturbing `-v` as a verbose-mode prefix flag.
+    if (argv.len == 1 and std.mem.eql(u8, argv[0], "-v")) {
+        return .{ .command = .version };
+    }
+
     var options: CliOptions = .{};
     var positional = std.array_list.Managed([]const u8).init(allocator);
     defer positional.deinit();
@@ -492,6 +836,29 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
             } else if (std.mem.eql(u8, arg, "--fork-session")) {
                 // sdk-headless-14: fork the resumed session before running.
                 options.fork_session = true;
+                options.headless = true;
+            } else if (std.mem.eql(u8, arg, "--session-id") or std.mem.startsWith(u8, arg, "--session-id=")) {
+                // cli-flags-09 / headless-sdk-02: pin the session identifier
+                // for this run. Validated as a UUID (matches the reference's
+                // own "must be a valid UUID" rejection message). Feeds both
+                // the general `Config.session_id` carrier and the headless
+                // `RunCaps.session_id_override` fast path -- a headless run
+                // honors the override directly; any other consumer reads
+                // `Config.session_id`.
+                const raw = try parseFlagValue(argv, &i, arg, "--session-id");
+                if (!isValidUuid(raw)) {
+                    try std_io.stderrWriter().print(
+                        "error: --session-id: '{s}' is not a valid UUID.\n  - Expected the form xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.\n",
+                        .{raw},
+                    );
+                    return error.UsageErrorReported;
+                }
+                options.session_id = raw;
+                options.session_id_override = raw;
+                options.headless = true;
+            } else if (std.mem.eql(u8, arg, "--no-session-persistence")) {
+                // headless-sdk-02: skip writing this run's session file.
+                options.no_session_persistence = true;
                 options.headless = true;
             } else if (std.mem.eql(u8, arg, "--thinking")) {
                 // sdk-headless-14: bare `--thinking` is a sentinel "on". It does
@@ -737,6 +1104,176 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
             } else if (std.mem.eql(u8, arg, "--resume") or std.mem.startsWith(u8, arg, "--resume=")) {
                 options.command = .session_resume;
                 options.subject = try parseFlagValue(argv, &i, arg, "--resume");
+            } else if (std.mem.eql(u8, arg, "--permission-mode") or std.mem.startsWith(u8, arg, "--permission-mode=")) {
+                // cli-flags-01: reference-spelled alias for --approval-mode.
+                // Both land in the same `approval_mode` field so the live
+                // approval engine (which already understands every reference
+                // spelling; see permission_decision.isReferenceModeName)
+                // picks it up unchanged. "auto" has no zcode equivalent (no
+                // ant-only cloud classifier), so it degrades to the closest
+                // built-in mode -- tiered-auto -- with a one-time note.
+                const raw = try parseFlagValue(argv, &i, arg, "--permission-mode");
+                try rejectControlChars("--permission-mode", raw);
+                options.used_permission_mode_flag = true;
+                options.approval_mode = try normalizeApprovalModeValue(raw);
+            } else if (std.mem.eql(u8, arg, "--dangerously-skip-permissions")) {
+                // Claude Code's spelling for what zcode already calls --yolo
+                // (approval.evaluate's yolo_mode branch approves everything
+                // except a BLOCKED-tier call). Set both so either name works.
+                options.dangerously_skip_permissions = true;
+                options.yolo = true;
+            } else if (std.mem.eql(u8, arg, "--allow-dangerously-skip-permissions")) {
+                // Distinct from the above: only PERMITS bypass to be enabled
+                // later; must never itself auto-approve. Does not set yolo.
+                options.allow_dangerously_skip_permissions = true;
+            } else if (std.mem.eql(u8, arg, "--add-dir") or std.mem.startsWith(u8, arg, "--add-dir=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--add-dir");
+                try rejectControlChars("--add-dir", raw);
+                options.add_dir = try appendCommaJoined(allocator, &options._owned_add_dir, raw);
+            } else if (std.mem.eql(u8, arg, "--allowedTools") or std.mem.startsWith(u8, arg, "--allowedTools=") or
+                std.mem.eql(u8, arg, "--allowed-tools") or std.mem.startsWith(u8, arg, "--allowed-tools="))
+            {
+                const flag_name = if (std.mem.startsWith(u8, arg, "--allowedTools")) "--allowedTools" else "--allowed-tools";
+                const raw = try parseFlagValue(argv, &i, arg, flag_name);
+                try rejectControlChars(flag_name, raw);
+                options.allowed_tools = try appendCommaJoined(allocator, &options._owned_allowed_tools, raw);
+            } else if (std.mem.eql(u8, arg, "--disallowedTools") or std.mem.startsWith(u8, arg, "--disallowedTools=") or
+                std.mem.eql(u8, arg, "--disallowed-tools") or std.mem.startsWith(u8, arg, "--disallowed-tools="))
+            {
+                const flag_name = if (std.mem.startsWith(u8, arg, "--disallowedTools")) "--disallowedTools" else "--disallowed-tools";
+                const raw = try parseFlagValue(argv, &i, arg, flag_name);
+                try rejectControlChars(flag_name, raw);
+                options.disallowed_tools = try appendCommaJoined(allocator, &options._owned_disallowed_tools, raw);
+            } else if (std.mem.eql(u8, arg, "--tools") or std.mem.startsWith(u8, arg, "--tools=")) {
+                // Unlike the other list flags, "" is a meaningful value here
+                // (disable every tool per Claude's own --tools wording), so
+                // it must reach appendCommaJoined even when empty -- handled
+                // specially since parseFlagValue's bare-token form allows an
+                // empty next argv token (only the `=""` form is rejected).
+                const raw = try parseFlagValue(argv, &i, arg, "--tools");
+                try rejectControlChars("--tools", raw);
+                options.tools_flag = try appendCommaJoined(allocator, &options._owned_tools_flag, raw);
+            } else if (std.mem.eql(u8, arg, "--betas") or std.mem.startsWith(u8, arg, "--betas=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--betas");
+                try rejectControlChars("--betas", raw);
+                options.betas = try appendCommaJoined(allocator, &options._owned_betas, raw);
+            } else if (std.mem.eql(u8, arg, "--agents") or std.mem.startsWith(u8, arg, "--agents=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--agents");
+                try validateAgentsJson(raw);
+                options.agents_json = raw;
+            } else if (std.mem.eql(u8, arg, "--mcp-config") or std.mem.startsWith(u8, arg, "--mcp-config=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--mcp-config");
+                try validateMcpConfigEntry(allocator, raw);
+                options.mcp_config = try appendOwnedListValue(allocator, options.mcp_config, &options._owned_mcp_config, raw);
+            } else if (std.mem.eql(u8, arg, "--strict-mcp-config")) {
+                options.strict_mcp_config = true;
+            } else if (std.mem.eql(u8, arg, "--plugin-dir") or std.mem.startsWith(u8, arg, "--plugin-dir=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--plugin-dir");
+                try rejectControlChars("--plugin-dir", raw);
+                options.plugin_dirs = try appendOwnedListValue(allocator, options.plugin_dirs, &options._owned_plugin_dirs, raw);
+            } else if (std.mem.eql(u8, arg, "--plugin-url") or std.mem.startsWith(u8, arg, "--plugin-url=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--plugin-url");
+                try rejectControlChars("--plugin-url", raw);
+                options.plugin_urls = try appendOwnedListValue(allocator, options.plugin_urls, &options._owned_plugin_urls, raw);
+            } else if (std.mem.eql(u8, arg, "--worktree") or std.mem.startsWith(u8, arg, "--worktree=")) {
+                options.worktree_requested = true;
+                if (std.mem.indexOfScalar(u8, arg, '=')) |eq_idx| {
+                    const raw = arg[eq_idx + 1 ..];
+                    if (raw.len == 0) return error.MissingFlagValue;
+                    try rejectControlChars("--worktree", raw);
+                    options.worktree_name = raw;
+                }
+            } else if (std.mem.eql(u8, arg, "--tmux")) {
+                options.tmux_mode = "";
+            } else if (std.mem.startsWith(u8, arg, "--tmux=")) {
+                const raw = arg["--tmux=".len..];
+                try rejectControlChars("--tmux", raw);
+                options.tmux_mode = raw;
+            } else if (std.mem.eql(u8, arg, "--system-prompt") or std.mem.startsWith(u8, arg, "--system-prompt=")) {
+                options.system_prompt = try parseFlagValue(argv, &i, arg, "--system-prompt");
+            } else if (std.mem.eql(u8, arg, "--system-prompt-file") or std.mem.startsWith(u8, arg, "--system-prompt-file=")) {
+                const path = try parseFlagValue(argv, &i, arg, "--system-prompt-file");
+                const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(1 * 1024 * 1024)) catch |err| {
+                    const stderr = std_io.stderrWriter();
+                    switch (err) {
+                        error.FileNotFound => stderr.print("error: --system-prompt-file: no such file: {s}\n", .{path}) catch {},
+                        error.AccessDenied => stderr.print("error: --system-prompt-file: permission denied reading {s}\n", .{path}) catch {},
+                        error.IsDir => stderr.print("error: --system-prompt-file: path is a directory, expected a regular file: {s}\n", .{path}) catch {},
+                        error.StreamTooLong => stderr.print("error: --system-prompt-file: file exceeds the 1 MiB cap: {s}\n", .{path}) catch {},
+                        else => stderr.print("error: --system-prompt-file: cannot read {s} ({s}).\n", .{ path, @errorName(err) }) catch {},
+                    }
+                    return error.FlagFileUnreadable;
+                };
+                options._owned_system_prompt = bytes;
+                options.system_prompt = bytes;
+            } else if (std.mem.eql(u8, arg, "--safe-mode")) {
+                // No zcode subsystem consults ZCODE_SAFE_MODE yet (see the
+                // doc comment on Config.safe_mode) -- set it anyway, in the
+                // same spirit as --bare/ZCODE_SIMPLE, so it's already
+                // available the moment a package wires a consumer for it.
+                options.safe_mode = true;
+                _ = setenv("ZCODE_SAFE_MODE", "1", 1);
+            } else if (std.mem.eql(u8, arg, "--debug")) {
+                options.debug = true;
+                // Bare -d/--debug takes no value; an attached filter uses
+                // --debug=<filter> (below) so a following bare positional
+                // prompt is never swallowed as the filter value. `-d` (the
+                // single-dash short form) is handled in the short-flag
+                // switch below since it can't start with "--".
+            } else if (std.mem.startsWith(u8, arg, "--debug=")) {
+                options.debug = true;
+                const raw = arg["--debug=".len..];
+                try rejectControlChars("--debug", raw);
+                options.debug_filter = raw;
+            } else if (std.mem.eql(u8, arg, "--debug-file") or std.mem.startsWith(u8, arg, "--debug-file=")) {
+                options.debug = true;
+                options.debug_file = try parseFlagValue(argv, &i, arg, "--debug-file");
+            } else if (std.mem.eql(u8, arg, "--disable-slash-commands")) {
+                options.disable_slash_commands = true;
+            } else if (std.mem.eql(u8, arg, "--effort") or std.mem.startsWith(u8, arg, "--effort=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--effort");
+                options.effort = try normalizeEffortValue(raw);
+            } else if (std.mem.eql(u8, arg, "--autocompact") or std.mem.startsWith(u8, arg, "--autocompact=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--autocompact");
+                try rejectControlChars("--autocompact", raw);
+                options.autocompact = raw;
+            } else if (std.mem.eql(u8, arg, "--chrome")) {
+                options.chrome = true;
+            } else if (std.mem.eql(u8, arg, "--no-chrome")) {
+                options.chrome = false;
+            } else if (std.mem.eql(u8, arg, "--fallback-model") or std.mem.startsWith(u8, arg, "--fallback-model=")) {
+                options.fallback_model = try parseFlagValue(argv, &i, arg, "--fallback-model");
+            } else if (std.mem.eql(u8, arg, "--await-initialize")) {
+                options.await_initialize = true;
+            } else if (std.mem.eql(u8, arg, "--permission-prompts") or std.mem.startsWith(u8, arg, "--permission-prompts=")) {
+                const raw = try parseFlagValue(argv, &i, arg, "--permission-prompts");
+                if (!std.mem.eql(u8, raw, "host") and !std.mem.eql(u8, raw, "none")) {
+                    try std_io.stderrWriter().print(
+                        "error: invalid --permission-prompts '{s}'. Expected one of: host, none.\n",
+                        .{raw},
+                    );
+                    return error.UsageErrorReported;
+                }
+                options.permission_prompts = raw;
+            } else if (std.mem.eql(u8, arg, "--brief")) {
+                options.brief = true;
+            } else if (std.mem.eql(u8, arg, "--dry-run")) {
+                options.dry_run = true;
+            } else if (std.mem.eql(u8, arg, "--yes")) {
+                // `project purge`'s confirmation-skip. zcode's global -y is
+                // already the broader "assume yes" signal (--yolo); accept
+                // the reference's own --yes spelling as a synonym so
+                // scripts written against `claude project purge --yes` work.
+                options.yolo = true;
+            } else if (std.mem.eql(u8, arg, "--all")) {
+                options.respawn_all = true;
+            } else if (std.mem.eql(u8, arg, "--ax-screen-reader")) {
+                // cli-flags-24: pure alias of --accessible.
+                options.accessible = true;
+                options.no_color = true;
+                options.no_spinner = true;
+                options.no_thinking_summary = true;
+                options.no_fullscreen = true;
             } else {
                 return error.UnknownFlag;
             }
@@ -766,6 +1303,15 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
                 'v' => options.verbose = true,
                 'j' => options.json = true,
                 'y' => options.yolo = true,
+                // cli-flags-14: bare `-d` enables debug-level logging with
+                // no category filter (an attached filter needs the long
+                // `--debug=<filter>` form; `-d<filter>` is not supported,
+                // matching how `-v`/`-q`/`-y` also take no attached value).
+                'd' => options.debug = true,
+                // cli-flags-08: bare `-w` (no attached name -- that needs
+                // the long `--worktree=name` form, since `-wname` is not a
+                // form Claude Code's own CLI supports either).
+                'w' => options.worktree_requested = true,
                 'V' => {
                     // Short form for --version. Uppercase so it
                     // doesn't collide with -v (verbose).
@@ -1032,6 +1578,16 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
         return error.UnknownSubcommand;
     }
     if (std.mem.eql(u8, head, "agents")) {
+        // cli-flags-33: Claude Code's `agents` manages BACKGROUND sessions
+        // (part of the --bg/attach/logs/stop/rm family); zcode got to the
+        // name first for a different concept (declared sub-agent
+        // definitions). Rather than rename either, `agents --bg`/`agents ps`
+        // bridges to the same listing `zcode ps` prints, so muscle memory
+        // from Claude Code lands somewhere useful instead of an error.
+        if (options.bg or (positional.items.len >= 2 and std.mem.eql(u8, positional.items[1], "ps"))) {
+            options.command = .ps;
+            return options;
+        }
         if (positional.items.len < 2) {
             try std_io.stdoutWriter().writeAll(
                 \\zcode agents - Inspect declared sub-agents.
@@ -1041,6 +1597,10 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
                 \\  show <name>   Print the agent frontmatter, tools, and system prompt.
                 \\
                 \\Agents are defined under .zcode/agents/*.md with YAML frontmatter.
+                \\
+                \\NOTE: this differs from Claude Code's `agents`, which manages
+                \\background sessions (see `zcode ps`/`zcode attach`/`zcode stop`).
+                \\Run `zcode agents --bg` or `zcode agents ps` for that listing.
                 \\
             );
             options.command = .help;
@@ -1148,16 +1708,33 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
         }
         return error.UnknownSubcommand;
     }
-    // phase-26 daemon-background-09/01/10: the detached-session surface.
-    // `ps` lists live sessions; `kill <id|pid>` SIGTERMs one and removes its
-    // registry file; `logs <id|pid>` dumps a --bg session's captured output.
+    // phase-26 daemon-background-09/01/10, extended by cli-flags-27/32: the
+    // detached-session surface. `ps` lists live sessions; `kill`/`stop
+    // <id|pid>` (aliases, matching the reference `stop|kill <id>`) SIGTERM
+    // one WITHOUT deleting its registry entry, so the conversation stays
+    // resumable; `rm <id|pid>` is the destructive delete zcode's `kill`
+    // used to perform unconditionally; `attach <id|pid>` reopens a
+    // still-registered session's conversation interactively; `logs
+    // <id|pid>` dumps a --bg session's captured output.
     if (std.mem.eql(u8, head, "ps")) {
         options.command = .ps;
         return options;
     }
-    if (std.mem.eql(u8, head, "kill")) {
-        if (positional.items.len < 2) return reportUsageError("kill", "<id|pid>", "kill <id|pid>");
+    if (std.mem.eql(u8, head, "kill") or std.mem.eql(u8, head, "stop")) {
+        if (positional.items.len < 2) return reportUsageError(head, "<id|pid>", "kill <id|pid>");
         options.command = .kill;
+        options.subject = positional.items[1];
+        return options;
+    }
+    if (std.mem.eql(u8, head, "rm")) {
+        if (positional.items.len < 2) return reportUsageError("rm", "<id|pid>", "rm <id|pid>");
+        options.command = .rm;
+        options.subject = positional.items[1];
+        return options;
+    }
+    if (std.mem.eql(u8, head, "attach")) {
+        if (positional.items.len < 2) return reportUsageError("attach", "<id|pid>", "attach <id|pid>");
+        options.command = .attach;
         options.subject = positional.items[1];
         return options;
     }
@@ -1234,7 +1811,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
         }
         return error.UnknownSubcommand;
     }
-    if (std.mem.eql(u8, head, "plugins")) {
+    if (std.mem.eql(u8, head, "plugins") or std.mem.eql(u8, head, "plugin")) {
         if (positional.items.len < 2) {
             try std_io.stdoutWriter().writeAll(
                 \\zcode plugins - Install and manage agent-facing plugins.
@@ -1505,15 +2082,13 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
         return error.UnknownSubcommand;
     }
     if (std.mem.eql(u8, head, "doctor")) {
+        // cli-flags-28: bare `doctor` (no subcommand) is a general
+        // installation health check -- config validity, provider
+        // configuration, keychain status -- distinct from `doctor
+        // enterprise`'s managed-policy-specific checks. Matches the
+        // reference: "Check the health of your Claude Code installation."
         if (positional.items.len < 2) {
-            try std_io.stdoutWriter().writeAll(
-                \\zcode doctor - Run diagnostics.
-                \\
-                \\Subcommands:
-                \\  enterprise    Check enterprise-readiness controls.
-                \\
-            );
-            options.command = .help;
+            options.command = .doctor_general;
             return options;
         }
         if (std.mem.eql(u8, positional.items[1], "enterprise")) {
@@ -1804,9 +2379,52 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
         }
         return options;
     }
-    if (std.mem.eql(u8, head, "update")) {
+    if (std.mem.eql(u8, head, "update") or std.mem.eql(u8, head, "upgrade")) {
         options.command = .update;
         return options;
+    }
+    if (std.mem.eql(u8, head, "install")) {
+        // cli-flags-30: `zcode install [target]`. zcode's self-updater has
+        // no version-pinning support yet (see cmdUpdateWithConfig); the
+        // dispatcher reports that plainly for a non-empty target rather
+        // than silently ignoring it and updating to latest anyway.
+        options.command = .update;
+        options.install_requested = true;
+        options.subject = if (positional.items.len > 1) positional.items[1] else null;
+        return options;
+    }
+    if (std.mem.eql(u8, head, "respawn")) {
+        // cli-flags-30: restart a background session (or, with --all,
+        // every live `bg` session) so it runs under the currently
+        // installed zcode binary. zcode's registry does not persist the
+        // original launch argv, so this stops the target(s) and points at
+        // `zcode attach`/a fresh `--bg` launch rather than silently
+        // fabricating a re-invocation command.
+        options.command = .respawn;
+        options.subject = if (positional.items.len > 1) positional.items[1] else null;
+        return options;
+    }
+    if (std.mem.eql(u8, head, "project")) {
+        if (positional.items.len < 2) {
+            try std_io.stdoutWriter().writeAll(
+                \\zcode project - Manage zcode project state.
+                \\
+                \\Subcommands:
+                \\  purge [path] [--dry-run] [--yes]   Delete all zcode state for a project
+                \\                                     (transcripts, task history, config
+                \\                                     entry). Prompts for confirmation
+                \\                                     unless --yes (or -y) is given.
+                \\
+            );
+            options.command = .help;
+            return options;
+        }
+        if (std.mem.eql(u8, positional.items[1], "purge")) {
+            options.command = .project_purge;
+            options.subject = if (positional.items.len > 2) positional.items[2] else null;
+            return options;
+        }
+        return error.UnknownSubcommand;
     }
     if (std.mem.eql(u8, head, "audit")) {
         if (positional.items.len < 2) {
@@ -1967,6 +2585,23 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
     return error.UnknownCommand;
 }
 
+/// headless-sdk-02: true when `s` is a canonical 36-char dashed UUID (8-4-4-4-12
+/// hex groups). Deliberately permissive about version/variant nibbles -- the
+/// reference's own `--session-id` validation is "must be a valid UUID", not a
+/// v4-only check, and zcode may itself be handed a v1/v4/etc. session id from
+/// a resumed reference session.
+fn isValidUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, idx| {
+        if (idx == 8 or idx == 13 or idx == 18 or idx == 23) {
+            if (c != '-') return false;
+        } else if (!std.ascii.isHex(c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn parseFlagValue(argv: []const []const u8, index: *usize, arg: []const u8, flag_name: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, arg, '=')) |eq_idx| {
         const val = arg[eq_idx + 1 ..];
@@ -2077,17 +2712,63 @@ pub fn printUsage(writer: anytype) !void {
         \\  zcode policy show|validate
         \\  zcode api schema|serve
         \\  zcode review [working|commit <sha>|branch <base>]
-        \\  zcode update                     Check for updates and self-update
+        \\  zcode update | upgrade           Check for updates and self-update
+        \\  zcode install [target]           stable | latest | an exact version (pinned installs not yet supported)
+        \\  zcode doctor [enterprise]        General installation health check, or managed-policy checks
+        \\  zcode ps                         List background (--bg) sessions
+        \\  zcode kill|stop <id|pid>         Stop a background session (conversation kept; `attach` reopens it)
+        \\  zcode rm <id|pid>                Delete a background session's registry entry
+        \\  zcode attach <id|pid>            Reopen a background session's conversation interactively
+        \\  zcode logs <id|pid>              Dump a background session's captured output
+        \\  zcode respawn [id] [--all]       Stop background session(s) so they can be restarted on this version
+        \\  zcode project purge [path] [--dry-run] [--yes]  Delete a project's .zcode/ workspace state
         \\  zcode benchmark run
         \\Flags:
         \\  -m, --model <id>
         \\  -p, --provider <name>
         \\  -n, --name <name>               Name this session (shown in zcode ps and session list)
         \\      --agent <name>
+        \\      --agents <json>             Inline custom agent definitions for this process only (not persisted)
         \\      --profile <name>
-        \\      --approval-mode <mode>      tiered-auto (default) | manual | strict
+        \\      --approval-mode, --permission-mode <mode>
+        \\                                  tiered-auto (default) | manual | strict | acceptEdits | plan |
+        \\                                  bypassPermissions | dontAsk | auto (degrades to tiered-auto)
+        \\      --dangerously-skip-permissions   Alias for -y/--yolo (Claude Code's own spelling)
+        \\      --allow-dangerously-skip-permissions  Permit (but do not itself enable) bypassing permission checks
         \\      --sandbox <profile>         read-only | workspace-write | no-network | danger-full-access
         \\      --cwd <path>
+        \\  -w, --worktree[=name]           Create (or reuse) a git worktree for this session
+        \\      --tmux[=classic]            Spawn a detached tmux session rooted at the worktree (needs --worktree)
+        \\      --add-dir <dir>             Additional directory to allow tool access to (repeatable)
+        \\      --allowedTools, --allowed-tools <tools...>      Comma/repeatable allow-list of tool names
+        \\      --disallowedTools, --disallowed-tools <tools...>  Comma/repeatable deny-list of tool names
+        \\      --tools <tools...>          Restrict the available tool set; "" disables all, "default" is unrestricted
+        \\      --mcp-config <json-or-path> Load MCP servers from a JSON file or inline JSON string (repeatable)
+        \\      --strict-mcp-config         Only use --mcp-config servers, ignoring .mcp.json/managed config
+        \\      --plugin-dir <path>         Load a plugin from a directory for this session only (repeatable)
+        \\      --plugin-url <url>          Fetch a plugin .zip for this session only (repeatable)
+        \\      --session-id <uuid>         Pin the session identifier for this run
+        \\      --system-prompt <text>      Full replacement for the default system prompt
+        \\      --system-prompt-file <path> Read --system-prompt from a file
+        \\      --safe-mode                 Disable CLAUDE.md/skills/plugins/hooks/MCP/commands/output-styles for this run
+        \\  -d, --debug[=filter]            Enable debug-level logging, optionally with a category filter
+        \\      --debug-file <path>         Write debug logs to a file instead of stderr (implies --debug)
+        \\      --disable-slash-commands    Disable skills and custom slash commands for this run
+        \\      --no-session-persistence    Do not persist this session to disk (--print only)
+        \\      --betas <betas...>          API beta headers to include in Anthropic requests (repeatable)
+        \\      --chrome | --no-chrome      Override the Chrome bridge for this process only
+        \\      --fallback-model <model[,model...]>  Fall back to another model on overload (--print only)
+        \\      --effort <level>            low | medium | high | xhigh (degrades to max) | max
+        \\      --autocompact <auto|N[k]>   Auto-compact window size (auto, or 100k-1M tokens)
+        \\      --ax-screen-reader          Alias for --accessible
+        \\      --await-initialize          Block on an `initialize` control_request first (--input-format stream-json only)
+        \\      --permission-prompts <host|none>  Who answers permission prompts under --print (default host)
+        \\      --brief                     Enable the SendUserMessage agent-to-user-communication tool
+        \\      --settings <file-or-json>   Path to a settings JSON file, or inline JSON, loaded as the flag settings source
+        \\      --setting-sources <list>    Comma-separated: user,project,local -- restrict which config layers load
+        \\      --scope <user|project|local>     Target scope for a settings-writing subcommand
+        \\      --output-style <name>       Output style/persona to render responses with
+        \\      --permission-prompt-tool <name>  MCP tool name that answers permission prompts non-interactively
         \\  -j, --json                      Emit a single JSON object on stdout (machine-readable mode)
         \\      --print                     Run one prompt non-interactively and exit (headless).
         \\                                  No short alias: -p stays bound to --provider in zcode,
@@ -2121,7 +2802,10 @@ pub fn printUsage(writer: anytype) !void {
         \\      --strict
         \\      --approve-high
         \\  -y, --yolo                      Auto-approve high-risk tool calls (use with care)
-        \\  -v, --verbose                   Log extra diagnostic info to stderr
+        \\  -v, --verbose                   Log extra diagnostic info to stderr.
+        \\                                  Claude Code's -v is --version; zcode keeps -V for --version and
+        \\                                  reserves -v for --verbose, EXCEPT a lone `zcode -v` (no other args)
+        \\                                  still prints the version, matching `claude -v`-shaped scripts.
         \\  -q, --quiet                     Suppress non-essential output (spinner, thinking summary)
         \\      --log-level <level>         debug | info | warn (default) | error
         \\      --log-format <text|json>    Log format on stderr (json is aggregator-friendly)
@@ -2903,6 +3587,35 @@ test "sdk-headless-14: --fork-session sets the flag and headless gate" {
     try testing.expect(opts.headless);
 }
 
+test "headless-sdk-02: --session-id accepts a valid UUID and sets the headless gate" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--session-id", "123e4567-e89b-12d3-a456-426614174000", "--print", "hi" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+
+    try testing.expectEqualStrings("123e4567-e89b-12d3-a456-426614174000", opts.session_id_override.?);
+    try testing.expect(opts.headless);
+}
+
+test "headless-sdk-02: --session-id rejects a non-UUID value" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--session-id", "not-a-uuid", "--print", "hi" };
+    // Unified with cli-flags-09's --session-id validation (both packages
+    // added the same flag independently): the parser prints a specific
+    // message and reports error.UsageErrorReported, not InvalidFlagValue.
+    try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+}
+
+test "headless-sdk-02: --no-session-persistence sets the flag and headless gate" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--no-session-persistence", "--print", "hi" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+
+    try testing.expect(opts.no_session_persistence);
+    try testing.expect(opts.headless);
+}
+
 test "sdk-headless-14: --max-thinking-tokens parses an integer" {
     const allocator = testing.allocator;
     const argv = [_][]const u8{ "--max-thinking-tokens", "2048", "--print", "hi" };
@@ -3099,4 +3812,524 @@ test "parse --name= with an empty value errors" {
     const allocator = testing.allocator;
     const argv = [_][]const u8{ "--name=", "run", "do a thing" };
     try testing.expectError(error.MissingFlagValue, parse(allocator, argv[0..]));
+}
+
+// ===========================================================================
+// wp4-cli-flags tests
+// ===========================================================================
+
+test "cli-flags-01: --permission-mode acceptEdits parses into approval_mode" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--permission-mode", "acceptEdits", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.used_permission_mode_flag);
+    try testing.expectEqualStrings("acceptEdits", opts.approval_mode.?);
+}
+
+test "cli-flags-01: --approval-mode bypassPermissions is unaffected by the permission-mode alias" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--approval-mode", "bypassPermissions", "--print", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(!opts.used_permission_mode_flag);
+    try testing.expectEqualStrings("bypassPermissions", opts.approval_mode.?);
+}
+
+test "cli-flags-01: --permission-mode auto degrades to tiered-auto" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--permission-mode", "auto", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("tiered-auto", opts.approval_mode.?);
+}
+
+test "cli-flags-02: --dangerously-skip-permissions behaves exactly like --yolo" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--dangerously-skip-permissions", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.dangerously_skip_permissions);
+    try testing.expect(opts.yolo);
+}
+
+test "cli-flags-02: --allow-dangerously-skip-permissions does not set yolo" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--allow-dangerously-skip-permissions", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.allow_dangerously_skip_permissions);
+    try testing.expect(!opts.yolo);
+}
+
+test "cli-flags-03: repeated --add-dir accumulates into a comma-joined value" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--add-dir", "a", "--add-dir", "b", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("a,b", opts.add_dir.?);
+}
+
+test "cli-flags-04: --allowedTools, --disallowed-tools, and --tools parse independently" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--allowedTools", "Read,Grep", "--disallowed-tools", "Bash", "--tools", "default", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("Read,Grep", opts.allowed_tools.?);
+    try testing.expectEqualStrings("Bash", opts.disallowed_tools.?);
+    try testing.expectEqualStrings("default", opts.tools_flag.?);
+}
+
+test "cli-flags-04: --tools accepts an empty value (disable all tools)" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--tools", "", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("", opts.tools_flag.?);
+}
+
+test "cli-flags-05: --agents with a valid JSON object parses" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--agents", "{\"reviewer\":{\"description\":\"d\",\"prompt\":\"p\"}}", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.agents_json != null);
+}
+
+test "cli-flags-05: --agents with malformed JSON is rejected" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--agents", "not json", "run", "x" };
+    try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+}
+
+test "cli-flags-05: --agents with a JSON array (not an object) is rejected" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--agents", "[1,2,3]", "run", "x" };
+    try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+}
+
+test "cli-flags-06: --mcp-config accepts inline JSON, repeats, and --strict-mcp-config" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{
+        "--mcp-config", "{\"mcpServers\":{\"foo\":{\"command\":\"echo\"}}}",
+        "--mcp-config", "{\"mcpServers\":{\"bar\":{\"command\":\"echo\"}}}",
+        "--strict-mcp-config", "run", "x",
+    };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), opts.mcp_config.len);
+    try testing.expect(opts.strict_mcp_config);
+}
+
+test "cli-flags-06: --mcp-config rejects malformed inline JSON" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--mcp-config", "{not json", "run", "x" };
+    try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+}
+
+test "cli-flags-06: --mcp-config rejects a nonexistent path that isn't inline JSON" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--mcp-config", "/no/such/mcp-config.json", "run", "x" };
+    try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+}
+
+test "cli-flags-07: repeated --plugin-dir and --plugin-url each accumulate" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{
+        "--plugin-dir", "./a", "--plugin-dir", "./b",
+        "--plugin-url", "https://x/a.zip",
+        "run", "x",
+    };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), opts.plugin_dirs.len);
+    try testing.expectEqualStrings("./a", opts.plugin_dirs[0]);
+    try testing.expectEqualStrings("./b", opts.plugin_dirs[1]);
+    try testing.expectEqual(@as(usize, 1), opts.plugin_urls.len);
+}
+
+test "cli-flags-08: -w sets worktree_requested with no name; --worktree=name sets both" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "-w", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.worktree_requested);
+        try testing.expect(opts.worktree_name == null);
+    }
+    {
+        const argv = [_][]const u8{ "--worktree=feature-x", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.worktree_requested);
+        try testing.expectEqualStrings("feature-x", opts.worktree_name.?);
+    }
+}
+
+test "cli-flags-08: --tmux and --tmux=classic both parse" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "--worktree", "--tmux", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expectEqualStrings("", opts.tmux_mode.?);
+    }
+    {
+        const argv = [_][]const u8{ "--worktree", "--tmux=classic", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expectEqualStrings("classic", opts.tmux_mode.?);
+    }
+}
+
+test "cli-flags-09: --session-id accepts a well-formed UUID" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--session-id", "123e4567-e89b-12d3-a456-426614174000", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("123e4567-e89b-12d3-a456-426614174000", opts.session_id.?);
+}
+
+test "cli-flags-09: --session-id rejects a non-UUID value" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--session-id", "not-a-uuid", "run", "x" };
+    try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+}
+
+test "cli-flags-10: --system-prompt sets a full replacement" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--system-prompt", "You are a terse bot.", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("You are a terse bot.", opts.system_prompt.?);
+}
+
+test "cli-flags-10: --system-prompt-file reads the file contents" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try @import("../core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(dir_path);
+    const file_path = try std.fs.path.join(allocator, &.{ dir_path, "sp.txt" });
+    defer allocator.free(file_path);
+    {
+        const f = try std.Io.Dir.cwd().createFile(rt.io, file_path, .{ .truncate = true });
+        defer f.close(rt.io);
+        try f.writeStreamingAll(rt.io, "You are terse.");
+    }
+    const argv = [_][]const u8{ "--system-prompt-file", file_path, "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("You are terse.", opts.system_prompt.?);
+}
+
+test "cli-flags-12: --safe-mode sets options.safe_mode" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--safe-mode", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.safe_mode);
+}
+
+test "cli-flags-14: -d, --debug, --debug=filter, and --debug-file all parse" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "-d", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.debug);
+        try testing.expect(opts.debug_filter == null);
+    }
+    {
+        const argv = [_][]const u8{ "--debug", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.debug);
+    }
+    {
+        const argv = [_][]const u8{ "--debug=api,hooks", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.debug);
+        try testing.expectEqualStrings("api,hooks", opts.debug_filter.?);
+    }
+    {
+        const argv = [_][]const u8{ "--debug-file", "/tmp/zcode-dbg.log", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.debug);
+        try testing.expectEqualStrings("/tmp/zcode-dbg.log", opts.debug_file.?);
+    }
+}
+
+test "cli-flags-15: --disable-slash-commands parses" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--disable-slash-commands", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.disable_slash_commands);
+}
+
+test "cli-flags-16: --no-session-persistence parses" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--print", "--no-session-persistence", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.no_session_persistence);
+}
+
+test "cli-flags-19: repeated --betas accumulates comma-joined" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--betas", "foo-2025-01-01", "--betas", "bar-2025-02-02", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("foo-2025-01-01,bar-2025-02-02", opts.betas.?);
+}
+
+test "cli-flags-20: --chrome and --no-chrome set opts.chrome" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "--chrome", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expectEqual(@as(?bool, true), opts.chrome);
+    }
+    {
+        const argv = [_][]const u8{ "--no-chrome", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expectEqual(@as(?bool, false), opts.chrome);
+    }
+}
+
+test "cli-flags-21: --fallback-model parses" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--print", "--fallback-model", "haiku,sonnet", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("haiku,sonnet", opts.fallback_model.?);
+}
+
+test "cli-flags-22: --effort accepts known levels, degrades xhigh, rejects bogus" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "--effort", "high", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expectEqualStrings("high", opts.effort.?);
+    }
+    {
+        const argv = [_][]const u8{ "--effort", "xhigh", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expectEqualStrings("max", opts.effort.?);
+    }
+    {
+        const argv = [_][]const u8{ "--effort", "bogus", "run", "x" };
+        try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+    }
+}
+
+test "cli-flags-23: --autocompact stores the raw value for main.zig to apply" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--autocompact", "200000", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expectEqualStrings("200000", opts.autocompact.?);
+}
+
+test "cli-flags-24: --ax-screen-reader behaves like --accessible" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--ax-screen-reader", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.accessible);
+    try testing.expect(opts.no_color);
+    try testing.expect(opts.no_spinner);
+}
+
+test "cli-flags-25: a lone -v prints the version; -v with other args stays --verbose" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{"-v"};
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .version);
+    }
+    {
+        const argv = [_][]const u8{ "-v", "run", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.verbose);
+        try testing.expect(opts.command == .run);
+    }
+}
+
+test "headless-sdk-12: --await-initialize parses" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--print", "--input-format", "stream-json", "--await-initialize" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.await_initialize);
+}
+
+test "headless-sdk-13: --permission-prompts accepts host/none and rejects other values" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "--print", "--permission-prompts", "none", "x" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expectEqualStrings("none", opts.permission_prompts.?);
+    }
+    {
+        const argv = [_][]const u8{ "--print", "--permission-prompts", "sometimes", "x" };
+        try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+    }
+}
+
+test "cli-flags-missed-113: --brief parses" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--brief", "run", "x" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+    try testing.expect(opts.brief);
+}
+
+test "cli-flags-26: printUsage documents the five previously-undocumented flags" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+    try printUsage(buf.writer());
+    const text = buf.items();
+    for ([_][]const u8{ "--settings", "--setting-sources", "--scope", "--output-style", "--permission-prompt-tool" }) |flag| {
+        try testing.expect(std.mem.indexOf(u8, text, flag) != null);
+    }
+}
+
+test "cli-flags-32: stop is an alias for kill; plugin is an alias for plugins; upgrade is an alias for update" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "stop", "1234" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .kill);
+        try testing.expectEqualStrings("1234", opts.subject.?);
+    }
+    {
+        const argv = [_][]const u8{ "plugin", "list" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .plugins_list);
+    }
+    {
+        const argv = [_][]const u8{"upgrade"};
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .update);
+    }
+}
+
+test "cli-flags-27: rm and attach subcommands parse" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "rm", "1234" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .rm);
+        try testing.expectEqualStrings("1234", opts.subject.?);
+    }
+    {
+        const argv = [_][]const u8{ "attach", "1234" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .attach);
+        try testing.expectEqualStrings("1234", opts.subject.?);
+    }
+    {
+        const argv = [_][]const u8{"rm"};
+        try testing.expectError(error.UsageErrorReported, parse(allocator, argv[0..]));
+    }
+}
+
+test "cli-flags-28: bare doctor resolves to the general health check, doctor enterprise is unchanged" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{"doctor"};
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .doctor_general);
+    }
+    {
+        const argv = [_][]const u8{ "doctor", "enterprise" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .doctor_enterprise);
+    }
+}
+
+test "cli-flags-30: install [target] and respawn [id] [--all] parse" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "install", "0.12.40" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .update);
+        try testing.expect(opts.install_requested);
+        try testing.expectEqualStrings("0.12.40", opts.subject.?);
+    }
+    {
+        const argv = [_][]const u8{ "respawn", "--all" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .respawn);
+        try testing.expect(opts.respawn_all);
+    }
+    {
+        const argv = [_][]const u8{ "respawn", "1234" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .respawn);
+        try testing.expectEqualStrings("1234", opts.subject.?);
+    }
+}
+
+test "cli-flags-31: project purge parses path, --dry-run, and --yes" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "project", "purge" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .project_purge);
+        try testing.expect(opts.subject == null);
+    }
+    {
+        const argv = [_][]const u8{ "project", "purge", "/tmp/some-project", "--dry-run", "--yes" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .project_purge);
+        try testing.expectEqualStrings("/tmp/some-project", opts.subject.?);
+        try testing.expect(opts.dry_run);
+        try testing.expect(opts.yolo);
+    }
+}
+
+test "cli-flags-33: agents --bg and agents ps both alias `ps`; plain agents list is unaffected" {
+    const allocator = testing.allocator;
+    {
+        const argv = [_][]const u8{ "agents", "--bg" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .ps);
+    }
+    {
+        const argv = [_][]const u8{ "agents", "ps" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .ps);
+    }
+    {
+        const argv = [_][]const u8{ "agents", "list" };
+        var opts = try parse(allocator, argv[0..]);
+        defer opts.deinit(allocator);
+        try testing.expect(opts.command == .agents_list);
+    }
 }

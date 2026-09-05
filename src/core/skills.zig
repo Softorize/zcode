@@ -3,6 +3,7 @@ const std_io = @import("std_io.zig");
 const rt = @import("zcode_runtime");
 const bundled = @import("bundled_skills.zig");
 const paths = @import("paths.zig");
+const env = @import("env.zig");
 const arg_sub = @import("argument_substitution.zig");
 const display_safe = @import("display_safe.zig");
 const skill_types = @import("skill_types.zig");
@@ -44,13 +45,36 @@ pub fn listWithTouched(
     var resolved = try paths.resolve(allocator);
     defer resolved.deinit(allocator);
 
+    // config-layout-06: `~/.claude/skills` is read unconditionally alongside
+    // `~/.zcode/skills` (both scope .user) so a user-level Claude Code skills
+    // directory is discovered the same way zcode's own is, without requiring
+    // any file to have been touched first. Appended BEFORE the `.zcode`
+    // variant so that on a same-name collision at this scope tier, the
+    // zcode-native directory wins (equal-specificity ties go to the latest
+    // append -- see `upsert`).
+    if (env.getOwned(allocator, "HOME")) |home| {
+        defer allocator.free(home);
+        const claude_user_root = try std.fs.path.join(allocator, &.{ home, ".claude", "skills" });
+        defer allocator.free(claude_user_root);
+        try appendFromRoot(allocator, &out, claude_user_root, .user, "");
+    } else |_| {}
+
     const user_root = try std.fs.path.join(allocator, &.{ resolved.zcode_home, "skills" });
     defer allocator.free(user_root);
-    try appendFromRoot(allocator, &out, user_root, .user);
+    try appendFromRoot(allocator, &out, user_root, .user, "");
+
+    // config-layout-05: the project-root `.claude/skills` directory is read
+    // unconditionally too (previously only reachable through the
+    // touched-files-gated `discoverNestedSkills` walk, which never ran at
+    // session start with no touched files yet). Same append-order reasoning
+    // as above: `.claude` before `.zcode` so the zcode-native root wins ties.
+    const claude_workspace_root = try std.fs.path.join(allocator, &.{ cwd, ".claude", "skills" });
+    defer allocator.free(claude_workspace_root);
+    try appendFromRoot(allocator, &out, claude_workspace_root, .workspace, "");
 
     const workspace_root = try paths.workspacePathAlloc(allocator, cwd, "skills");
     defer allocator.free(workspace_root);
-    try appendFromRoot(allocator, &out, workspace_root, .workspace);
+    try appendFromRoot(allocator, &out, workspace_root, .workspace, "");
 
     // Plugin skills: each enabled plugin may ship a skills/ dir under its root.
     appendPluginSkills(allocator, &out, cwd) catch {};
@@ -220,6 +244,20 @@ pub fn renderDetail(allocator: std.mem.Allocator, cwd: []const u8, raw_name: []c
         }
         try out.writer().writeByte('\n');
     }
+    // bundled-skills-missed-227: surface a tool restriction in the detail view
+    // (Skill action=read) so the model sees it BEFORE calling action=run, not
+    // only after the restriction is silently enforced. allowed-tools takes
+    // precedence when both are set (bundled-skills-17), so print only one.
+    if (skill.allowed_tools.len > 0) {
+        try writeToolList(&out, allocator, "allowed-tools=", skill.allowed_tools);
+    } else if (skill.disallowed_tools.len > 0) {
+        try writeToolList(&out, allocator, "disallowed-tools=", skill.disallowed_tools);
+    }
+    if (skill.argument_hint.len > 0) {
+        const safe_hint = try display_safe.sanitize(allocator, skill.argument_hint);
+        defer allocator.free(safe_hint);
+        try out.writer().print("argument-hint={s}\n", .{safe_hint});
+    }
     try out.writer().writeAll("\nprompt:\n");
     // Body is intentionally NOT sanitized -- the user explicitly
     // asked for the skill's prompt body, prose may legitimately
@@ -228,6 +266,19 @@ pub fn renderDetail(allocator: std.mem.Allocator, cwd: []const u8, raw_name: []c
     try out.writer().writeAll(skill.prompt);
     if (!std.mem.endsWith(u8, skill.prompt, "\n")) try out.writer().writeByte('\n');
     return out.toOwnedSlice();
+}
+
+/// bundled-skills-missed-227 helper: print a `<label><tool>, <tool>, ...\n`
+/// line (mirroring the existing `aliases=` line's format at `renderDetail`).
+fn writeToolList(out: *std_io.StringBuilder, allocator: std.mem.Allocator, label: []const u8, tools: []const []u8) !void {
+    try out.writer().writeAll(label);
+    for (tools, 0..) |tool, i| {
+        if (i > 0) try out.writer().writeAll(", ");
+        const safe = try display_safe.sanitize(allocator, tool);
+        defer allocator.free(safe);
+        try out.writer().writeAll(safe);
+    }
+    try out.writer().writeByte('\n');
 }
 
 pub fn renderRun(allocator: std.mem.Allocator, cwd: []const u8, raw_name: []const u8, args: []const u8, session_id: []const u8) ![]u8 {
@@ -246,14 +297,26 @@ pub fn renderRun(allocator: std.mem.Allocator, cwd: []const u8, raw_name: []cons
         // skills-03: builtin skills have no real directory, so ${CLAUDE_SKILL_DIR}
         // is left untouched (visibly unresolved rather than silently blanked) and
         // no base-dir header is added. ${CLAUDE_SESSION_ID} is still substituted.
+        //
+        // bundled-skills-05: code-review's --fix/--comment/<target> args are
+        // parsed into structured flags instead of being dumped as opaque
+        // freeform text, so the model (and any code driving it) gets an
+        // unambiguous fix/comment/target signal rather than having to infer it
+        // from prose.
         const base = if (trimmed_args.len == 0)
             try allocator.dupe(u8, skill.prompt)
-        else
-            try std.fmt.allocPrint(
+        else if (std.ascii.eqlIgnoreCase(skill.name, "code-review")) blk: {
+            const parsed = bundled.parseCodeReviewArgs(trimmed_args);
+            break :blk try std.fmt.allocPrint(
                 allocator,
-                "{s}\n\nAdditional task context:\n{s}\n",
-                .{ skill.prompt, trimmed_args },
+                "{s}\n\nAdditional task context:\n- fix: {}\n- comment: {}\n- target: {s}\n",
+                .{ skill.prompt, parsed.fix, parsed.comment, if (parsed.target.len > 0) parsed.target else "(none)" },
             );
+        } else try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\nAdditional task context:\n{s}\n",
+            .{ skill.prompt, trimmed_args },
+        );
         defer allocator.free(base);
         return replaceVar(allocator, base, "${CLAUDE_SESSION_ID}", session_id);
     }
@@ -335,7 +398,20 @@ fn appendBuiltinSkills(allocator: std.mem.Allocator, out: *std.array_list.Manage
         // the authoring-only `skillify` skill when its opt-in is unset) is not
         // registered, so it does not surface in any listing or the run path.
         if (!skill.enabled()) continue;
-        const spec = try skill_types.makeBuiltin(allocator, skill.name, skill.description, skill.prompt_template, skill.aliases);
+        // bundled-skills-03/17/226: thread the bundled skill's per-skill
+        // overrides (when-to-use, argument hint, allowed/disallowed tools,
+        // invocability, model/effort/context) into the produced SkillSpec.
+        const spec = try skill_types.makeBuiltin(allocator, skill.name, skill.description, skill.prompt_template, skill.aliases, .{
+            .when_to_use = skill.when_to_use,
+            .argument_hint = skill.argument_hint,
+            .allowed_tools = skill.allowed_tools,
+            .disallowed_tools = skill.disallowed_tools,
+            .user_invocable = skill.user_invocable,
+            .disable_model_invocation = skill.disable_model_invocation,
+            .model = skill.model,
+            .effort = skill.effort,
+            .context = skill.context,
+        });
         try upsert(out, allocator, spec);
     }
 }
@@ -348,7 +424,11 @@ fn appendPluginSkills(allocator: std.mem.Allocator, out: *std.array_list.Managed
         if (!plugin.enabled) continue;
         const skills_dir = std.fs.path.join(allocator, &.{ plugin.root_path, "skills" }) catch continue;
         defer allocator.free(skills_dir);
-        appendFromRoot(allocator, out, skills_dir, .plugin) catch continue;
+        // bundled-skills-02: namespace a plugin's skills under its own name
+        // (`<plugin-name>:<skill>`), mirroring the Skill tool's documented
+        // `plugin:skill` resolution and keeping a plugin's bare skill names
+        // from silently shadowing a workspace/user skill of the same name.
+        appendFromRoot(allocator, out, skills_dir, .plugin, plugin.name) catch continue;
     }
 }
 
@@ -411,7 +491,7 @@ fn discoverNestedSkills(
                     allocator.free(key);
                 };
 
-                appendFromRoot(allocator, out, skills_dir, .workspace) catch {};
+                appendFromRoot(allocator, out, skills_dir, .workspace, "") catch {};
             }
 
             if (std.mem.eql(u8, dir, cwd)) break;
@@ -427,11 +507,15 @@ fn appendFromRoot(
     out: *std.array_list.Managed(SkillSpec),
     root: []const u8,
     scope: SkillScope,
+    initial_prefix: []const u8,
 ) !void {
-    // Start the namespaced walk at the root with an empty prefix. A directory
-    // directly under `root` that holds a SKILL.md is a flat skill; one nested
-    // under intermediate dirs gets a `parent:...:dir` namespaced name.
-    try appendFromDir(allocator, out, root, "", scope, 0);
+    // Start the namespaced walk at the root with `initial_prefix` (bundled-
+    // skills-02: a plugin root starts with its own plugin name so its skills
+    // come out `<plugin-name>:<skill>`; every other root starts empty). A
+    // directory directly under `root` that holds a SKILL.md is a flat skill
+    // (or `<initial_prefix>:<dirname>` when non-empty); one nested under
+    // intermediate dirs extends the prefix further.
+    try appendFromDir(allocator, out, root, initial_prefix, scope, 0);
 }
 
 /// Recursive walk of a skills directory. A subdirectory that contains a
@@ -484,9 +568,39 @@ fn appendFromDir(
     }
 }
 
+/// bundled-skills-02: scope specificity ranking used by `upsert`'s
+/// "most-specific-wins" tie-break on a bare-name collision. Higher wins:
+/// a project-local workspace skill is more specific than a user-wide one,
+/// which is more specific than an installed plugin's, which is more specific
+/// than a zcode-shipped builtin. `.mcp` skills route by a `mcp:` source_path
+/// rather than colliding on bare names in practice, so it shares builtin's
+/// floor.
+fn scopeSpecificity(scope: SkillScope) u8 {
+    return switch (scope) {
+        .workspace => 3,
+        .user => 2,
+        .plugin => 1,
+        .builtin, .mcp => 0,
+    };
+}
+
+/// Insert `incoming`, replacing any existing skill of the same name
+/// (case-insensitive). bundled-skills-02 "most specific wins": on a
+/// collision, the entry with the HIGHER scope specificity is kept regardless
+/// of append order (`scopeSpecificity`); when the two tie (e.g. two nested
+/// `.zcode/skills` walks both at `.workspace`), the incoming (later) one wins,
+/// preserving the original "latest discovery wins" behavior for same-tier
+/// re-discovery.
 fn upsert(out: *std.array_list.Managed(SkillSpec), allocator: std.mem.Allocator, incoming: SkillSpec) !void {
     for (out.items, 0..) |*existing, idx| {
         if (std.ascii.eqlIgnoreCase(existing.name, incoming.name)) {
+            if (scopeSpecificity(existing.scope) > scopeSpecificity(incoming.scope)) {
+                // The existing entry is strictly more specific; drop the
+                // incoming one instead of letting append-order silently win.
+                var tmp = incoming;
+                tmp.deinit(allocator);
+                return;
+            }
             existing.deinit(allocator);
             out.items[idx] = incoming;
             return;
@@ -512,8 +626,35 @@ fn lessThan(_: void, lhs: SkillSpec, rhs: SkillSpec) bool {
 
 const testing = std.testing;
 
+/// config-layout-05/06: `list()`/`listWithTouched()` now read `~/.zcode/skills`
+/// AND `~/.claude/skills` unconditionally. Without isolating `$HOME`, a test
+/// silently reads whatever the machine actually running it has in its real
+/// home directory -- machine-dependent, and able to shadow a bundled skill by
+/// name under the "most specific wins" scope-specificity rule in `upsert`
+/// (caught in practice: a real `~/.claude/skills/code-review` on a dev
+/// machine outranks the builtin one). Pointing `$HOME` at the SAME directory
+/// the test already uses as `cwd` isolates it from the real machine while
+/// staying harmless to existing assertions: a fixture already placed under
+/// `<cwd>/.zcode/skills` then aliases as both the "user" and "workspace"
+/// roots, and the specificity tie-break always resolves that alias to
+/// `.workspace` (matching what these tests already expect). Callers must
+/// `defer env.clearOverrides();`.
+fn isolateHome(cwd: []const u8) !void {
+    try env.setOverride("HOME", cwd);
+    try env.setOverride("XDG_CONFIG_HOME", "");
+}
+
 test "renderRun returns builtin prompt with extra args" {
-    const rendered = try renderRun(testing.allocator, ".", "debug", "focus on provider auth", "");
+    // bundled-skills-19: "debug" now means session/log diagnosis; the old
+    // root-cause-and-fix-the-code content lives under "fix-bug".
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
+
+    const rendered = try renderRun(testing.allocator, cwd, "fix-bug", "focus on provider auth", "");
     defer testing.allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "Help debug the current issue") != null);
@@ -536,6 +677,8 @@ test "workspace skill overrides builtin and renders detail" {
 
     const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
     defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
 
     const detail = try renderDetail(testing.allocator, cwd, "debug");
     defer testing.allocator.free(detail);
@@ -560,6 +703,8 @@ test "skill in a subdirectory gets a namespaced name" {
 
     const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
     defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
 
     const skills = try list(testing.allocator, cwd);
     defer freeList(testing.allocator, skills);
@@ -589,6 +734,8 @@ test "skills-04 computeActivatedConditionalSkills marks a matching conditional s
 
     const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
     defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
 
     // Turn 1: a *.zig file is touched -> the skill activates.
     {
@@ -644,6 +791,8 @@ test "skills-04 nested discovery surfaces a skill in a subdir .zcode/skills" {
 
     const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
     defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
 
     // Make the tmp dir its own git repo so the nested-discovery gitignore probe
     // (`git check-ignore`, run from cwd) resolves against THIS repo and not the
@@ -702,6 +851,8 @@ test "skills-03 renderRun substitutes CLAUDE_SKILL_DIR and CLAUDE_SESSION_ID and
 
     const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
     defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
 
     const rendered = try renderRun(testing.allocator, cwd, "runner", "", "sess-123");
     defer testing.allocator.free(rendered);
@@ -730,9 +881,16 @@ test "skills-03 renderRun substitutes CLAUDE_SKILL_DIR and CLAUDE_SESSION_ID and
 test "skills-03 builtin skill renders unchanged with no base-dir header" {
     // (e) A builtin skill (no real directory) gets no base-dir header and the
     // ${CLAUDE_SKILL_DIR} literal is left untouched; ${CLAUDE_SESSION_ID} still
-    // substitutes. `debug` is a bundled skill that does not reference the vars,
-    // so its body is unchanged.
-    const rendered = try renderRun(testing.allocator, ".", "debug", "", "sess-xyz");
+    // substitutes. `fix-bug` is a bundled skill that does not reference the
+    // vars, so its body is unchanged.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
+
+    const rendered = try renderRun(testing.allocator, cwd, "fix-bug", "", "sess-xyz");
     defer testing.allocator.free(rendered);
     try testing.expect(std.mem.indexOf(u8, rendered, "Base directory for this skill:") == null);
     try testing.expect(std.mem.indexOf(u8, rendered, "Help debug the current issue") != null);
@@ -745,6 +903,8 @@ test "skills-07 skillify is absent from list() when the authoring gate is off" {
     defer tmp.cleanup();
     const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
     defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
 
     const skills = try list(testing.allocator, cwd);
     defer freeList(testing.allocator, skills);
@@ -779,6 +939,8 @@ test "skills-13 findByName resolves a workspace skill via its alias; canonical n
 
     const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
     defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
 
     // The skill is found by an alias.
     {
@@ -838,4 +1000,258 @@ test "skills-03 replaceVar substitutes all occurrences and no-ops when absent" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings("xy", out);
     }
+}
+
+test "config-layout-05: project .claude/skills is discovered unconditionally, not only via touched files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(rt.io, ".claude/skills/debug");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/skills/debug/SKILL.md",
+        .data =
+        \\# Local Debug
+        \\
+        \\Project-specific debug workflow.
+        ,
+    });
+
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    // Plain `list()` (touched_files == &.{}), matching the acceptance test:
+    // a fresh session with nothing touched yet still sees the project's
+    // `.claude/skills` directory.
+    const skills = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, skills);
+
+    var found = false;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "debug")) {
+            found = true;
+            // The workspace `.claude/skills/debug` (specificity 3) beats the
+            // zcode builtin "debug" (specificity 0) on the name collision.
+            try testing.expectEqual(SkillScope.workspace, s.scope);
+            try testing.expect(std.mem.indexOf(u8, s.prompt, "Project-specific debug workflow") != null);
+        }
+    }
+    try testing.expect(found);
+}
+
+test "config-layout-06: ~/.claude/skills is read as a user-scope root" {
+    const env_mod = @import("env.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(home);
+
+    try tmp.dir.createDirPath(rt.io, ".claude/skills/frontend");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/skills/frontend/SKILL.md",
+        .data =
+        \\# Frontend
+        \\
+        \\Frontend conventions for this user.
+        ,
+    });
+    // Deliberately no `.zcode/skills` under this fake HOME.
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", home);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    // A separate, empty cwd so nothing at the workspace level interferes.
+    var cwd_tmp = testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &cwd_tmp);
+    defer testing.allocator.free(cwd);
+
+    const skills = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, skills);
+
+    var found = false;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "frontend")) {
+            found = true;
+            try testing.expectEqual(SkillScope.user, s.scope);
+        }
+    }
+    try testing.expect(found);
+}
+
+// bundled-skills-02 plugin fixtures use the USER plugin root (`~/.zcode/plugins`,
+// via a HOME override), not the workspace plugin root: `plugins.list`'s
+// workspace-scope plugins are gated on the cwd's trust status (untrusted by
+// default for a fresh tmp dir), while the user-scope root is always
+// trust_default=true -- so a fixture plugin there is deterministically
+// `enabled` without also having to fake a trust marker.
+test "bundled-skills-02: a plugin's skills are namespaced <plugin-name>:<skill>" {
+    const env_mod = @import("env.zig");
+    var home_tmp = testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &home_tmp);
+    defer testing.allocator.free(home);
+
+    try home_tmp.dir.createDirPath(rt.io, ".zcode/plugins/acme");
+    try home_tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/plugins/acme/plugin.json",
+        .data =
+        \\{"name":"acme","version":"1.0.0","description":"demo plugin","entrypoint":"run.sh"}
+        ,
+    });
+    try home_tmp.dir.createDirPath(rt.io, ".zcode/plugins/acme/skills/deploy");
+    try home_tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/plugins/acme/skills/deploy/SKILL.md",
+        .data =
+        \\# Deploy
+        \\
+        \\Deploy via acme's process.
+        ,
+    });
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", home);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    var cwd_tmp = testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &cwd_tmp);
+    defer testing.allocator.free(cwd);
+
+    const skills = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, skills);
+
+    var found_namespaced = false;
+    var found_bare = false;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "acme:deploy")) found_namespaced = true;
+        if (std.mem.eql(u8, s.name, "deploy")) found_bare = true;
+    }
+    try testing.expect(found_namespaced);
+    try testing.expect(!found_bare);
+}
+
+test "bundled-skills-02: most-specific-wins -- a workspace skill beats a same-named plugin skill even though the plugin is appended later" {
+    const env_mod = @import("env.zig");
+    var home_tmp = testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &home_tmp);
+    defer testing.allocator.free(home);
+
+    // A plugin (loaded from the USER plugin root, always enabled) that
+    // overrides its own namespaced name back to the bare "shared" via
+    // frontmatter `name:` -- appended AFTER the workspace root
+    // (appendPluginSkills runs after the workspace-root append), so a naive
+    // last-write-wins policy would let it clobber the workspace skill.
+    try home_tmp.dir.createDirPath(rt.io, ".zcode/plugins/acme");
+    try home_tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/plugins/acme/plugin.json",
+        .data =
+        \\{"name":"acme","version":"1.0.0","description":"demo plugin","entrypoint":"run.sh"}
+        ,
+    });
+    try home_tmp.dir.createDirPath(rt.io, ".zcode/plugins/acme/skills/shared");
+    try home_tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/plugins/acme/skills/shared/SKILL.md",
+        .data =
+        \\---
+        \\name: shared
+        \\description: plugin's own shared skill
+        \\---
+        \\The plugin's shared skill (should NOT win).
+        ,
+    });
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", home);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A workspace-scope "shared" skill (specificity 3).
+    try tmp.dir.createDirPath(rt.io, ".zcode/skills/shared");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/skills/shared/SKILL.md",
+        .data =
+        \\# Shared (workspace)
+        \\
+        \\The workspace's own shared skill.
+        ,
+    });
+
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const skills = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, skills);
+
+    var found = false;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "shared")) {
+            found = true;
+            try testing.expectEqual(SkillScope.workspace, s.scope);
+            try testing.expect(std.mem.indexOf(u8, s.prompt, "workspace's own shared skill") != null);
+        }
+    }
+    try testing.expect(found);
+}
+
+test "bundled-skills-missed-227: renderDetail surfaces allowed-tools, disallowed-tools, and argument-hint" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
+
+    // security-review is a bundled skill with allowed_tools set.
+    const detail = try renderDetail(testing.allocator, cwd, "security-review");
+    defer testing.allocator.free(detail);
+    try testing.expect(std.mem.indexOf(u8, detail, "allowed-tools=") != null);
+    try testing.expect(std.mem.indexOf(u8, detail, "Bash") != null);
+
+    // code-review has an argument-hint.
+    const cr_detail = try renderDetail(testing.allocator, cwd, "code-review");
+    defer testing.allocator.free(cr_detail);
+    try testing.expect(std.mem.indexOf(u8, cr_detail, "argument-hint=[--fix] [--comment]") != null);
+
+    // A disk skill declaring only disallowed-tools surfaces that line instead.
+    try tmp.dir.createDirPath(rt.io, ".zcode/skills/guarded");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/skills/guarded/SKILL.md",
+        .data =
+        \\---
+        \\name: guarded
+        \\description: d
+        \\disallowed-tools: Write, Edit
+        \\---
+        \\body
+        ,
+    });
+    const guarded_detail = try renderDetail(testing.allocator, cwd, "guarded");
+    defer testing.allocator.free(guarded_detail);
+    try testing.expect(std.mem.indexOf(u8, guarded_detail, "disallowed-tools=Write, Edit") != null);
+}
+
+test "bundled-skills-05: code-review's --fix/--comment/target args render as structured task context, not opaque text" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
+
+    const rendered = try renderRun(testing.allocator, cwd, "code-review", "--fix main", "");
+    defer testing.allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "fix: true") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "comment: false") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "target: main") != null);
+
+    // The legacy alias resolves to the same skill and the same parsing.
+    const via_alias = try renderRun(testing.allocator, cwd, "review", "--comment 42", "");
+    defer testing.allocator.free(via_alias);
+    try testing.expect(std.mem.indexOf(u8, via_alias, "comment: true") != null);
+    try testing.expect(std.mem.indexOf(u8, via_alias, "target: 42") != null);
 }

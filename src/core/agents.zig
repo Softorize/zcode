@@ -14,6 +14,9 @@ pub const AgentScope = enum {
     user,
     workspace,
     plugin,
+    /// cli-flags-05: defined inline via `--agents <json>` for this process
+    /// only (never read from or written to disk).
+    cli,
 };
 
 pub const AgentMode = enum {
@@ -196,6 +199,7 @@ pub fn scopeName(scope: AgentScope) []const u8 {
         .user => "user",
         .workspace => "workspace",
         .plugin => "plugin",
+        .cli => "cli",
     };
 }
 
@@ -234,6 +238,11 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]AgentSpec {
     // builtin/user/workspace agent via the last-wins `upsert`, mirroring the
     // plugin-skills loader in skills.zig:appendPluginSkills.
     appendPluginAgents(allocator, &out, cwd) catch {};
+
+    // cli-flags-05: --agents <json> agents are appended (and take
+    // precedence via last-wins upsert) last, so a CLI-supplied definition
+    // always wins over a same-named file-defined one for this process.
+    appendCliAgents(allocator, &out) catch {};
 
     std.mem.sort(AgentSpec, out.items, {}, lessThan);
     return out.toOwnedSlice();
@@ -411,6 +420,62 @@ fn appendPluginAgents(
         const agents_dir = std.fs.path.join(allocator, &.{ plugin.root_path, "agents" }) catch continue;
         defer allocator.free(agents_dir);
         appendFromDir(allocator, out, agents_dir, .plugin) catch continue;
+    }
+}
+
+/// Env var `--agents <json>` is passed through as (set via `env.setOverride`
+/// from `main.zig`, the same "spawner sets env, reader reads it" pattern
+/// `SessionKind.fromEnv`/`ZCODE_SIMPLE` already use elsewhere). Kept as an
+/// env-equivalent rather than a new `list()` parameter so every existing
+/// call site keeps working unchanged.
+pub const ENV_CLI_AGENTS_JSON = "ZCODE_CLI_AGENTS_JSON";
+
+/// cli-flags-05: merge `--agents <json>` (`{"name":{"description":...,
+/// "prompt":...}}`) into `out`, taking precedence over any same-named
+/// file-defined agent (last-wins `upsert`, matching the plugin-agents
+/// precedence above). Never persisted to disk. A malformed or absent env
+/// value is a silent no-op -- `args.zig` already validated the JSON shape
+/// at parse time, so a failure here is either "flag never passed" (the
+/// common case) or an OOM, neither of which should block `agents list`.
+fn appendCliAgents(allocator: std.mem.Allocator, out: *std.array_list.Managed(AgentSpec)) !void {
+    const env_mod = @import("env.zig");
+    const raw = env_mod.getOwned(allocator, ENV_CLI_AGENTS_JSON) catch return;
+    defer allocator.free(raw);
+    if (raw.len == 0) return;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (!helpers.isSafeIdentifier(entry.key_ptr.*)) continue;
+        if (entry.value_ptr.* != .object) continue;
+        const def = entry.value_ptr.*.object;
+        // "prompt" is Claude's own --agents field name; "system_prompt" is
+        // accepted too so a file-derived JSON blob round-trips unchanged.
+        const system_prompt = getString(def, "system_prompt") orelse getString(def, "prompt") orelse "";
+
+        const spec = AgentSpec{
+            .name = allocator.dupe(u8, entry.key_ptr.*) catch continue,
+            .description = allocator.dupe(u8, getString(def, "description") orelse "") catch continue,
+            .system_prompt = allocator.dupe(u8, system_prompt) catch continue,
+            .model = allocator.dupe(u8, getString(def, "model") orelse "") catch continue,
+            .mode = parseMode(getString(def, "mode") orelse ""),
+            .tools = parseTools(allocator, def.get("tools")) catch continue,
+            .scope = .cli,
+            .source_path = allocator.dupe(u8, "--agents") catch continue,
+            .mcp_servers = &.{},
+            .disallowed_tools = parseTools(allocator, def.get("disallowedTools")) catch continue,
+            .skills = parseTools(allocator, def.get("skills")) catch continue,
+            .effort = allocator.dupe(u8, "") catch continue,
+            .permission_mode = allocator.dupe(u8, "") catch continue,
+            .max_turns = null,
+            .memory = allocator.dupe(u8, "") catch continue,
+            .hooks_json = allocator.dupe(u8, "") catch continue,
+            .color = allocator.dupe(u8, "") catch continue,
+        };
+        upsert(out, allocator, spec) catch continue;
     }
 }
 
@@ -648,7 +713,7 @@ fn loadMarkdownFile(
         .permission_mode = try allocator.dupe(u8, getEitherFm(fm, "permissionMode", "permission-mode") orelse ""),
         .max_turns = parseMaxTurnsStr(getEitherFm(fm, "maxTurns", "max-turns")),
         .memory = try allocator.dupe(u8, frontmatter.getValue(fm, "memory") orelse ""),
-        .hooks_json = try allocator.dupe(u8, skill_types.hooksJsonFrom(fm)),
+        .hooks_json = try allocator.dupe(u8, skill_types.jsonObjectFrom(fm, "hooks")),
         .color = try allocator.dupe(u8, frontmatter.getValue(fm, "color") orelse ""),
     };
 }
@@ -786,6 +851,89 @@ fn lessThan(_: void, a: AgentSpec, b: AgentSpec) bool {
 const eqlIgnoreCase = @import("parse_helpers.zig").eqlIgnoreCase;
 
 const testing = std.testing;
+
+test "cli-flags-05: --agents json merges into list(), taking precedence over a file-defined agent" {
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers_mod.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    // A file-defined "reviewer" agent that --agents should override.
+    const agents_dir = try std.fs.path.join(testing.allocator, &.{ cwd, ".zcode", "agents" });
+    defer testing.allocator.free(agents_dir);
+    try std.Io.Dir.cwd().createDirPath(rt.io, agents_dir);
+    const file_path = try std.fs.path.join(testing.allocator, &.{ agents_dir, "reviewer.json" });
+    defer testing.allocator.free(file_path);
+    try std.Io.Dir.cwd().writeFile(rt.io, .{
+        .sub_path = file_path,
+        .data =
+        \\{"name":"reviewer","description":"file version","system_prompt":"You are the file reviewer."}
+        ,
+    });
+
+    try env_mod.setOverride(ENV_CLI_AGENTS_JSON,
+        \\{"reviewer":{"description":"Reviews code","prompt":"You are a CLI reviewer"},"helper":{"prompt":"You help"}}
+    );
+
+    const agents = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, agents);
+
+    var found_reviewer = false;
+    var found_helper = false;
+    for (agents) |a| {
+        if (eqlIgnoreCase(a.name, "reviewer")) {
+            found_reviewer = true;
+            try testing.expectEqual(AgentScope.cli, a.scope);
+            try testing.expectEqualStrings("You are a CLI reviewer", a.system_prompt);
+            try testing.expectEqualStrings("Reviews code", a.description);
+        }
+        if (eqlIgnoreCase(a.name, "helper")) found_helper = true;
+    }
+    try testing.expect(found_reviewer);
+    try testing.expect(found_helper);
+}
+
+test "cli-flags-05: findByName resolves a --agents-defined agent with no file on disk" {
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers_mod.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    try env_mod.setOverride(ENV_CLI_AGENTS_JSON,
+        \\{"reviewer":{"description":"d","prompt":"You are a reviewer"}}
+    );
+
+    const found = try findByName(testing.allocator, cwd, "reviewer");
+    try testing.expect(found != null);
+    var f = found.?;
+    defer f.deinit(testing.allocator);
+    try testing.expectEqualStrings("You are a reviewer", f.system_prompt);
+}
+
+test "cli-flags-05: a malformed --agents value is a silent no-op" {
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers_mod.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    try env_mod.setOverride(ENV_CLI_AGENTS_JSON, "not json");
+
+    const agents = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, agents);
+    // No crash, and the builtin agents are still present.
+    try testing.expect(agents.len > 0);
+}
+
+const test_helpers_mod = @import("test_helpers.zig");
 
 test "loadFile parses agent json" {
     var tmp = testing.tmpDir(.{});

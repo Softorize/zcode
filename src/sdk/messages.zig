@@ -46,9 +46,16 @@ pub const ResultSubtype = output.ResultSubtype;
 pub const Usage = output.Usage;
 pub const PermissionDenial = output.PermissionDenial;
 pub const InitInfo = output.InitInfo;
+pub const McpServerInfo = output.McpServerInfo;
+pub const PluginInfo = output.PluginInfo;
+pub const ContentBlock = output.ContentBlock;
+pub const ToolUseBlock = output.ToolUseBlock;
+pub const AssistantMessage = output.AssistantMessage;
 
 pub const serializeResult = output.serializeResult;
 pub const serializeInit = output.serializeInit;
+pub const serializeAssistant = output.serializeAssistant;
+pub const serializeUserToolResult = output.serializeUserToolResult;
 pub const streamInitAndResult = output.streamInitAndResult;
 
 // sdk-headless-12: partial-message / hook-event / user-replay serializers.
@@ -116,6 +123,13 @@ pub const ResultInputs = struct {
     stop_reason: []const u8 = "",
     /// Structured-output payload as raw JSON (from --json-schema), or empty.
     structured_output_json: []const u8 = "",
+    /// Session-cache token counts, when tracked (headless-sdk-09). 0 when not.
+    cache_creation_input_tokens: usize = 0,
+    cache_read_input_tokens: usize = 0,
+    /// A fresh UUIDv4 for this result line (headless-sdk-05).
+    uuid: []const u8 = "",
+    /// Client uuid of the triggering user message (headless-sdk-missed-186).
+    user_message_uuid: []const u8 = "",
 };
 
 /// Build an SDK `result` struct from a finished turn. `total_cost_usd` is
@@ -128,21 +142,27 @@ pub fn buildResult(inputs: ResultInputs) Result {
         .session_id = inputs.session_id,
         .result_text = inputs.final_text,
         .num_turns = inputs.rounds,
-        .total_cost_usd = cost.estimateCost(
+        .total_cost_usd = cost.estimateCostWithCache(
             inputs.provider,
             inputs.model,
             inputs.total_input_tokens,
             inputs.total_output_tokens,
+            inputs.cache_read_input_tokens,
+            inputs.cache_creation_input_tokens,
         ),
         .usage = .{
             .input_tokens = inputs.total_input_tokens,
             .output_tokens = inputs.total_output_tokens,
+            .cache_creation_input_tokens = inputs.cache_creation_input_tokens,
+            .cache_read_input_tokens = inputs.cache_read_input_tokens,
         },
         .model = inputs.model,
         .duration_ms = inputs.duration_ms,
         .duration_api_ms = inputs.duration_api_ms,
         .stop_reason = inputs.stop_reason,
         .structured_output_json = inputs.structured_output_json,
+        .uuid = inputs.uuid,
+        .user_message_uuid = inputs.user_message_uuid,
     };
 }
 
@@ -158,10 +178,15 @@ pub const InitInputs = struct {
     cwd: []const u8 = "",
     claude_code_version: []const u8 = "",
     tools: []const []const u8 = &.{},
-    mcp_servers: []const []const u8 = &.{},
+    mcp_servers: []const McpServerInfo = &.{},
     slash_commands: []const []const u8 = &.{},
     skills: []const []const u8 = &.{},
-    plugins: []const []const u8 = &.{},
+    plugins: []const PluginInfo = &.{},
+    api_key_source: []const u8 = "none",
+    output_style: []const u8 = "default",
+    agents: []const []const u8 = &.{},
+    uuid: []const u8 = "",
+    betas: []const []const u8 = &.{},
 };
 
 /// Build a `system:init` struct from session metadata + registries. The
@@ -178,6 +203,11 @@ pub fn buildInit(inputs: InitInputs) InitInfo {
         .slash_commands = inputs.slash_commands,
         .skills = inputs.skills,
         .plugins = inputs.plugins,
+        .api_key_source = inputs.api_key_source,
+        .output_style = inputs.output_style,
+        .agents = inputs.agents,
+        .uuid = inputs.uuid,
+        .betas = inputs.betas,
     };
 }
 
