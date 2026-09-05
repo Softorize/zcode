@@ -58,6 +58,23 @@ pub const Format = enum { text, json };
 
 var min_level_severity: u8 = Level.warn.toSeverity();
 var emit_format: Format = .text;
+/// cli-flags-14: `--debug-file <path>` redirect target. Defaults to
+/// stderr; `setOutputFile` opens (create/truncate) the given path and
+/// switches every subsequent `logFn` write there instead. Best-effort: a
+/// write failure once redirected is silently dropped (matching the
+/// existing stderr write's `_ = ...` fire-and-forget contract) rather than
+/// panicking a running session over a log sink going away.
+var output_fd: std.posix.fd_t = std.posix.STDERR_FILENO;
+
+/// Redirect log output to `path` (create/truncate). Implicitly enables
+/// debug mode is the CALLER's job (matching the reference's "implicitly
+/// enables debug mode" wording for `--debug-file`) -- this function only
+/// switches the sink.
+pub fn setOutputFile(path: []const u8) !void {
+    const rt = @import("zcode_runtime");
+    const file = try std.Io.Dir.cwd().createFile(rt.io, path, .{ .truncate = true });
+    output_fd = file.handle;
+}
 
 /// Parse a user-supplied log level. Rejects unknown values explicitly
 /// so the operator sees the error at startup rather than silently
@@ -148,7 +165,9 @@ pub fn logFn(
 
     const out = w.buffered();
     // 0.16: std.posix.write is gone; route via libc (we link libc).
-    _ = std.c.write(std.posix.STDERR_FILENO, out.ptr, out.len);
+    // cli-flags-14: writes to `output_fd`, stderr by default or a
+    // `--debug-file` target once `setOutputFile` has redirected it.
+    _ = std.c.write(output_fd, out.ptr, out.len);
 }
 
 // --- Tests ------------------------------------------------------------

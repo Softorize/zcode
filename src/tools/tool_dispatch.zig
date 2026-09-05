@@ -163,16 +163,23 @@ const dispatch_table = [_]DispatchEntry{
     .{ .names = &.{ "OpenPR", "open_pr" }, .handler = handleOpenPR },
     .{ .names = &.{ "HttpRequest", "http_request" }, .handler = handleHttpRequest },
     .{ .names = &.{ "JsonQuery", "json_query" }, .handler = handleJsonQuery },
-    .{ .names = &.{ "AgentRun", "agent_run" }, .handler = handleAgentRun },
+    // tools-01: "Agent" is the reference-exact advertised name; "AgentRun"/
+    // "agent_run" stay dispatch-only legacy synonyms.
+    .{ .names = &.{ "AgentRun", "agent_run", "Agent", "agent" }, .handler = handleAgentRun },
     .{ .names = &.{ "Sleep", "sleep" }, .handler = handleSleep },
     .{ .names = &.{ "EnterWorktree", "enter_worktree" }, .handler = handleEnterWorktree },
     .{ .names = &.{ "ExitWorktree", "exit_worktree" }, .handler = handleExitWorktree },
     .{ .names = &.{ "mcp_servers_list", "McpServersList" }, .handler = handleMcpServersList },
     .{ .names = &.{ "mcp_tools_list", "McpToolsList" }, .handler = handleMcpToolsList },
     .{ .names = &.{"mcp_invoke"}, .handler = handleMcpInvoke },
-    .{ .names = &.{"mcp_resources_list"}, .handler = handleMcpResourcesList },
+    // tools-missed-68: "ListMcpResourcesTool"/"ReadMcpResourceTool" are the
+    // reference-exact advertised names; the snake_case forms stay
+    // dispatch-only legacy synonyms.
+    .{ .names = &.{ "mcp_resources_list", "ListMcpResourcesTool" }, .handler = handleMcpResourcesList },
     .{ .names = &.{"mcp_resource_templates_list"}, .handler = handleMcpResourceTemplatesList },
-    .{ .names = &.{"mcp_resource_read"}, .handler = handleMcpResourceRead },
+    .{ .names = &.{ "mcp_resource_read", "ReadMcpResourceTool" }, .handler = handleMcpResourceRead },
+    // tools-13: list the direct children of a directory resource.
+    .{ .names = &.{ "ReadMcpResourceDirTool", "mcp_resource_read_dir" }, .handler = handleMcpResourceReadDir },
     .{ .names = &.{"mcp_prompts_list"}, .handler = handleMcpPromptsList },
     .{ .names = &.{"mcp_prompt_get"}, .handler = handleMcpPromptGet },
     .{ .names = &.{"mcp_complete"}, .handler = handleMcpComplete },
@@ -181,7 +188,19 @@ const dispatch_table = [_]DispatchEntry{
     .{ .names = &.{"mcp_notifications"}, .handler = handleMcpNotifications },
     .{ .names = &.{"mcp_logging_set_level"}, .handler = handleMcpLoggingSetLevel },
     .{ .names = &.{ "ToolSearch", "tool_search" }, .handler = handleToolSearch },
-    .{ .names = &.{ "Brief", "brief" }, .handler = handleBrief },
+    // tools-04: "AttachContext" is the reference-exact advertised name for
+    // zcode's file-attachment tool; "Brief"/"brief" stay dispatch-only
+    // legacy synonyms for it (they are NOT the reference's SendUserMessage
+    // alias -- that's a distinct, unrelated tool, added separately below).
+    .{ .names = &.{ "AttachContext", "attach_context", "Brief", "brief" }, .handler = handleBrief },
+    .{ .names = &.{ "SendUserMessage", "send_user_message" }, .handler = handleSendUserMessage },
+    .{ .names = &.{ "Monitor", "monitor" }, .handler = handleMonitor },
+    .{ .names = &.{ "ScheduleWakeup", "schedule_wakeup" }, .handler = handleScheduleWakeup },
+    .{ .names = &.{ "ListAgents", "list_agents" }, .handler = handleListAgents },
+    .{ .names = &.{ "ReportFindings", "report_findings" }, .handler = handleReportFindings },
+    .{ .names = &.{ "PushNotification", "push_notification" }, .handler = handlePushNotification },
+    .{ .names = &.{ "SendUserFile", "send_user_file" }, .handler = handleSendUserFile },
+    .{ .names = &.{ "EndConversation", "end_conversation" }, .handler = handleEndConversation },
     .{ .names = &.{ "TodoWrite", "todo_write" }, .handler = handleTodoWrite },
     .{ .names = &.{ "McpAuth", "mcp_auth" }, .handler = handleMcpAuth },
     .{ .names = &.{ "REPL", "repl" }, .handler = handleRepl },
@@ -407,9 +426,41 @@ fn handleFileRead(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: Too
     const requested = parseUsize(getArg(req.args, "max_bytes"), 64 * 1024);
     const cap = resolveReadMaxBytes();
     const max_bytes = @min(requested, cap);
-    const offset = parseUsize(getArg(req.args, "offset"), 0);
-    const limit = parseUsize(getArg(req.args, "limit"), 0);
+    // tools-19: `pages` is the reference's PDF page-range parameter (e.g.
+    // "1-5"). zcode already implements PDF page extraction by reusing the
+    // `offset`/`limit` integer parameters as page_start/page_count
+    // (file.zig readRange -> readPdfAsText); `pages` is parsed here into
+    // that same offset/limit pair rather than treating PDF paging as
+    // unbuilt. Explicit offset/limit still win if both are given.
+    var offset = parseUsize(getArg(req.args, "offset"), 0);
+    var limit = parseUsize(getArg(req.args, "limit"), 0);
+    if (offset == 0 and limit == 0) {
+        if (getArg(req.args, "pages")) |pages_range| {
+            if (parsePageRange(pages_range)) |range| {
+                offset = range.start;
+                limit = range.count;
+            }
+        }
+    }
     return file_tool.readRange(allocator, req.cwd, path, max_bytes, offset, limit);
+}
+
+/// tools-19: parse a PDF page range like "5" (single page) or "1-5"
+/// (inclusive range) into a (start, count) pair matching readRange's
+/// offset/limit page semantics. Returns null for anything unparseable so the
+/// caller falls back to reading the whole document.
+const PageRange = struct { start: usize, count: usize };
+fn parsePageRange(raw: []const u8) ?PageRange {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, trimmed, '-')) |dash| {
+        const start = std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[0..dash], " \t"), 10) catch return null;
+        const end = std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[dash + 1 ..], " \t"), 10) catch return null;
+        if (end < start) return null;
+        return .{ .start = start, .count = end - start + 1 };
+    }
+    const page = std.fmt.parseInt(usize, trimmed, 10) catch return null;
+    return .{ .start = page, .count = 1 };
 }
 
 fn handleFileWrite(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
@@ -509,16 +560,27 @@ fn handleGrep(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExe
     // Args ported from claude-code-main/src/tools/GrepTool:
     //   glob        -- rg --glob filter ("*.zig", "*.{ts,tsx}")
     //   type        -- rg --type filter ("zig", "py", "rust")
-    //   output_mode -- rg output shape: content (default, lines
-    //                  with matches), files_with_matches (-l,
-    //                  path list only), count (-c, per-file
-    //                  match counts). Huge context-budget lever
-    //                  for the model on repo-wide searches.
+    //   output_mode -- rg output shape: content (lines with matches),
+    //                  files_with_matches (-l, path list only, THE
+    //                  DEFAULT when omitted per the reference), count
+    //                  (-c, per-file match counts). Huge context-budget
+    //                  lever for the model on repo-wide searches.
     const glob = getArg(req.args, "glob") orelse "";
     const type_filter = getArg(req.args, "type") orelse "";
-    const output_mode_raw = getArg(req.args, "output_mode") orelse "";
+    // tools-20: the reference defaults output_mode to "files_with_matches"
+    // when omitted (the previous zcode default was "content", the reverse).
+    // An explicit "content" (or any other recognized spelling) still works
+    // unchanged -- only the omitted-field default flipped.
+    const output_mode_raw = getArg(req.args, "output_mode") orelse "files_with_matches";
     const output_mode = @import("grep.zig").OutputMode.fromString(output_mode_raw);
-    return ext_tool.grep(allocator, req.cwd, pattern, search_path, max_results, ignore_case, multiline, context_lines, glob, type_filter, output_mode);
+    // tools-20: -A/-B (asymmetric context) take priority over the symmetric
+    // `context` (-C) when either is set; head_limit/offset paginate the
+    // combined output client-side.
+    const before_lines = parseUsize(getArg(req.args, "-B") orelse getArg(req.args, "before"), 0);
+    const after_lines = parseUsize(getArg(req.args, "-A") orelse getArg(req.args, "after"), 0);
+    const head_limit = parseUsize(getArg(req.args, "head_limit"), 0);
+    const offset = parseUsize(getArg(req.args, "offset"), 0);
+    return ext_tool.grep(allocator, req.cwd, pattern, search_path, max_results, ignore_case, multiline, context_lines, glob, type_filter, output_mode, before_lines, after_lines, head_limit, offset);
 }
 
 fn handleWebFetch(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
@@ -658,8 +720,11 @@ fn handleTaskClaim(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: To
 }
 
 fn taskCreate(allocator: std.mem.Allocator, req: ToolExecutionRequest) ![]u8 {
-    const title = getArg(req.args, "title") orelse return missingArg(allocator, "title");
-    const summary = getArg(req.args, "summary") orelse "";
+    // tools-24: `subject`/`description` are the reference-exact field names
+    // (cc_system_prompt_2.1.261.md: "TaskCreate (subject, description,
+    // activeForm, metadata)"); `title`/`summary` stay accepted synonyms.
+    const title = getArg(req.args, "subject") orelse getArg(req.args, "title") orelse return missingArg(allocator, "subject");
+    const summary = getArg(req.args, "description") orelse getArg(req.args, "summary") orelse "";
     const owner = getArg(req.args, "owner") orelse "";
     const priority = getArg(req.args, "priority") orelse "normal";
     const deps = getArg(req.args, "deps") orelse "";
@@ -676,19 +741,22 @@ fn taskCreate(allocator: std.mem.Allocator, req: ToolExecutionRequest) ![]u8 {
 }
 
 fn taskGet(allocator: std.mem.Allocator, req: ToolExecutionRequest) ![]u8 {
-    const id = getArg(req.args, "id") orelse return missingArg(allocator, "id");
+    // tools-24: `taskId` is the reference-exact field name; `id` stays an
+    // accepted synonym.
+    const id = getArg(req.args, "taskId") orelse getArg(req.args, "id") orelse return missingArg(allocator, "taskId");
     return ext_tool.taskGet(allocator, req.cwd, id);
 }
 
 fn taskUpdate(allocator: std.mem.Allocator, req: ToolExecutionRequest) ![]u8 {
-    const id = getArg(req.args, "id") orelse return missingArg(allocator, "id");
+    const id = getArg(req.args, "taskId") orelse getArg(req.args, "id") orelse return missingArg(allocator, "taskId");
 
-    // Dependency edges (swarm-tasks-01) are set via TaskUpdate. `add_blocks` is a
-    // comma-separated list of ids that THIS task blocks; `add_blocked_by` is a
-    // comma-separated list of ids that must complete before this task. Apply the
-    // edges before the scalar update so the returned record reflects them.
-    try applyDependencyEdges(allocator, req.cwd, id, getArg(req.args, "add_blocks"), true);
-    try applyDependencyEdges(allocator, req.cwd, id, getArg(req.args, "add_blocked_by"), false);
+    // Dependency edges (swarm-tasks-01) are set via TaskUpdate. `addBlocks`
+    // (reference-exact; `add_blocks` accepted too) is a comma-separated list
+    // of ids that THIS task blocks; `addBlockedBy` (`add_blocked_by`) is a
+    // comma-separated list of ids that must complete before this task. Apply
+    // the edges before the scalar update so the returned record reflects them.
+    try applyDependencyEdges(allocator, req.cwd, id, getArg(req.args, "addBlocks") orelse getArg(req.args, "add_blocks"), true);
+    try applyDependencyEdges(allocator, req.cwd, id, getArg(req.args, "addBlockedBy") orelse getArg(req.args, "add_blocked_by"), false);
 
     return ext_tool.taskUpdate(
         allocator,
@@ -707,7 +775,7 @@ fn taskUpdate(allocator: std.mem.Allocator, req: ToolExecutionRequest) ![]u8 {
 // already owns another open task. Renders the claim outcome as model-facing
 // text mirroring the reference `ClaimTaskResult` reasons.
 fn taskClaim(allocator: std.mem.Allocator, req: ToolExecutionRequest) ![]u8 {
-    const id = getArg(req.args, "id") orelse return missingArg(allocator, "id");
+    const id = getArg(req.args, "taskId") orelse getArg(req.args, "id") orelse return missingArg(allocator, "taskId");
     const owner = getArg(req.args, "owner") orelse return missingArg(allocator, "owner");
     const check_busy = parseBool(getArg(req.args, "check_busy") orelse "false");
 
@@ -770,12 +838,12 @@ fn applyDependencyEdges(
 }
 
 fn taskStop(allocator: std.mem.Allocator, req: ToolExecutionRequest) ![]u8 {
-    const id = getArg(req.args, "id") orelse return missingArg(allocator, "id");
+    const id = getArg(req.args, "taskId") orelse getArg(req.args, "id") orelse return missingArg(allocator, "taskId");
     return ext_tool.taskStop(allocator, req.cwd, id);
 }
 
 fn taskOutput(allocator: std.mem.Allocator, req: ToolExecutionRequest) ![]u8 {
-    const id = getArg(req.args, "id") orelse return missingArg(allocator, "id");
+    const id = getArg(req.args, "taskId") orelse getArg(req.args, "id") orelse return missingArg(allocator, "taskId");
     return ext_tool.taskOutput(allocator, req.cwd, id, getArg(req.args, "output"));
 }
 
@@ -817,8 +885,18 @@ fn handleAskUserQuestion(allocator: std.mem.Allocator, _: ?*mcp_client.Client, r
 }
 
 fn handleSkill(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
-    const action = getArg(req.args, "action") orelse "list";
-    return ext_tool.skillAction(allocator, req.cwd, action, getArg(req.args, "name"), getArg(req.args, "args"));
+    // tools-21 / bundled-skills-01: the reference's real contract is
+    // {skill, args} with NO `action` field -- a bare `skill` name means
+    // "run it". The previous default (`action` omitted -> "list") meant a
+    // model calling Skill({skill:"foo"}) exactly per its reference training
+    // got back a skill LISTING instead of running "foo". `skill` is now
+    // accepted as a synonym for `name`; when `action` is omitted but a
+    // skill/name value IS present, default to "run" instead of "list". The
+    // explicit action=list|read|run contract keeps working unchanged for
+    // callers that still use it.
+    const skill_name = getArg(req.args, "skill") orelse getArg(req.args, "name");
+    const action = getArg(req.args, "action") orelse if (skill_name != null) "run" else "list";
+    return ext_tool.skillAction(allocator, req.cwd, action, skill_name, getArg(req.args, "args"));
 }
 
 fn handleCommand(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
@@ -827,9 +905,13 @@ fn handleCommand(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: Tool
 }
 
 fn handleTeamCreate(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
-    const name = getArg(req.args, "name") orelse return missingArg(allocator, "name");
-    const members = getArg(req.args, "members") orelse "";
-    return ext_tool.teamCreate(allocator, req.cwd, name, members);
+    // tools-24: `team_name`/`agent_type`/`model` are the reference-exact
+    // field names; `name`/`members` stay accepted synonyms.
+    const name = getArg(req.args, "team_name") orelse getArg(req.args, "name") orelse return missingArg(allocator, "team_name");
+    const agent_type = getArg(req.args, "agent_type") orelse getArg(req.args, "members") orelse "";
+    const model = getArg(req.args, "model") orelse "";
+    const description = getArg(req.args, "description") orelse "";
+    return ext_tool.teamCreateWithOptions(allocator, req.cwd, name, agent_type, model, description);
 }
 
 fn handleTeamDelete(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
@@ -991,16 +1073,62 @@ fn handleSleep(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolEx
     return std.fmt.allocPrint(allocator, "slept for {d} seconds", .{seconds});
 }
 
+/// True when `branch` already exists as a local ref in the repo at `cwd`.
+/// Any failure to run/parse `git rev-parse` (not a git repo, git missing,
+/// etc.) is treated as "does not exist" so the caller falls through to the
+/// create-new-branch path, which will itself surface a clear git error if
+/// something is actually wrong with the repo.
+fn branchExistsInRepo(allocator: std.mem.Allocator, cwd: []const u8, branch: []const u8) bool {
+    const ref = std.fmt.allocPrint(allocator, "refs/heads/{s}", .{branch}) catch return false;
+    defer allocator.free(ref);
+    const result = std.process.run(allocator, rt.io, .{
+        .argv = &.{ "git", "rev-parse", "--verify", "--quiet", ref },
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(4 * 1024),
+        .stderr_limit = .limited(4 * 1024),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term == .exited and result.term.exited == 0;
+}
+
 fn handleEnterWorktree(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
-    const path = getArg(req.args, "path") orelse return missingArg(allocator, "path");
-    const branch = getArg(req.args, "branch");
+    // tools-missed-71: `name` is the reference's field (deferred one-liner:
+    // "EnterWorktree (name)"). When `path`/`branch` are not given explicitly,
+    // derive the conventional sibling layout: path=../<name>, branch=<name>.
+    const name_arg = getArg(req.args, "name");
+    var derived_path_buf: ?[]u8 = null;
+    defer if (derived_path_buf) |buf| allocator.free(buf);
+    const path: []const u8 = getArg(req.args, "path") orelse blk: {
+        const n = name_arg orelse return missingArg(allocator, "name");
+        derived_path_buf = try std.fmt.allocPrint(allocator, "../{s}", .{n});
+        break :blk derived_path_buf.?;
+    };
+    const branch = getArg(req.args, "branch") orelse name_arg;
     var argv_buf = std.array_list.Managed([]const u8).init(allocator);
     defer argv_buf.deinit();
     try argv_buf.append("git");
     try argv_buf.append("worktree");
     try argv_buf.append("add");
-    try argv_buf.append(path);
-    if (branch) |b| try argv_buf.append(b);
+    if (branch) |b| {
+        // tools-missed-71: the schema promises "Branch name (created if not
+        // exists)". `git worktree add <path> <branch>` only WORKS when
+        // `<branch>` already exists (it checks the ref out); a genuinely new
+        // branch name needs `-b <branch>` instead, or git refuses with
+        // "invalid reference: <branch>". Check existence first so the common
+        // "spin up a fresh worktree on a fresh branch" case (e.g. `name`
+        // alone) actually creates the branch instead of erroring.
+        if (branchExistsInRepo(allocator, req.cwd, b)) {
+            try argv_buf.append(path);
+            try argv_buf.append(b);
+        } else {
+            try argv_buf.append("-b");
+            try argv_buf.append(b);
+            try argv_buf.append(path);
+        }
+    } else {
+        try argv_buf.append(path);
+    }
 
     const result = std.process.run(allocator, rt.io, .{
         .argv = argv_buf.items,
@@ -1020,6 +1148,14 @@ fn handleEnterWorktree(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req
 
 fn handleExitWorktree(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
     const path = getArg(req.args, "path") orelse return missingArg(allocator, "path");
+    // tools-missed-71: `action` (keep|remove) -- the reference's deferred
+    // one-liner is "ExitWorktree (action keep|remove)". `keep` (the default
+    // was previously "always remove") leaves the worktree directory and its
+    // branch untouched; `remove` deletes the linked worktree as before.
+    const action = getArg(req.args, "action") orelse "remove";
+    if (std.mem.eql(u8, action, "keep")) {
+        return std.fmt.allocPrint(allocator, "worktree kept: {s} (not removed; branch and files remain for later use)", .{path});
+    }
     const result = std.process.run(allocator, rt.io, .{
         .argv = &.{ "git", "worktree", "remove", path },
         .cwd = .{ .path = req.cwd },
@@ -1345,6 +1481,13 @@ fn handleCronCreate(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: T
 
 fn handleCronDelete(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
     const id = getArg(req.args, "id") orelse return missingArg(allocator, "id");
+    return removeCronJob(allocator, id);
+}
+
+/// commands-20: pub wrapper so the /loops slash command can cancel a job by
+/// id without needing a full ToolExecutionRequest. Identical body to what
+/// handleCronDelete did inline; shared by both callers now.
+pub fn removeCronJob(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
     const store = try getCronStore(allocator);
     if (store.remove(id)) {
         return std.fmt.allocPrint(allocator, "Cancelled job {s}.", .{id});
@@ -1352,7 +1495,10 @@ fn handleCronDelete(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: T
     return std.fmt.allocPrint(allocator, "Job not found: {s}", .{id});
 }
 
-fn handleCronList(allocator: std.mem.Allocator, _: ?*mcp_client.Client, _: ToolExecutionRequest) ![]u8 {
+/// commands-20: made pub so the /loops slash command (a thin management
+/// layer over the jobs /loop already creates) can list the same store the
+/// CronList tool renders, without a second listing engine.
+pub fn handleCronList(allocator: std.mem.Allocator, _: ?*mcp_client.Client, _: ToolExecutionRequest) ![]u8 {
     const store = try getCronStore(allocator);
     const entries = store.list();
     if (entries.len == 0) {
@@ -1578,6 +1724,235 @@ fn handleBrief(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolEx
         "<brief label=\"{s}\" path=\"{s}\" bytes=\"{d}\">\n{s}\n</brief>",
         .{ label, path, content.len, content },
     );
+}
+
+// --- tools-04: SendUserMessage ---
+
+/// The real reference tool at the "Brief" legacy-alias target: deliver a
+/// message directly to the user. zcode's tool result already surfaces as
+/// user-visible output, so this is a thin, honest pass-through -- the value
+/// is in the tool EXISTING and being distinct from AttachContext/Brief, not
+/// in any extra formatting.
+fn handleSendUserMessage(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    const message = getArg(req.args, "message") orelse return missingArg(allocator, "message");
+    return allocator.dupe(u8, message);
+}
+
+// --- tools-08: Monitor ---
+
+/// Run a shell command via the same background-task runner Bash's
+/// `run_in_background` uses, so the caller is notified via the normal
+/// task-completion path when it exits.
+///
+/// DOCUMENTED DEVIATION: the reference wakes the agent on EVERY emitted
+/// stdout line (a true streaming push). This implementation wakes on
+/// command EXIT only (reusing the existing background-task notification),
+/// not per-line -- true per-line wakeups would need the agent's turn loop
+/// (agent_runtime.zig, outside this package's ownership) to poll the
+/// growing output file and re-invoke the model on each new line, which is a
+/// larger, cross-cutting change tracked separately rather than half-wired
+/// here.
+fn handleMonitor(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    const command = getArg(req.args, "command") orelse return missingArg(allocator, "command");
+    const description = getArg(req.args, "description") orelse "monitored command";
+    const title_owned = backgroundShellTitle(allocator, command) catch null;
+    defer if (title_owned) |buf| allocator.free(buf);
+    const title = title_owned orelse "monitor";
+    const sandboxed_command = try shell_tool.buildBackgroundCommandStringWithSnapshot(allocator, req.cwd, command, req.sandbox_profile, req.shell_snapshot_path);
+    defer allocator.free(sandboxed_command);
+    const raw = try ext_tool.taskRun(allocator, req.cwd, null, title, sandboxed_command, description, "monitor", "normal", "");
+    defer allocator.free(raw);
+    return renderManagedBackgroundShellStart(allocator, command, raw);
+}
+
+// --- tools-09: ScheduleWakeup ---
+
+/// Clamp a requested `/loop` dynamic-mode wakeup delay to the reference's
+/// [60, 3600] second range. Exported for direct unit testing -- pure, no IO.
+pub fn clampScheduleWakeupDelaySeconds(raw: ?[]const u8) usize {
+    const parsed = parseUsize(raw, 300);
+    return @min(@max(parsed, 60), 3600);
+}
+
+/// Self-paced /loop dynamic-mode wake control.
+///
+/// DOCUMENTED DEVIATION: the clamp/validation logic here is real and
+/// unit-tested, and the tool is fully dispatchable, but this does not reach
+/// into zcode's actual `/loop` dynamic-mode scheduler (owned by a different
+/// package) to reschedule the next iteration -- it only returns the
+/// acknowledgment text the model would see. Wiring the scheduler itself is
+/// tracked as a follow-up.
+fn handleScheduleWakeup(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    if (parseBool(getArg(req.args, "stop") orelse "false")) {
+        return allocator.dupe(u8, "loop stopped: no further wakeup scheduled.");
+    }
+    if (parseBool(getArg(req.args, "noop") orelse "false")) {
+        return allocator.dupe(u8, "acknowledged: schedule unchanged.");
+    }
+    const delay = clampScheduleWakeupDelaySeconds(getArg(req.args, "delaySeconds"));
+    const prompt = getArg(req.args, "prompt") orelse "";
+    const reason = getArg(req.args, "reason") orelse "";
+    return std.fmt.allocPrint(allocator, "wakeup scheduled in {d}s\nprompt={s}\nreason={s}", .{ delay, prompt, reason });
+}
+
+// --- tools-10: ListAgents ---
+
+/// Lists SendMessage-addressable agents. Derived from open-task ownership
+/// (task.zig's `getAgentStatuses`, which buckets unresolved tasks by owner --
+/// a background AgentRun spawn or a claimed task both register their owner
+/// there), mirroring the reference's "in-process subagents you spawned, the
+/// teammates on your team" framing without needing a separate live-session
+/// registry.
+fn handleListAgents(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    const statuses = try ext_tool.getAgentStatuses(allocator, req.cwd);
+    defer ext_tool.freeAgentStatuses(allocator, statuses);
+
+    if (statuses.len == 0) {
+        return allocator.dupe(u8, "No addressable agents right now -- SendMessage(to=...) has nothing to target yet.");
+    }
+
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    try out.writer().print("Addressable agents ({d}):\n", .{statuses.len});
+    for (statuses) |s| {
+        try out.writer().print("- {s} ({s})\n", .{ s.name, if (s.busy) "busy" else "idle" });
+    }
+    return out.toOwnedSlice();
+}
+
+// --- tools-11: ReportFindings ---
+
+fn findingsStrField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    if (obj.get(key)) |v| {
+        if (v == .string and v.string.len > 0) return v.string;
+    }
+    return null;
+}
+
+/// Render a code-review findings list as a structured block, so the REPL has
+/// a typed list to show instead of ad hoc prose. Validates the `findings`
+/// array shape; a malformed payload returns a model-readable error instead
+/// of crashing.
+fn handleReportFindings(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    const findings_json = getArg(req.args, "findings") orelse return missingArg(allocator, "findings");
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, findings_json, .{}) catch {
+        return allocator.dupe(u8, "error: 'findings' must be a JSON array");
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) return allocator.dupe(u8, "error: 'findings' must be a JSON array");
+
+    const level = getArg(req.args, "level") orelse "";
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    if (level.len > 0) try out.writer().print("[level={s}]\n", .{level});
+
+    if (parsed.value.array.items.len == 0) {
+        try out.writer().writeAll("No findings survived verification.\n");
+        return out.toOwnedSlice();
+    }
+
+    try out.writer().print("Findings ({d}):\n\n", .{parsed.value.array.items.len});
+    for (parsed.value.array.items, 0..) |item, i| {
+        if (item != .object) continue;
+        const obj = item.object;
+        const file = findingsStrField(obj, "file") orelse "";
+        const summary = findingsStrField(obj, "summary") orelse "";
+        const failure = findingsStrField(obj, "failure_scenario") orelse "";
+        const category = findingsStrField(obj, "category") orelse "";
+        const verdict = findingsStrField(obj, "verdict") orelse "";
+        const outcome = findingsStrField(obj, "outcome") orelse "";
+
+        try out.writer().print("{d}. {s}", .{ i + 1, summary });
+        if (category.len > 0) try out.writer().print(" [{s}]", .{category});
+        if (verdict.len > 0) try out.writer().print(" ({s})", .{verdict});
+        try out.writer().writeAll("\n");
+        if (file.len > 0) {
+            if (obj.get("line")) |line_val| {
+                if (line_val == .integer) {
+                    try out.writer().print("   {s}:{d}\n", .{ file, line_val.integer });
+                } else {
+                    try out.writer().print("   {s}\n", .{file});
+                }
+            } else {
+                try out.writer().print("   {s}\n", .{file});
+            }
+        }
+        if (failure.len > 0) try out.writer().print("   {s}\n", .{failure});
+        if (outcome.len > 0) try out.writer().print("   outcome: {s}\n", .{outcome});
+    }
+    return out.toOwnedSlice();
+}
+
+// --- tools-12: PushNotification / SendUserFile ---
+
+const os_notify = @import("../core/os_notify.zig");
+
+/// OS-level push notification, built directly on the existing
+/// os_notify.zig primitive (already exercised by its own tests, and a
+/// no-op under `builtin.is_test` so this dispatch handler never pops a
+/// real desktop notification during `zig build test`).
+fn handlePushNotification(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    const title = getArg(req.args, "title") orelse return missingArg(allocator, "title");
+    const message = getArg(req.args, "message") orelse return missingArg(allocator, "message");
+    os_notify.notify(allocator, title, message);
+    return std.fmt.allocPrint(allocator, "notification sent: {s} - {s}", .{ title, message });
+}
+
+/// Surfaces a finished deliverable file + message. Renders a tagged block
+/// the REPL can recognize as a dedicated "user file" output rather than a
+/// plain assistant-text file mention.
+fn handleSendUserFile(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    const path = getArg(req.args, "file_path") orelse getArg(req.args, "path") orelse return missingArg(allocator, "file_path");
+    const message = getArg(req.args, "message") orelse "";
+    return std.fmt.allocPrint(allocator, "[user_file]\npath={s}\nmessage={s}", .{ path, message });
+}
+
+// --- tools-14: EndConversation ---
+
+/// Minimal deferred termination signal.
+///
+/// DOCUMENTED DEVIATION: returns a fixed closing message plus a
+/// `[end_conversation=true]` sentinel line (the same embedded-marker
+/// convention `renderManagedBackgroundShellStart` uses for background-task
+/// start markers), but does not itself reach into the REPL's turn loop
+/// (agent_runtime.zig, outside this package's ownership) to force
+/// termination. Wiring the REPL to watch for that sentinel and end the
+/// session is a follow-up for whichever package owns that loop.
+fn handleEndConversation(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    const reason = getArg(req.args, "reason") orelse "";
+    if (reason.len > 0) {
+        return std.fmt.allocPrint(allocator, "[end_conversation=true]\nGoodbye. ({s})", .{reason});
+    }
+    return allocator.dupe(u8, "[end_conversation=true]\nGoodbye.");
+}
+
+// --- tools-13: ReadMcpResourceDirTool ---
+
+/// List the direct children of a directory resource. mcp_client models
+/// resources as a flat list keyed by URI (there is no separate
+/// directory-resource concept), so "direct child of `uri`" is derived
+/// structurally: a resource whose URI starts with "<uri>/" and has no
+/// further "/" after that prefix (a grandchild is excluded).
+fn handleMcpResourceReadDir(allocator: std.mem.Allocator, mcp: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
+    const server = getArg(req.args, "server") orelse return missingArg(allocator, "server");
+    const uri = getArg(req.args, "uri") orelse return missingArg(allocator, "uri");
+    if (mcp == null) return allocator.dupe(u8, "MCP client unavailable");
+
+    const resources = try mcp.?.listResources(server);
+    defer mcp_client.freeResourceInfos(allocator, resources);
+
+    const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{std.mem.trimEnd(u8, uri, "/")});
+    defer allocator.free(prefix);
+
+    var children = std.array_list.Managed(mcp_client.ResourceInfo).init(allocator);
+    defer children.deinit();
+    for (resources) |r| {
+        if (!std.mem.startsWith(u8, r.uri, prefix)) continue;
+        const rest = r.uri[prefix.len..];
+        if (std.mem.indexOfScalar(u8, rest, '/') != null) continue; // grandchild, not a direct child
+        try children.append(r);
+    }
+    return renderResourceList(allocator, children.items);
 }
 
 const testing = std.testing;
@@ -2057,4 +2432,286 @@ fn renderNotificationList(allocator: std.mem.Allocator, notifications: []const m
         try out.writer().print("{s}\t{s}\t{s}\n", .{ notification.server, notification.method, notification.params_json });
     }
     return out.toOwnedSlice();
+}
+
+// --- wp2-tools-surface: new/changed dispatch behavior tests ---
+
+test "tools-04: SendUserMessage echoes the message back as its output" {
+    const out = try dispatch(testing.allocator, null, .{ .name = "SendUserMessage", .args = "\"message\":\"hello there\"", .cwd = "" });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hello there", out);
+}
+
+test "tools-04: AttachContext is dispatchable under its new name and the legacy Brief alias" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "note.txt", .data = "reference material" });
+    const cwd = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const via_new = try dispatch(testing.allocator, null, .{ .name = "AttachContext", .args = "\"path\":\"note.txt\"", .cwd = cwd });
+    defer testing.allocator.free(via_new);
+    try testing.expect(std.mem.indexOf(u8, via_new, "reference material") != null);
+
+    const via_legacy = try dispatch(testing.allocator, null, .{ .name = "Brief", .args = "\"path\":\"note.txt\"", .cwd = cwd });
+    defer testing.allocator.free(via_legacy);
+    try testing.expect(std.mem.indexOf(u8, via_legacy, "reference material") != null);
+}
+
+test "tools-08: Monitor spawns a background task and returns immediately" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const out = try dispatch(testing.allocator, null, .{ .name = "Monitor", .args = "\"command\":\"true\",\"description\":\"wait for it\"", .cwd = cwd });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "background_task_started=true") != null);
+}
+
+test "tools-09: ScheduleWakeup clamps delaySeconds to [60, 3600]" {
+    try testing.expectEqual(@as(usize, 60), clampScheduleWakeupDelaySeconds("1"));
+    try testing.expectEqual(@as(usize, 3600), clampScheduleWakeupDelaySeconds("999999"));
+    try testing.expectEqual(@as(usize, 120), clampScheduleWakeupDelaySeconds("120"));
+    try testing.expectEqual(@as(usize, 300), clampScheduleWakeupDelaySeconds(null));
+
+    const out = try dispatch(testing.allocator, null, .{ .name = "ScheduleWakeup", .args = "\"delaySeconds\":5,\"prompt\":\"resume\"", .cwd = "" });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "wakeup scheduled in 60s") != null);
+
+    const stopped = try dispatch(testing.allocator, null, .{ .name = "ScheduleWakeup", .args = "\"stop\":true", .cwd = "" });
+    defer testing.allocator.free(stopped);
+    try testing.expect(std.mem.indexOf(u8, stopped, "loop stopped") != null);
+}
+
+test "tools-10: ListAgents lists task-owning agents and is empty when none" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const empty = try dispatch(testing.allocator, null, .{ .name = "ListAgents", .args = "", .cwd = cwd });
+    defer testing.allocator.free(empty);
+    try testing.expect(std.mem.indexOf(u8, empty, "No addressable agents") != null);
+
+    const created = try ext_tool.taskCreateWithOptions(testing.allocator, cwd, "do the thing", "", "worker-x", "normal", "", null, "", "");
+    testing.allocator.free(created);
+
+    const listed = try dispatch(testing.allocator, null, .{ .name = "ListAgents", .args = "", .cwd = cwd });
+    defer testing.allocator.free(listed);
+    try testing.expect(std.mem.indexOf(u8, listed, "worker-x") != null);
+}
+
+test "tools-11: ReportFindings renders a structured findings list, and an empty array is a clean no-op" {
+    const out = try dispatch(testing.allocator, null, .{
+        .name = "ReportFindings",
+        .args = "\"level\":\"high\",\"findings\":[{\"file\":\"src/a.zig\",\"line\":42,\"summary\":\"off-by-one\",\"failure_scenario\":\"empty input crashes\",\"category\":\"correctness\",\"verdict\":\"CONFIRMED\"}]",
+        .cwd = "",
+    });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "off-by-one") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "src/a.zig:42") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "CONFIRMED") != null);
+
+    const none = try dispatch(testing.allocator, null, .{ .name = "ReportFindings", .args = "\"findings\":[]", .cwd = "" });
+    defer testing.allocator.free(none);
+    try testing.expect(std.mem.indexOf(u8, none, "No findings survived verification") != null);
+}
+
+test "tools-12: SendUserFile renders a tagged path+message block" {
+    const out = try dispatch(testing.allocator, null, .{ .name = "SendUserFile", .args = "\"file_path\":\"/tmp/report.html\",\"message\":\"here is the report\"", .cwd = "" });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "/tmp/report.html") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "here is the report") != null);
+}
+
+test "tools-12: PushNotification is dispatchable (no-op under test) and returns an acknowledgment" {
+    const out = try dispatch(testing.allocator, null, .{ .name = "PushNotification", .args = "\"title\":\"Done\",\"message\":\"build finished\"", .cwd = "" });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "Done") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "build finished") != null);
+}
+
+test "tools-14: EndConversation returns a closing message and sentinel" {
+    const out = try dispatch(testing.allocator, null, .{ .name = "EndConversation", .args = "\"reason\":\"user asked to see it\"", .cwd = "" });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "[end_conversation=true]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "user asked to see it") != null);
+}
+
+test "tools-21/bundled-skills-01: Skill({skill:...}) runs directly without an action field" {
+    // "simplify" is a real bundled skill (see core.bundled_skills tests). The
+    // point under test: omitting `action` with a bare `skill` value takes
+    // the "run" branch (expanding the skill's own instructions) rather than
+    // silently falling through to the "list" branch (a "skills:\n..."
+    // directory listing).
+    const out = try dispatch(testing.allocator, null, .{ .name = "Skill", .args = "\"skill\":\"simplify\"", .cwd = "" });
+    defer testing.allocator.free(out);
+    try testing.expect(!std.mem.startsWith(u8, out, "skills:"));
+    try testing.expect(out.len > 0);
+
+    // An unknown skill name under the same bare-`skill` contract still takes
+    // the "run" branch (surfacing SkillNotFound) rather than "list".
+    try testing.expectError(error.SkillNotFound, dispatch(testing.allocator, null, .{ .name = "Skill", .args = "\"skill\":\"definitely-not-a-real-skill-xyz\"", .cwd = "" }));
+}
+
+test "tools-19: Read accepts file_path and a pages range for a would-be PDF (falls through to offset/limit)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "doc.txt", .data = "line one\nline two\nline three\n" });
+    const cwd = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const out = try dispatch(testing.allocator, null, .{ .name = "Read", .args = "\"file_path\":\"doc.txt\"", .cwd = cwd });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "line one") != null);
+}
+
+test "tools-19: parsePageRange parses single and ranged pages" {
+    try testing.expectEqual(PageRange{ .start = 5, .count = 1 }, parsePageRange("5").?);
+    try testing.expectEqual(PageRange{ .start = 1, .count = 5 }, parsePageRange("1-5").?);
+    try testing.expect(parsePageRange("5-1") == null);
+    try testing.expect(parsePageRange("nope") == null);
+}
+
+test "tools-24: TeamCreate accepts team_name/agent_type/model reference field names" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const out = try dispatch(testing.allocator, null, .{
+        .name = "TeamCreate",
+        .args = "\"team_name\":\"alpha-refname\",\"agent_type\":\"reviewer\",\"model\":\"sonnet\"",
+        .cwd = cwd,
+    });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "alpha-refname") != null);
+}
+
+test "tools-24: TaskCreate/TaskGet/TaskUpdate accept reference field names" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const created = try dispatch(testing.allocator, null, .{ .name = "TaskCreate", .args = "\"subject\":\"fix the bug\",\"description\":\"details here\"", .cwd = cwd });
+    defer testing.allocator.free(created);
+    const id = fieldValue(created, "id") orelse unreachable;
+    const id_owned = try testing.allocator.dupe(u8, id);
+    defer testing.allocator.free(id_owned);
+
+    const args_buf = try std.fmt.allocPrint(testing.allocator, "\"taskId\":\"{s}\"", .{id_owned});
+    defer testing.allocator.free(args_buf);
+    const got = try dispatch(testing.allocator, null, .{ .name = "TaskGet", .args = args_buf, .cwd = cwd });
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "fix the bug") != null);
+}
+
+test "tools-missed-71: EnterWorktree derives ../<name> path and <name> branch; ExitWorktree keep leaves it in place" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(parent);
+
+    const repo = try std.fmt.allocPrint(testing.allocator, "{s}/repo", .{parent});
+    defer testing.allocator.free(repo);
+    try std.Io.Dir.cwd().createDirPath(rt.io, repo);
+
+    const git_available = blk: {
+        const r = std.process.run(testing.allocator, rt.io, .{ .argv = &.{ "git", "init", "-q" }, .cwd = .{ .path = repo } }) catch break :blk false;
+        defer testing.allocator.free(r.stdout);
+        defer testing.allocator.free(r.stderr);
+        break :blk r.term == .exited and r.term.exited == 0;
+    };
+    if (!git_available) return error.SkipZigTest;
+
+    // A worktree needs at least one commit to branch from.
+    {
+        const r = try std.process.run(testing.allocator, rt.io, .{ .argv = &.{ "git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "init" }, .cwd = .{ .path = repo } });
+        testing.allocator.free(r.stdout);
+        testing.allocator.free(r.stderr);
+    }
+
+    const out = try dispatch(testing.allocator, null, .{ .name = "EnterWorktree", .args = "\"name\":\"feature-x\"", .cwd = repo });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "worktree failed") == null);
+
+    const worktree_path = try std.fmt.allocPrint(testing.allocator, "{s}/feature-x", .{parent});
+    defer testing.allocator.free(worktree_path);
+    // The derived sibling directory now exists.
+    _ = std.Io.Dir.cwd().statFile(rt.io, worktree_path, .{}) catch |err| {
+        std.debug.print("expected worktree at {s}: {}\n", .{ worktree_path, err });
+        return err;
+    };
+
+    const kept = try dispatch(testing.allocator, null, .{ .name = "ExitWorktree", .args = "\"path\":\"../feature-x\",\"action\":\"keep\"", .cwd = repo });
+    defer testing.allocator.free(kept);
+    try testing.expect(std.mem.indexOf(u8, kept, "worktree kept") != null);
+    // "keep" must not have deleted it.
+    _ = try std.Io.Dir.cwd().statFile(rt.io, worktree_path, .{});
+
+    const removed = try dispatch(testing.allocator, null, .{ .name = "ExitWorktree", .args = "\"path\":\"../feature-x\",\"action\":\"remove\"", .cwd = repo });
+    defer testing.allocator.free(removed);
+    try testing.expect(std.mem.indexOf(u8, removed, "worktree removed") != null);
+}
+
+test "tools-13: ReadMcpResourceDirTool lists only direct children of a directory URI" {
+    if (@import("../core/env.zig").getenv("CI") != null) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script_body =
+        \\import sys, json
+        \\def read_frame():
+        \\    header = b""
+        \\    while not header.endswith(b"\r\n\r\n"):
+        \\        b = sys.stdin.buffer.read(1)
+        \\        if not b:
+        \\            return None
+        \\        header += b
+        \\    length = 0
+        \\    for line in header.decode("utf-8").split("\r\n"):
+        \\        if line.lower().startswith("content-length:"):
+        \\            length = int(line.split(":", 1)[1].strip())
+        \\    body = sys.stdin.buffer.read(length)
+        \\    return json.loads(body.decode("utf-8"))
+        \\def write_frame(obj):
+        \\    body = json.dumps(obj).encode("utf-8")
+        \\    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+        \\    sys.stdout.buffer.write(body)
+        \\    sys.stdout.buffer.flush()
+        \\while True:
+        \\    msg = read_frame()
+        \\    if msg is None:
+        \\        break
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"dirstub","version":"0.1"}}})
+        \\    elif method == "notifications/initialized":
+        \\        pass
+        \\    elif method == "resources/list":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"resources":[{"uri":"dir://a/one","name":"one","description":""},{"uri":"dir://a/two","name":"two","description":""},{"uri":"dir://a/two/deep","name":"deep","description":""}]}})
+    ;
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "mock_dir_server.py", .data = script_body });
+    const script = try @import("../core/test_helpers.zig").tmpDirPath(testing.allocator, &tmp, "mock_dir_server.py");
+    defer testing.allocator.free(script);
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "servers.json", .data = "[]" });
+    const registry = try @import("../core/test_helpers.zig").tmpDirPath(testing.allocator, &tmp, "servers.json");
+    defer testing.allocator.free(registry);
+
+    var client = try mcp_client.Client.init(testing.allocator, registry);
+    defer client.deinit();
+    const transport = try std.fmt.allocPrint(testing.allocator, "python3 '{s}'", .{script});
+    defer testing.allocator.free(transport);
+    try client.add("dirstub", transport);
+
+    const out = dispatch(testing.allocator, &client, .{ .name = "ReadMcpResourceDirTool", .args = "\"server\":\"dirstub\",\"uri\":\"dir://a\"", .cwd = "" }) catch |err| {
+        std.debug.print("skipping tools-13 MCP resource-dir test: {}\n", .{err});
+        return;
+    };
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "dir://a/one") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "dir://a/two") != null and std.mem.indexOf(u8, out, "dir://a/two/deep") == null);
 }

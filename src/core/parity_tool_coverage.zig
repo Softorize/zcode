@@ -17,7 +17,12 @@ const tools_568 = [_][]const u8{
 /// #568 audit. When a new handler is added, move the tool from
 /// `deferred` to `handled`.
 const handled = [_][]const u8{
-    "Brief", // handleBrief in tool_dispatch.zig
+    // tools-04 (wp2-tools-surface): the advertised schema name is now
+    // "AttachContext" (the reference's real "Brief" alias target is the
+    // unrelated SendUserMessage tool); "Brief"/"brief" remain dispatch-only
+    // legacy synonyms routed to the same handleBrief handler, so this #568
+    // identifier is still accurate as an internal dispatch-name check.
+    "Brief", // handleBrief in tool_dispatch.zig (advertised as "AttachContext")
     "ScheduleCron", // handleCronCreate/handleCronDelete in tool_dispatch.zig
     "Sleep", // handleSleep in tool_dispatch.zig
     "TodoWrite", // handleTodoWrite in tool_dispatch.zig (V1 shim over V2 task.zig)

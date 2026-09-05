@@ -219,6 +219,12 @@ pub const AskUserPromptFn = *const fn (ctx: *anyopaque, allocator: std.mem.Alloc
 pub const ApprovalHandler = struct {
     ctx: *anyopaque,
     prompt: ApprovalPromptFn,
+    /// headless-sdk-01: optional hook a host-driven (`sdk_relay`) handler uses
+    /// to receive the REAL tool_name/input/tool_use_id for the tool call about
+    /// to be gated, since `prompt` itself only ever receives a human-readable
+    /// message. Called once per dispatched tool call, before `prompt` may run.
+    /// `null` for every non-relay handler (REPL, stdin) -- they are unaffected.
+    setPending: ?*const fn (ctx: *anyopaque, tool_name: []const u8, input_json: []const u8, tool_use_id: []const u8) void = null,
 };
 
 /// Minimum turn duration (seconds) at which we emit a terminal
@@ -1973,6 +1979,7 @@ pub const AgentRuntime = struct {
                     &self.git_capture_cache,
                     working_context,
                     prompt_mode,
+                    !self.interactive,
                 );
                 defer built.envelope.deinit();
 
@@ -3272,6 +3279,16 @@ pub const AgentRuntime = struct {
     }
 
     fn executeToolCallDispatch(self: *AgentRuntime, name: []const u8, args: []const u8) !ToolTrace {
+        // headless-sdk-01: a host-driven session's can_use_tool relay needs the
+        // REAL tool_name/input for the upcoming dispatch (previously hardcoded
+        // to ""/"{}" -- see sdk/structured_io.zig's RelayApprover). This is the
+        // single call site that knows `name`/`args` for every dispatched tool
+        // call, so it is the one place we stamp them onto the relay before the
+        // gate runs; the gate itself (agent_tools.effectiveApproval) is
+        // unchanged and still only ever sees `ctx`/`prompt`.
+        if (self.sdk_relay) |relay| {
+            if (relay.setPending) |setFn| setFn(relay.ctx, name, args, "");
+        }
         // Intercept Skill action=run so we can apply the skill's autonomy
         // directives the generic dispatch can't see: session-scoped
         // allowed-tools auto-allow and context: fork (isolated child runtime).
@@ -3766,6 +3783,20 @@ pub const AgentRuntime = struct {
 
     fn handleAgentRunTool(self: *AgentRuntime, name: []const u8, args: []const u8) !ToolTrace {
         return agent_tools.handleAgentRunTool(self.allocator, self.audit, self.cfg.cloud_telemetry_opt_in, self.cfg.control_plane_url, self.cfg.control_plane_token, name, args, self.depth, self.current_reporter, spawnChildAgent, @ptrCast(self));
+    }
+
+    /// commands-25 (`/subtask`): spawn a background sub-agent from a slash
+    /// command rather than a model-invoked AgentRun tool call. Reuses the
+    /// EXACT same spawn path (`spawnChildAgent`) the AgentRun/Task tool uses so
+    /// isolation, worktree handling, and task-registry bookkeeping all match --
+    /// this just bypasses the tool-args string format since the caller already
+    /// has a structured `AgentRunConfig` (there is no model turn to parse args
+    /// out of). Depth/MAX_DEPTH is intentionally NOT re-checked here: `/subtask`
+    /// is refused up front by the caller when `self.depth > 0` (this runtime is
+    /// itself a spawned sub-agent), matching the reference's `isEnabled:()=>!Ci()`
+    /// nesting guard one level earlier than the tool-dispatch depth counter.
+    pub fn spawnSubtaskAgent(self: *AgentRuntime, config: @import("tools/agent.zig").AgentRunConfig) ![]u8 {
+        return spawnChildAgent(@ptrCast(self), config);
     }
 
     /// swarm-tasks-11: the resolved working directory (and bookkeeping) for a
@@ -6024,6 +6055,7 @@ pub const AgentRuntime = struct {
             &self.git_capture_cache,
             working_context,
             @enumFromInt(@intFromEnum(effective_mode)),
+            !self.interactive,
         );
         defer built.envelope.deinit();
 
