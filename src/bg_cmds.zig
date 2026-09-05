@@ -256,7 +256,10 @@ fn readTail(allocator: std.mem.Allocator, path: []const u8, max: usize) ![]u8 {
 /// returns without entering the REPL.
 ///
 /// `orig_argv` is the process argv (rt.argv); `cwd` is the working dir.
-pub fn spawnBackground(allocator: std.mem.Allocator, orig_argv: []const []const u8, cwd: []const u8, writer: anytype) !void {
+/// `queued_prompt` (commands-12) is a `/background [prompt]`-supplied message
+/// to forward into the child's env as `ZCODE_BG_INITIAL_PROMPT` -- null for
+/// every other spawner (the top-level `--bg` CLI flag has no such concept).
+pub fn spawnBackground(allocator: std.mem.Allocator, orig_argv: []const []const u8, cwd: []const u8, writer: anytype, queued_prompt: ?[]const u8) !void {
     // Per-session id for the log filename. argv[0] is the exe path; the child
     // re-discovers its own pid for the registry key, so a timestamp id is
     // enough to keep concurrent --bg launches from colliding on the log file.
@@ -280,6 +283,9 @@ pub fn spawnBackground(allocator: std.mem.Allocator, orig_argv: []const []const 
     defer env_map.deinit();
     try env_map.put("ZCODE_SESSION_KIND", "bg");
     try env_map.put("ZCODE_SESSION_LOG", log_path);
+    if (queued_prompt) |p| {
+        if (p.len > 0) try env_map.put("ZCODE_BG_INITIAL_PROMPT", p);
+    }
 
     // Re-invocation argv: same args minus --bg/--background, with argv[0]
     // rewritten to the resolved exe path (orig_argv[0] may be a bare name).

@@ -1000,6 +1000,48 @@ fn leaveAltScreen(writer: anytype) !void {
     return repl_render_mod.leaveAltScreen(writer);
 }
 
+/// commands-12: writes "(leave the alt screen, if `use_fullscreen`) then
+/// (the command's own output)", in that order. `leaveAltScreen` emits
+/// `\x1b[?1049l`, which tells the terminal to discard the alt-screen buffer
+/// and restore the one underneath it -- so anything written to `writer`
+/// BEFORE that escape (the order `/background`/`/bg` used before this fix)
+/// is content the terminal throws away along with the rest of the alt
+/// screen, and never actually becomes visible. `/exit` has always gotten
+/// this order right; this is a pure writer-in/writer-out extraction of the
+/// same shape so the ordering invariant is unit-testable without a real
+/// TTY (`use_fullscreen`'s own detection requires one).
+fn writeAltScreenThenOutput(writer: anytype, use_fullscreen: bool, output: ?[]const u8) !void {
+    if (use_fullscreen) try leaveAltScreen(writer);
+    if (output) |o| {
+        try writer.writeAll(o);
+        if (!std.mem.endsWith(u8, o, "\n")) try writer.writeByte('\n');
+    }
+}
+
+test "writeAltScreenThenOutput leaves the alt screen before writing output (commands-12)" {
+    var out = std_io.StringBuilder.init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeAltScreenThenOutput(out.writer(), true, "started background session\tpid=123\n");
+
+    const bytes = out.items();
+    // The alt-screen-leave escape must appear, and it must come BEFORE the
+    // command's own output text -- otherwise the terminal has already
+    // discarded the alt-screen buffer by the time the hint would land in
+    // it, and the user never sees it (the bug this test guards against).
+    const leave_idx = std.mem.indexOf(u8, bytes, "\x1b[?1049l") orelse return error.TestUnexpectedResult;
+    const output_idx = std.mem.indexOf(u8, bytes, "started background session") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(leave_idx < output_idx);
+}
+
+test "writeAltScreenThenOutput writes nothing extra when not in fullscreen" {
+    var out = std_io.StringBuilder.init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeAltScreenThenOutput(out.writer(), false, "hello\n");
+    try std.testing.expectEqualStrings("hello\n", out.items());
+}
+
 fn appendInputLine(allocator: std.mem.Allocator, transcript: *UiTranscript, prompt_label: []const u8, line: []const u8) !void {
     var buf: [16 * 1024]u8 = undefined;
     const rendered = formatInputPreview(prompt_label, line, &buf);
@@ -8417,11 +8459,18 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                     try writer.print("error: {s}\n", .{@errorName(err)});
                     continue;
                 };
-                if (maybe_output) |output| {
-                    defer allocator.free(output);
-                    try writer.writeAll(output);
-                    if (!std.mem.endsWith(u8, output, "\n")) try writer.writeByte('\n');
+                defer if (maybe_output) |output| allocator.free(output);
+                if (use_fullscreen) {
+                    fullscreen_active = false;
+                    raw_mode.disable();
                 }
+                // commands-12 fix: leave the alt screen BEFORE printing the
+                // pid/logs/kill hint, matching /exit's own convention just
+                // below -- see `writeAltScreenThenOutput`'s doc comment for
+                // why the previous (output-then-leave) order silently
+                // dropped the hint.
+                try writeAltScreenThenOutput(writer, use_fullscreen, maybe_output);
+                return;
             }
             if (use_fullscreen) {
                 fullscreen_active = false;
@@ -9832,6 +9881,25 @@ test "writeWelcomeHeader (default) shows the condensed glyph header and no termi
 }
 
 test "writeWelcomeHeader (default) shows a one-line /init nudge instead of the legacy Quick-reference card" {
+    // regression fix: `writeWelcomeHeader` -> `onboarding.shouldShowProjectOnboarding`
+    // resolves the REAL `$HOME/.zcode/state.json` (paths.resolve reads the
+    // process's actual HOME) to decide whether the seen-count cap has been
+    // hit. Without a HOME override this test raced every other zcode
+    // process on the machine (including concurrent `zig build test` runs in
+    // sibling worktrees) reading/writing that SAME shared file, making the
+    // "seen_count >= 4 => hide the nudge" check flip nondeterministically
+    // (a verifier-reported flake). Point HOME at a private, empty tmp dir --
+    // matching the established `setOverride("HOME", root)` pattern already
+    // used elsewhere in this file -- so this test's state.json is nobody
+    // else's.
+    const env_mod = @import("../core/env.zig");
+    var home_tmp = testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const fake_home = try test_helpers.tmpDirCwd(testing.allocator, &home_tmp);
+    defer testing.allocator.free(fake_home);
+    try env_mod.setOverride("HOME", fake_home);
+    defer env_mod.clearOverrides();
+
     var buf = std_io.StringBuilder.init(testing.allocator);
     defer buf.deinit();
 

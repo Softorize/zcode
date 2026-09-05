@@ -1,6 +1,7 @@
 const std = @import("std");
 const rt = @import("zcode_runtime");
 const std_io = @import("core/std_io.zig");
+const clock = @import("core/clock.zig");
 const build_options = @import("build_options");
 
 const repl = @import("cli/repl.zig");
@@ -813,6 +814,121 @@ pub fn resumeSessionInteractive(
     try repl.run(allocator, stdin, writer, handler, options);
 }
 
+/// How long `resumeSessionHeadless`'s idle loop sleeps between heartbeat
+/// checks once it has nothing left to do. Short enough that `zcode kill`'s
+/// SIGTERM (which needs no signal handler -- the default action just ends
+/// the process) is noticed promptly if a test or caller ever wants to poll
+/// for shutdown; long enough not to spin.
+const HEADLESS_IDLE_POLL_NS: u64 = 2 * std.time.ns_per_s;
+
+/// commands-12: the detached child a `/background`/`/bg` (or a bare `--bg`)
+/// re-invocation of `--resume <id>` spawns. `resumeSessionInteractive` (what
+/// plain `--resume` uses) opens the interactive REPL and blocks reading
+/// stdin -- but the spawner redirects the child's stdin to `.ignore`, so
+/// that read fails immediately with `EndOfStream` the instant there is no
+/// queued input. This variant never touches stdin at all: it loads the
+/// session (falling back to minting a brand-new one under the SAME id when
+/// the session has zero prior turns and was therefore never flushed to the
+/// store yet -- `store.load`'s FileNotFound in that case is not an error,
+/// just "nothing to resume"), answers `initial_prompt` if one was queued
+/// (the `[prompt]` argument to `/background`, forwarded via
+/// `ZCODE_BG_INITIAL_PROMPT`), then idles. Idling (rather than exiting)
+/// keeps `zcode ps` honestly showing a live process for this session until
+/// `zcode kill`/`rm` SIGTERMs it or the process is otherwise stopped --
+/// mirrors `kairos.serve`'s same "run until externally killed" daemon shape.
+/// A LATER `zcode attach`/`--resume` always re-reads the persisted
+/// transcript from a fresh process regardless of whether this one is still
+/// alive, so nothing further is lost if it is killed.
+pub fn resumeSessionHeadless(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    cfg: *const config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    initial_prompt: ?[]const u8,
+    auto_approve_high: bool,
+    strict: bool,
+    yolo_mode: bool,
+    initial_agent: ?[]const u8,
+) !void {
+    try prepBackgroundRuntime(allocator, cwd, cfg, policy, audit, store, mcp, browser, session_id, initial_prompt, auto_approve_high, strict, yolo_mode, initial_agent);
+    while (true) clock.sleepNanos(HEADLESS_IDLE_POLL_NS);
+}
+
+/// The testable half of `resumeSessionHeadless`: everything up to (but not
+/// including) the infinite idle loop, so a test can assert the session
+/// loaded/minted and the queued prompt was answered without hanging forever.
+fn prepBackgroundRuntime(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    cfg: *const config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    initial_prompt: ?[]const u8,
+    auto_approve_high: bool,
+    strict: bool,
+    yolo_mode: bool,
+    initial_agent: ?[]const u8,
+) !void {
+    store.active_cwd = cwd;
+
+    var runtime = blk: {
+        var loaded = store.load(session_id) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Zero prior turns: nothing was ever flushed to the store.
+                // Pin the id so the fresh runtime mints exactly this session
+                // id (sessions-storage-03/12's `--session-id` one-shot pin)
+                // instead of a random new one, so `zcode attach
+                // <session_id>` still finds it afterward.
+                store.pinNextSessionId(session_id) catch {};
+                break :blk try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, true, auto_approve_high, strict, yolo_mode);
+            },
+            else => return err,
+        };
+        defer loaded.deinit(allocator);
+        break :blk try AgentRuntime.initFromSession(allocator, cwd, cfg, policy, audit, store, mcp, browser, &loaded, true, auto_approve_high, strict, yolo_mode);
+    };
+    defer runtime.deinit();
+    prompt_sections.setGlobal(&runtime.prompt_sections_registry);
+
+    // Same registration `resumeSessionInteractive` does, so `zcode
+    // ps`/`attach` see this session too.
+    session_registry.register(allocator, .{
+        .session_id = runtime.session_id,
+        .cwd = cwd,
+        .name = null,
+    }) catch {};
+    defer session_registry.unregister(allocator);
+
+    runPluginEventSilent(allocator, .{ .event = .session_start, .cwd = cwd }) catch {};
+
+    if (initial_agent) |agent_name| {
+        const activation = try runtime.activateAgentByNameStrict(agent_name);
+        defer allocator.free(activation);
+    }
+
+    if (initial_prompt) |p| {
+        if (p.len > 0) {
+            const stdout = std_io.stdoutWriter();
+            if (runtime.handlePromptDetailed(p)) |result_val| {
+                var result = result_val;
+                defer result.deinit(allocator);
+                stdout.print("{s}\n", .{result.final_text}) catch {};
+            } else |err| {
+                stdout.print("error handling queued prompt: {s}\n", .{@errorName(err)}) catch {};
+            }
+        }
+    }
+}
+
 const testing_alloc = std.testing;
 
 test "detectGitBranch returns branch name in git repo" {
@@ -1029,6 +1145,84 @@ test "runHeadlessResumeResult answers one more turn on an EXISTING session witho
     defer loaded.deinit(alloc);
     try testing_alloc.expect(loaded.history.len >= 3); // prior + new user + assistant reply
     try testing_alloc.expectEqualStrings("earlier turn", loaded.history[0].content);
+}
+
+test "commands-12: prepBackgroundRuntime mints a fresh session under the pinned id when nothing was ever flushed to the store" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing_alloc.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try HeadlessCapsHarness.init(alloc, root);
+    defer h.deinit();
+
+    // The bug: a `/background` invoked as the session's very FIRST command
+    // has never been flushed to the store, so `store.load` would return
+    // FileNotFound. Before the fix that bubbled up as a hard error;
+    // `prepBackgroundRuntime` must instead mint a fresh session under this
+    // exact id (via pinNextSessionId) and answer the queued prompt on it.
+    try prepBackgroundRuntime(
+        alloc,
+        h.cwd,
+        &h.cfg,
+        &h.policy,
+        &h.audit,
+        &h.store,
+        &h.mcp,
+        null,
+        "brand-new-bg-session",
+        "say hello",
+        true, // auto_approve_high
+        false, // strict
+        true, // yolo_mode
+        null, // initial_agent
+    );
+
+    var loaded = try h.store.load("brand-new-bg-session");
+    defer loaded.deinit(alloc);
+    try testing_alloc.expect(loaded.history.len >= 2); // queued user turn + assistant reply
+}
+
+test "commands-12: prepBackgroundRuntime is a no-op turn-wise when no prompt is queued (bare /background)" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing_alloc.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try HeadlessCapsHarness.init(alloc, root);
+    defer h.deinit();
+
+    try h.store.appendTurn("bare-bg-session", .user, "earlier turn", "");
+
+    // Bare `/background` (no `[prompt]` arg) queues nothing -- this must
+    // load the existing session and return without touching stdin or
+    // appending a spurious turn.
+    try prepBackgroundRuntime(
+        alloc,
+        h.cwd,
+        &h.cfg,
+        &h.policy,
+        &h.audit,
+        &h.store,
+        &h.mcp,
+        null,
+        "bare-bg-session",
+        null,
+        true,
+        false,
+        true,
+        null,
+    );
+
+    var loaded = try h.store.load("bare-bg-session");
+    defer loaded.deinit(alloc);
+    try testing_alloc.expectEqual(@as(usize, 1), loaded.history.len);
 }
 
 test "sdk-headless-14: --json-schema sets pending_response_schema and surfaces structured_output" {
