@@ -8,6 +8,8 @@ const types = @import("../core/types.zig");
 const paths = @import("../core/paths.zig");
 const parse_helpers = @import("../core/parse_helpers.zig");
 const keychain = @import("../core/keychain.zig");
+const git_fs = @import("../core/git_fs.zig");
+const build_options = @import("build_options");
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const session_key_env = "ZCODE_SESSION_KEY";
 const session_keychain_account = "__session_key__";
@@ -26,6 +28,13 @@ pub const SessionEntry = struct {
     /// Empty slice when the session has no tags yet. Owned by the
     /// entry; freed via freeSessionEntries.
     tags: [][]u8 = &.{},
+    /// Cheap best-effort origin cwd (sessions-storage-04), read from the
+    /// `<id>.origin` sidecar written by appendTurn/appendSnapshot the first
+    /// time a session is touched with a known `active_cwd`. null when the
+    /// sidecar is missing (legacy session, or a session that has never been
+    /// written to with a known cwd). Owned by the entry; freed via
+    /// freeSessionEntries.
+    origin_cwd: ?[]u8 = null,
 };
 
 pub const LoadedSession = struct {
@@ -70,16 +79,67 @@ pub const Store = struct {
     sessions_dir: []u8,
     encryption_enabled: bool,
     encryption_key: ?[Aes256Gcm.key_length]u8,
+    /// `<zcode_home>` -- the parent directory of `sessions_dir`. Computed
+    /// once at init so per-project bucket paths
+    /// (`<zcode_home>/projects/<slug>/`, sessions-storage-02) can be derived
+    /// without re-deriving it on every call. Owned; freed in deinit.
+    zcode_home: []u8,
+    /// The live working directory this Store instance is operating on
+    /// (sessions-storage-02/04). Borrowed: every current production entry
+    /// point (session_mgmt.runInteractive/runOneShot/resumeSessionInteractive,
+    /// the cwd-aware session_cmds commands) sets this directly --
+    /// `store.active_cwd = cwd;` -- right after construction, from a `cwd`
+    /// string that already outlives the Store, so Store never copies or
+    /// frees it. The default "" means "no project context known": every
+    /// path resolution falls back to the pre-migration flat
+    /// `<zcode_home>/sessions/` layout, so any caller that never opts in
+    /// (background replay, bundle fork/checkpoint helpers, test harnesses)
+    /// is byte-for-byte unaffected by the sessions-storage-02 migration.
+    active_cwd: []const u8 = "",
+    /// One-shot override consumed by the very next `createSessionId` call
+    /// (sessions-storage-03: `--session-id <uuid>`). Sessions minted
+    /// without a pin get a fresh UUIDv4 as usual. Owned; freed by deinit if
+    /// a caller sets it but nothing ever consumes it (e.g. a rejected run).
+    pinned_next_session_id: ?[]u8 = null,
+    /// One-shot flag consumed by the very next `appendSnapshot` call
+    /// (sessions-storage-missed-199): when set, the snapshot record is
+    /// marked `isCompactSummary: true` and preceded by a
+    /// `{"type":"system","subtype":"compact_boundary",...}` marker record,
+    /// mirroring the reference's post-/compact transcript shape.
+    mark_next_snapshot_compact: bool = false,
+    /// Cap on a single session's on-disk `.jsonl` size before
+    /// `trimIfOversized` drops the oldest whole records
+    /// (sessions-storage-missed-200). Matches `load()`'s own 256 MiB read
+    /// cap by default; a test can shrink this to exercise the trim path
+    /// without writing hundreds of megabytes.
+    max_session_bytes: u64 = 256 * 1024 * 1024,
 
     pub fn init(allocator: std.mem.Allocator, sessions_dir: []const u8, encryption_enabled: bool) !Store {
         try paths.ensureDir(sessions_dir);
         const key = try loadSessionKey(allocator, encryption_enabled);
+        const home = std.fs.path.dirname(sessions_dir) orelse sessions_dir;
         return .{
             .allocator = allocator,
             .sessions_dir = try allocator.dupe(u8, sessions_dir),
             .encryption_enabled = encryption_enabled,
             .encryption_key = key,
+            .zcode_home = try allocator.dupe(u8, home),
         };
+    }
+
+    /// Pin the id the next `createSessionId` call returns (sessions-storage-03
+    /// `--session-id <uuid>`). Consumed exactly once; a second call to
+    /// `createSessionId` before another `pinNextSessionId` mints a fresh
+    /// UUIDv4 as usual.
+    pub fn pinNextSessionId(self: *Store, id: []const u8) !void {
+        if (self.pinned_next_session_id) |old| self.allocator.free(old);
+        self.pinned_next_session_id = try self.allocator.dupe(u8, id);
+    }
+
+    /// Mark the next `appendSnapshot` call as a post-compaction summary
+    /// (sessions-storage-missed-199). See `mark_next_snapshot_compact`.
+    pub fn markNextSnapshotAsCompact(self: *Store) void {
+        self.mark_next_snapshot_compact = true;
     }
 
     /// Generate a fresh random 256-bit session key, store it in the OS
@@ -96,18 +156,23 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.allocator.free(self.sessions_dir);
+        self.allocator.free(self.zcode_home);
+        if (self.pinned_next_session_id) |p| self.allocator.free(p);
     }
 
+    /// Mint a session id. sessions-storage-03: Claude Code session ids are
+    /// RFC4122 UUIDv4 strings (and `--session-id <uuid>` lets a caller pin an
+    /// exact one via `pinNextSessionId`), so we mint the same shape
+    /// `core/uuid.v4Hex` already produces for per-turn ids, rather than the
+    /// previous `<epoch>-<32-hex-nonce>` format.
     pub fn createSessionId(self: *Store) ![]u8 {
-        // 128-bit nonce from the crypto RNG. The previous 32-bit nonce
-        // had a birthday-collision expectation around ~65K sessions
-        // started in the same second; under concurrent REPL usage or
-        // bulk automation that risked session-file clobber (session IDs
-        // are used as filenames). 128 bits is collision-free at every
-        // realistic scale.
-        var nonce_hex: [32]u8 = undefined;
-        uuid.rawHex32(&nonce_hex);
-        return std.fmt.allocPrint(self.allocator, "{d}-{s}", .{ clock.nowSeconds(), nonce_hex });
+        if (self.pinned_next_session_id) |pinned| {
+            self.pinned_next_session_id = null;
+            return pinned; // ownership transferred to the caller
+        }
+        var buf: [36]u8 = undefined;
+        uuid.v4Hex(&buf);
+        return self.allocator.dupe(u8, &buf);
     }
 
     /// Append a turn record to the session JSONL. `turn_uuid` is the
@@ -116,9 +181,29 @@ pub const Store = struct {
     /// bundle). When the in-memory `History` already minted a uuid for
     /// the live turn it passes that same id so the on-disk record and the
     /// in-memory turn share it.
+    ///
+    /// sessions-storage-01: the on-disk shape is Claude Code's own
+    /// transcript record -- `type` (user/assistant/system), `uuid`,
+    /// `parentUuid` (chains turns into a linked list; null for the first
+    /// turn a session ever writes), `sessionId`, an ISO-8601 `timestamp`,
+    /// `cwd`/`version`/`gitBranch`, `message: {role, content}`,
+    /// `isSidechain`, `userType`, `requestId`, and (for a tool-result turn)
+    /// `toolUseResult` -- rather than the previous zcode-only
+    /// `{type:"turn",role,content,timestamp,uuid}` shape. `load()` still
+    /// reads the legacy shape transparently (additive migration: existing
+    /// session files are never rewritten).
     pub fn appendTurn(self: *Store, session_id: []const u8, role: types.HistoryRole, content: []const u8, turn_uuid: []const u8) !void {
         const path = try self.sessionPath(session_id);
         defer self.allocator.free(path);
+        if (std.fs.path.dirname(path)) |dir| try paths.ensureDir(dir);
+
+        // sessions-storage-04: cheap, write-once origin breadcrumb so a
+        // picker/resume command can learn where this session started
+        // without a full Store.load. Best-effort -- a failure here must
+        // never block the turn append itself.
+        if (self.active_cwd.len > 0) {
+            _ = self.setOriginIfAbsent(session_id, self.active_cwd) catch {};
+        }
 
         const file = try openAppendFile(path);
         defer file.close(rt.io);
@@ -132,18 +217,62 @@ pub const Store = struct {
             break :blk &minted;
         };
 
+        const parent_uuid = self.lastRecordUuid(path);
+        defer if (parent_uuid) |p| self.allocator.free(p);
+
+        const timestamp = try formatIso8601(self.allocator, clock.nowSeconds());
+        defer self.allocator.free(timestamp);
+
+        const branch: ?[]u8 = if (self.active_cwd.len > 0) git_fs.currentBranch(self.allocator, self.active_cwd) else null;
+        defer if (branch) |b| self.allocator.free(b);
+
+        const cc_type = ccRecordTypeForRole(role);
+
         var record_buf = std_io.StringBuilder.init(self.allocator);
         defer record_buf.deinit();
 
-        try record_buf.writer().print("{f}", .{std.json.fmt(.{
-            .type = "turn",
-            .role = types.roleToString(role),
-            .content = content,
-            .timestamp = clock.nowSeconds(),
-            .uuid = effective_uuid,
-        }, .{})});
+        if (role == .tool) {
+            // Tool-result turns are `user`-typed at the top level (there is
+            // no separate "tool" type in Claude's own transcript schema)
+            // and carry a sibling `toolUseResult` field -- that's how a
+            // reader distinguishes a plain user turn from a tool result.
+            // `message.role` keeps the more precise "tool" tag (rather than
+            // "user") so `load()`'s `parseRole` round-trips `.tool` exactly
+            // -- compaction/export/session_memory all branch on it.
+            try record_buf.writer().print("{f}", .{std.json.fmt(.{
+                .type = cc_type,
+                .uuid = effective_uuid,
+                .parentUuid = parent_uuid,
+                .sessionId = session_id,
+                .timestamp = timestamp,
+                .cwd = self.active_cwd,
+                .version = build_options.app_version,
+                .gitBranch = branch orelse "",
+                .message = .{ .role = "tool", .content = content },
+                .isSidechain = false,
+                .userType = "external",
+                .requestId = @as(?[]const u8, null),
+                .toolUseResult = content,
+            }, .{})});
+        } else {
+            try record_buf.writer().print("{f}", .{std.json.fmt(.{
+                .type = cc_type,
+                .uuid = effective_uuid,
+                .parentUuid = parent_uuid,
+                .sessionId = session_id,
+                .timestamp = timestamp,
+                .cwd = self.active_cwd,
+                .version = build_options.app_version,
+                .gitBranch = branch orelse "",
+                .message = .{ .role = cc_type, .content = content },
+                .isSidechain = false,
+                .userType = "external",
+                .requestId = @as(?[]const u8, null),
+            }, .{})});
+        }
 
         try self.appendRecordLine(file, record_buf.items());
+        self.trimIfOversized(path);
     }
 
     /// Append a snapshot record. `origin_cwd` is an optional breadcrumb
@@ -151,9 +280,23 @@ pub const Store = struct {
     /// active in; pass "" for replay-created sessions where origin has
     /// no meaning (bundle restore, CLI re-snapshot). The live REPL path
     /// passes the runtime's cwd so a picker can later display origin.
+    ///
+    /// sessions-storage-01/missed-201: the record now also carries the
+    /// Claude-Code envelope fields (`uuid`, `parentUuid`, `sessionId`,
+    /// ISO-8601 `timestamp`, `cwd`, `version`, `gitBranch`) around zcode's
+    /// own extension fields (facts/decisions/etc, kept as-is -- CC's own
+    /// `summary` record type is exactly meant to be extended like this).
+    /// sessions-storage-missed-199: when `markNextSnapshotAsCompact` was
+    /// called, this snapshot is preceded by a `compact_boundary` system
+    /// record and marked `isCompactSummary: true`.
     pub fn appendSnapshot(self: *Store, session_id: []const u8, snapshot: *const types.SessionSnapshot, conversation_summary: []const u8, origin_cwd: []const u8) !void {
         const path = try self.sessionPath(session_id);
         defer self.allocator.free(path);
+        if (std.fs.path.dirname(path)) |dir| try paths.ensureDir(dir);
+
+        if (origin_cwd.len > 0) {
+            _ = self.setOriginIfAbsent(session_id, origin_cwd) catch {};
+        }
 
         const file = try openAppendFile(path);
         defer file.close(rt.io);
@@ -161,11 +304,39 @@ pub const Store = struct {
             std.log.warn("session: failed to chmod {s}: {s}", .{ path, @errorName(err) });
         };
 
+        const timestamp = try formatIso8601(self.allocator, clock.nowSeconds());
+        defer self.allocator.free(timestamp);
+
+        const effective_cwd = if (origin_cwd.len > 0) origin_cwd else self.active_cwd;
+        const branch: ?[]u8 = if (effective_cwd.len > 0) git_fs.currentBranch(self.allocator, effective_cwd) else null;
+        defer if (branch) |b| self.allocator.free(b);
+
+        const is_compact = self.mark_next_snapshot_compact;
+        self.mark_next_snapshot_compact = false;
+        if (is_compact) {
+            try self.appendCompactBoundaryRecord(file, session_id, timestamp);
+        }
+
+        var minted: [36]u8 = undefined;
+        uuid.v4Hex(&minted);
+        const parent_uuid = self.lastRecordUuid(path);
+        defer if (parent_uuid) |p| self.allocator.free(p);
+
         var record_buf = std_io.StringBuilder.init(self.allocator);
         defer record_buf.deinit();
 
         try record_buf.writer().print("{f}", .{std.json.fmt(.{
-            .type = "snapshot",
+            .type = "summary",
+            .uuid = &minted,
+            .parentUuid = parent_uuid,
+            .sessionId = session_id,
+            .timestamp = timestamp,
+            .cwd = effective_cwd,
+            .version = build_options.app_version,
+            .gitBranch = branch orelse "",
+            .isSidechain = false,
+            .userType = "external",
+            .isCompactSummary = is_compact,
             .conversation_summary = conversation_summary,
             .facts = snapshot.facts,
             .decisions = snapshot.decisions,
@@ -178,9 +349,32 @@ pub const Store = struct {
             .activated_conditional_skills = snapshot.activated_conditional_skills,
             .origin_cwd = origin_cwd,
             .message_count_at_snapshot = snapshot.message_count_at_snapshot,
-            .timestamp = clock.nowSeconds(),
         }, .{})});
 
+        try self.appendRecordLine(file, record_buf.items());
+        self.trimIfOversized(path);
+    }
+
+    /// Emit a `{"type":"system","subtype":"compact_boundary",...}` marker
+    /// record (sessions-storage-missed-199) immediately before the
+    /// post-compaction summary record, mirroring the reference's
+    /// `$l(e) => e?.type==="system" && e.subtype==="compact_boundary"`
+    /// transcript marker so downstream consumers can skip/collapse the
+    /// summarized region.
+    fn appendCompactBoundaryRecord(self: *Store, file: std.Io.File, session_id: []const u8, timestamp: []const u8) !void {
+        var minted: [36]u8 = undefined;
+        uuid.v4Hex(&minted);
+
+        var record_buf = std_io.StringBuilder.init(self.allocator);
+        defer record_buf.deinit();
+        try record_buf.writer().print("{f}", .{std.json.fmt(.{
+            .type = "system",
+            .subtype = "compact_boundary",
+            .uuid = &minted,
+            .sessionId = session_id,
+            .timestamp = timestamp,
+            .isSidechain = false,
+        }, .{})});
         try self.appendRecordLine(file, record_buf.items());
     }
 
@@ -306,7 +500,34 @@ pub const Store = struct {
                     .timestamp = ts,
                     .uuid = owned_uuid,
                 });
-            } else if (std.mem.eql(u8, kind, "snapshot")) {
+            } else if (std.mem.eql(u8, kind, "user") or std.mem.eql(u8, kind, "assistant") or std.mem.eql(u8, kind, "system")) {
+                // sessions-storage-01: Claude-Code-shaped turn record. A
+                // bare `type:"system"` (no `subtype`) is a role turn; a
+                // `subtype:"compact_boundary"` system record
+                // (sessions-storage-missed-199) is a structural marker with
+                // no `message` payload, so it falls through untouched.
+                if (getString(obj, "subtype") != null) continue;
+                const message_obj = switch (obj.get("message") orelse continue) {
+                    .object => |m| m,
+                    else => continue,
+                };
+                const role_str = getString(message_obj, "role") orelse kind;
+                const content = getString(message_obj, "content") orelse continue;
+                const ts_iso = getString(obj, "timestamp");
+                const ts = if (ts_iso) |s| (parseIso8601ToEpoch(s) orelse clock.nowSeconds()) else clock.nowSeconds();
+                const turn_uuid = getString(obj, "uuid") orelse "";
+
+                try history.ensureUnusedCapacity(1);
+                const owned_content = try self.allocator.dupe(u8, content);
+                errdefer self.allocator.free(owned_content);
+                const owned_uuid = try self.allocator.dupe(u8, turn_uuid);
+                history.appendAssumeCapacity(.{
+                    .role = parseRole(role_str),
+                    .content = owned_content,
+                    .timestamp = ts,
+                    .uuid = owned_uuid,
+                });
+            } else if (std.mem.eql(u8, kind, "snapshot") or std.mem.eql(u8, kind, "summary")) {
                 // Two sequential dupes must be guarded so the first is
                 // freed if the second OOMs -- previously the first leaked.
                 // The `committed` flag disables the errdefer once both
@@ -409,8 +630,84 @@ pub const Store = struct {
         };
     }
 
+    /// List every session in `self.sessions_dir` (the pre-migration flat
+    /// layout). This is the ORIGINAL `list()` behavior, preserved exactly
+    /// so every caller that never opts into a `cwd` (background replay, the
+    /// REPL session switcher, tests) keeps seeing what it always did.
+    /// sessions-storage-02's per-project view lives in `listForActiveProject`
+    /// / `listAllProjects` below.
     pub fn list(self: *Store) ![]SessionEntry {
-        var dir = try std.Io.Dir.cwd().openDir(rt.io, self.sessions_dir, .{ .iterate = true });
+        return self.listDir(self.sessions_dir);
+    }
+
+    /// List sessions in the CURRENT project's bucket (sessions-storage-02/04:
+    /// `<zcode_home>/projects/<slug(active_cwd)>/`) when `active_cwd` is
+    /// known; otherwise falls back to `list()`'s flat-directory scan so a
+    /// caller that never set `active_cwd` is unaffected.
+    pub fn listForActiveProject(self: *Store) ![]SessionEntry {
+        if (self.active_cwd.len == 0) return self.list();
+        const project_dir = try self.projectDirForCwd(self.active_cwd);
+        defer self.allocator.free(project_dir);
+        return self.listDir(project_dir);
+    }
+
+    /// List every session across the legacy flat directory AND every
+    /// `<zcode_home>/projects/<slug>/` bucket (sessions-storage-02
+    /// `--all-projects` / `-a`). Each entry's `origin_cwd` (when present)
+    /// tells the caller which project it came from.
+    pub fn listAllProjects(self: *Store) ![]SessionEntry {
+        var out = std.array_list.Managed(SessionEntry).init(self.allocator);
+        errdefer {
+            for (out.items) |e| {
+                self.allocator.free(e.id);
+                if (e.label) |l| self.allocator.free(l);
+                if (e.origin_cwd) |o| self.allocator.free(o);
+            }
+            out.deinit();
+        }
+
+        // Legacy flat dir. list() dupes id/label/origin -- take ownership by
+        // moving each entry into `out` and freeing only the outer slice.
+        const legacy = try self.list();
+        defer self.allocator.free(legacy);
+        try out.appendSlice(legacy);
+
+        const projects_root = try std.fs.path.join(self.allocator, &.{ self.zcode_home, "projects" });
+        defer self.allocator.free(projects_root);
+        var dir = std.Io.Dir.cwd().openDir(rt.io, projects_root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.mem.sort(SessionEntry, out.items, {}, lessRecentFirst);
+                return out.toOwnedSlice();
+            },
+            else => return err,
+        };
+        defer dir.close(rt.io);
+
+        var it = dir.iterate();
+        while (try it.next(rt.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const sub_dir = try std.fs.path.join(self.allocator, &.{ projects_root, entry.name });
+            defer self.allocator.free(sub_dir);
+            const sub_entries = self.listDir(sub_dir) catch continue;
+            defer self.allocator.free(sub_entries);
+            try out.appendSlice(sub_entries);
+        }
+
+        std.mem.sort(SessionEntry, out.items, {}, lessRecentFirst);
+        return out.toOwnedSlice();
+    }
+
+    /// Shared readdir scan behind `list`/`listForActiveProject`/
+    /// `listAllProjects`. Reads the `.label`/`.origin` sidecars directly out
+    /// of `dir_path` (rather than through the general `sessionPath`
+    /// resolver) since the caller already knows exactly where the `.jsonl`
+    /// lives -- this keeps a directory listing to two stats per entry
+    /// instead of triggering the resolver's cross-project scan fallback.
+    fn listDir(self: *Store, dir_path: []const u8) ![]SessionEntry {
+        var dir = std.Io.Dir.cwd().openDir(rt.io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return self.allocator.alloc(SessionEntry, 0),
+            else => return err,
+        };
         defer dir.close(rt.io);
 
         var it = dir.iterate();
@@ -422,7 +719,7 @@ pub const Store = struct {
             if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
 
             const id = entry.name[0 .. entry.name.len - ".jsonl".len];
-            const file_path = try std.fs.path.join(self.allocator, &.{ self.sessions_dir, entry.name });
+            const file_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
             defer self.allocator.free(file_path);
 
             const stat = try std.Io.Dir.cwd().statFile(rt.io, file_path, .{});
@@ -434,10 +731,10 @@ pub const Store = struct {
             try out.ensureUnusedCapacity(1);
             const id_owned = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(id_owned);
-            // Best-effort label read: a missing sidecar file is the
-            // common case (session has never been renamed), so
-            // swallow the error and leave label null.
-            const label_slice = self.readLabel(id) catch null;
+            // Best-effort sidecar reads: missing is the common case (never
+            // renamed / no known origin), so swallow errors.
+            const label_slice = self.readSidecarInDir(dir_path, id, ".label", 1024) catch null;
+            const origin_slice = self.readSidecarInDir(dir_path, id, ".origin", 4096) catch null;
             // Tags are an opt-in per-session sidecar read; most
             // sessions have none. list() stays cheap by leaving
             // entry.tags empty -- callers that actually need tags
@@ -446,6 +743,7 @@ pub const Store = struct {
                 .id = id_owned,
                 .updated_ts = ts,
                 .label = label_slice,
+                .origin_cwd = origin_slice,
             });
         }
 
@@ -453,19 +751,41 @@ pub const Store = struct {
         return out.toOwnedSlice();
     }
 
+    fn readSidecarInDir(self: *Store, dir_path: []const u8, id: []const u8, suffix: []const u8, limit: usize) !?[]u8 {
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ id, suffix });
+        defer self.allocator.free(filename);
+        const path = try std.fs.path.join(self.allocator, &.{ dir_path, filename });
+        defer self.allocator.free(path);
+        return readTrimmedSidecar(self.allocator, path, limit);
+    }
+
     pub fn freeSessionEntries(self: *Store, entries: []SessionEntry) void {
         for (entries) |entry| {
             self.allocator.free(entry.id);
             if (entry.label) |label| self.allocator.free(label);
+            if (entry.origin_cwd) |origin| self.allocator.free(origin);
             if (entry.tags.len > 0) self.freeTags(entry.tags);
         }
         self.allocator.free(entries);
     }
 
+    /// Shared sidecar-path builder for every `<id>.<suffix>` metadata file
+    /// (`.label`, `.tags`, `.aititle`, `.branch`, `.mode`, `.color`,
+    /// `.firstprompt`, `.prlinks`, `.origin`, `.parent`). Resolves through
+    /// `sessionPath` (rather than hardcoding `self.sessions_dir`) so a
+    /// sidecar always lives next to wherever this session's `.jsonl`
+    /// actually is (or will be) -- essential once sessions-storage-02
+    /// per-project buckets exist, since a session's real directory is no
+    /// longer always the flat `sessions_dir`.
+    fn sidecarPath(self: *Store, session_id: []const u8, suffix: []const u8) ![]u8 {
+        const session_file = try self.sessionPath(session_id);
+        defer self.allocator.free(session_file);
+        const base = session_file[0 .. session_file.len - ".jsonl".len];
+        return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, suffix });
+    }
+
     fn tagsPath(self: *Store, session_id: []const u8) ![]u8 {
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.tags", .{session_id});
-        defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        return self.sidecarPath(session_id, ".tags");
     }
 
     /// Read the tag list for `session_id` from its sidecar file.
@@ -577,9 +897,7 @@ pub const Store = struct {
     /// Return the path to the sidecar label file for `session_id`.
     /// Caller owns the returned slice.
     fn labelPath(self: *Store, session_id: []const u8) ![]u8 {
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.label", .{session_id});
-        defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        return self.sidecarPath(session_id, ".label");
     }
 
     /// Read the human-readable label for `session_id` from the
@@ -633,9 +951,7 @@ pub const Store = struct {
     /// `<id>.aititle` sidecar (Phase 11 sessions-06) so it never collides
     /// with a user-set `.label` -- this is what lets a `/rename` always win.
     fn aiTitlePath(self: *Store, session_id: []const u8) ![]u8 {
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.aititle", .{session_id});
-        defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        return self.sidecarPath(session_id, ".aititle");
     }
 
     /// Read the AI-generated title for `session_id` from the sidecar file
@@ -705,18 +1021,26 @@ pub const Store = struct {
     /// Return the path to the git-branch sidecar (`<id>.branch`).
     /// Caller owns the returned slice.
     fn branchPath(self: *Store, session_id: []const u8) ![]u8 {
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.branch", .{session_id});
-        defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        return self.sidecarPath(session_id, ".branch");
     }
 
-    /// Read the persisted git branch for `session_id`. Returns null when
-    /// the sidecar is missing (session not on a branch, or pre-feature).
+    /// Read the persisted git branch for `session_id`. Prefers the `.branch`
+    /// sidecar (cheap, and reflects the branch as of the LAST write to it);
+    /// when the sidecar is missing (session predates the sidecar, or the
+    /// `.jsonl` was copied to another machine without it -- sessions-
+    /// storage-missed-201) falls back to the `gitBranch` field zcode's own
+    /// Claude-Code-shaped schema (sessions-storage-01) already stamps on
+    /// every turn record, so the branch is never silently lost even when
+    /// only the `.jsonl` survives. Returns null when neither source has it.
     /// Caller owns the returned slice.
     pub fn readBranch(self: *Store, session_id: []const u8) !?[]u8 {
         const path = try self.branchPath(session_id);
         defer self.allocator.free(path);
-        return readTrimmedSidecar(self.allocator, path, 1024);
+        if (try readTrimmedSidecar(self.allocator, path, 1024)) |sidecar| return sidecar;
+
+        const session_path = self.sessionPath(session_id) catch return null;
+        defer self.allocator.free(session_path);
+        return self.lastRecordField(session_path, "gitBranch");
     }
 
     /// Persist the git branch for `session_id`. Empty input deletes the
@@ -731,9 +1055,7 @@ pub const Store = struct {
     /// Return the path to the session-mode sidecar (`<id>.mode`).
     /// Caller owns the returned slice.
     fn modePath(self: *Store, session_id: []const u8) ![]u8 {
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.mode", .{session_id});
-        defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        return self.sidecarPath(session_id, ".mode");
     }
 
     /// Read the persisted session mode for `session_id` (e.g. "coordinator" or
@@ -758,9 +1080,7 @@ pub const Store = struct {
     /// Return the path to the prompt-bar accent color sidecar (`<id>.color`).
     /// Caller owns the returned slice.
     fn colorPath(self: *Store, session_id: []const u8) ![]u8 {
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.color", .{session_id});
-        defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        return self.sidecarPath(session_id, ".color");
     }
 
     /// Read the persisted prompt-bar accent color for `session_id`
@@ -785,17 +1105,26 @@ pub const Store = struct {
     /// Return the path to the first-prompt sidecar (`<id>.firstprompt`).
     /// Caller owns the returned slice.
     fn firstPromptPath(self: *Store, session_id: []const u8) ![]u8 {
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.firstprompt", .{session_id});
-        defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        return self.sidecarPath(session_id, ".firstprompt");
     }
 
-    /// Read the persisted first user prompt for `session_id`. Returns null
-    /// when absent. Caller owns the returned slice.
+    /// Read the persisted first user prompt for `session_id`. Prefers the
+    /// `.firstprompt` sidecar (a cheap, pre-truncated cache); when it is
+    /// missing (session predates the sidecar, or the `.jsonl` was copied
+    /// elsewhere without it -- sessions-storage-missed-201) falls back to
+    /// scanning the `.jsonl` itself for its first user turn's content,
+    /// mirroring the reference's own `extractFirstPromptFromEntries` (the
+    /// first prompt IS just the first user message; no separate write is
+    /// needed for a reader that has the transcript). Returns null when
+    /// neither source has one. Caller owns the returned slice.
     pub fn readFirstPrompt(self: *Store, session_id: []const u8) !?[]u8 {
         const path = try self.firstPromptPath(session_id);
         defer self.allocator.free(path);
-        return readTrimmedSidecar(self.allocator, path, 16 * 1024);
+        if (try readTrimmedSidecar(self.allocator, path, 16 * 1024)) |sidecar| return sidecar;
+
+        const session_path = self.sessionPath(session_id) catch return null;
+        defer self.allocator.free(session_path);
+        return self.firstUserTurnContent(session_path);
     }
 
     /// Persist the first user prompt for `session_id` ONLY if no first-prompt
@@ -826,9 +1155,176 @@ pub const Store = struct {
     /// Return the path to the PR-links sidecar (`<id>.prlinks`).
     /// Caller owns the returned slice.
     fn prLinksPath(self: *Store, session_id: []const u8) ![]u8 {
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}.prlinks", .{session_id});
-        defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        return self.sidecarPath(session_id, ".prlinks");
+    }
+
+    /// Return the path to the origin-cwd sidecar (`<id>.origin`,
+    /// sessions-storage-04). Caller owns the returned slice.
+    fn originPath(self: *Store, session_id: []const u8) ![]u8 {
+        return self.sidecarPath(session_id, ".origin");
+    }
+
+    /// Read the cheap origin-cwd breadcrumb for `session_id` without a full
+    /// `Store.load` (sessions-storage-04). Returns null when the sidecar is
+    /// missing (a legacy session, or one that was never written to with a
+    /// known `active_cwd`). Caller owns the returned slice.
+    pub fn readOrigin(self: *Store, session_id: []const u8) !?[]u8 {
+        const path = try self.originPath(session_id);
+        defer self.allocator.free(path);
+        return readTrimmedSidecar(self.allocator, path, 4096);
+    }
+
+    /// Persist `cwd` as `session_id`'s origin breadcrumb ONLY if no
+    /// `.origin` sidecar exists yet (write-once, mirroring
+    /// `setFirstPromptIfAbsent`). Returns true when it wrote, false when one
+    /// was already present or `cwd` is blank. Called from
+    /// appendTurn/appendSnapshot whenever `active_cwd`/`origin_cwd` is known.
+    pub fn setOriginIfAbsent(self: *Store, session_id: []const u8, cwd: []const u8) !bool {
+        const trimmed = std.mem.trim(u8, cwd, " \t\r\n");
+        if (trimmed.len == 0) return false;
+
+        const path = try self.originPath(session_id);
+        defer self.allocator.free(path);
+
+        if (readTrimmedSidecar(self.allocator, path, 4096)) |existing| {
+            if (existing) |e| {
+                self.allocator.free(e);
+                return false;
+            }
+        } else |_| {}
+
+        try paths.ensureDir(std.fs.path.dirname(path) orelse self.sessions_dir);
+        try writeSidecarAtomic(self.allocator, path, trimmed);
+        return true;
+    }
+
+    /// Return the path to the parent-session-id sidecar (`<id>.parent`,
+    /// sessions-storage-08): the id of the session `/clear` regenerated
+    /// THIS one from, for traceability. Caller owns the returned slice.
+    fn parentSessionIdPath(self: *Store, session_id: []const u8) ![]u8 {
+        return self.sidecarPath(session_id, ".parent");
+    }
+
+    /// Read the parent-session-id breadcrumb for `session_id`
+    /// (sessions-storage-08). Returns null when absent (every session that
+    /// wasn't minted by `/clear`). Caller owns the returned slice.
+    pub fn readParentSessionId(self: *Store, session_id: []const u8) !?[]u8 {
+        const path = try self.parentSessionIdPath(session_id);
+        defer self.allocator.free(path);
+        return readTrimmedSidecar(self.allocator, path, 512);
+    }
+
+    /// Record that `session_id` was regenerated from `parent_id` by
+    /// `/clear` (sessions-storage-08).
+    pub fn setParentSessionId(self: *Store, session_id: []const u8, parent_id: []const u8) !void {
+        const path = try self.parentSessionIdPath(session_id);
+        defer self.allocator.free(path);
+        try paths.ensureDir(std.fs.path.dirname(path) orelse self.sessions_dir);
+        try writeSidecarAtomic(self.allocator, path, parent_id);
+    }
+
+    /// Regenerate the session id for `/clear`/`/reset`/`/new`
+    /// (sessions-storage-08): mirrors edualc's
+    /// `regenerateSessionId({ setCurrentAsParent: true })` +
+    /// `resetSessionFilePointer()` (src/commands/clear/conversation.ts:203-208).
+    /// Writes `old_session_id` a final snapshot (best-effort -- a failure here
+    /// must never block the caller from actually clearing, since the whole
+    /// point is to leave a clean, resumable stopping point, not to guarantee
+    /// one), mints a brand-new UUIDv4 id via `createSessionId` (honoring any
+    /// pending `pinNextSessionId`), and records `old_session_id` as the new
+    /// id's `.parent` sidecar for traceability. The OLD session's `.jsonl` is
+    /// left completely untouched apart from that final snapshot line; the
+    /// returned id has no turns on disk yet. Caller owns the result and is
+    /// responsible for pointing the live runtime at it (free the old id,
+    /// assign the new one) -- this function only touches the store.
+    pub fn regenerateSessionForClear(
+        self: *Store,
+        old_session_id: []const u8,
+        final_snapshot: *const types.SessionSnapshot,
+        conversation_summary: []const u8,
+    ) ![]u8 {
+        self.appendSnapshot(old_session_id, final_snapshot, conversation_summary, self.active_cwd) catch |err| {
+            std.log.warn("session: /clear final snapshot on {s} failed: {s}", .{ old_session_id, @errorName(err) });
+        };
+        const new_id = try self.createSessionId();
+        errdefer self.allocator.free(new_id);
+        self.setParentSessionId(new_id, old_session_id) catch |err| {
+            std.log.warn("session: /clear could not record parent sidecar for {s}: {s}", .{ new_id, @errorName(err) });
+        };
+        return new_id;
+    }
+
+    /// Best-effort size-based transcript trim (sessions-storage-missed-200):
+    /// the reference tracks and can shrink an oversized transcript rather
+    /// than growing it unbounded (bundle symbols `oversized`, `keptBytes`,
+    /// `straddleSnapCarryLen`, `boundaryStartOffset` sit right next to its
+    /// isCompactSummary logic). Once `path` exceeds `self.max_session_bytes`
+    /// this drops the OLDEST whole records until the file is back under half
+    /// the cap, and writes a `{"type":"system","subtype":"transcript_trimmed",
+    /// "droppedBytes":N,"droppedRecords":M}` marker record in their place so
+    /// a reader knows earlier history was cut from disk -- the in-memory
+    /// conversation and any compaction summary already taken are unaffected;
+    /// this only bounds the on-disk file. Records are kept/dropped as OPAQUE
+    /// raw lines (never decoded), so trimming behaves identically whether or
+    /// not session encryption is enabled. Called after every append; never
+    /// propagates an error -- a failed trim just leaves the file oversized
+    /// until the next successful append, exactly like the pre-this-gap
+    /// behavior.
+    fn trimIfOversized(self: *Store, path: []const u8) void {
+        const stat = std.Io.Dir.cwd().statFile(rt.io, path, .{}) catch return;
+        if (stat.size <= self.max_session_bytes) return;
+
+        const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, self.allocator, .limited(self.max_session_bytes * 4 + 1024)) catch return;
+        defer self.allocator.free(bytes);
+
+        var lines = std.array_list.Managed([]const u8).init(self.allocator);
+        defer lines.deinit();
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            lines.append(line) catch return;
+        }
+        if (lines.items.len <= 1) return; // nothing safe to drop
+
+        const target: usize = @intCast(self.max_session_bytes / 2);
+
+        // Walk from the tail, keeping whole lines until the next one would
+        // push us past target -- but always keep at least the last line so
+        // a very large single record can never leave the file empty.
+        var kept_bytes: usize = 0;
+        var keep_from: usize = lines.items.len;
+        while (keep_from > 0) {
+            const candidate_len = lines.items[keep_from - 1].len + 1; // + '\n'
+            if (kept_bytes > 0 and kept_bytes + candidate_len > target) break;
+            kept_bytes += candidate_len;
+            keep_from -= 1;
+        }
+        if (keep_from == 0) return; // whole file already fits from the tail
+
+        var dropped_bytes: usize = 0;
+        for (lines.items[0..keep_from]) |line| dropped_bytes += line.len + 1;
+
+        const timestamp = formatIso8601(self.allocator, clock.nowSeconds()) catch return;
+        defer self.allocator.free(timestamp);
+        var minted: [36]u8 = undefined;
+        uuid.v4Hex(&minted);
+
+        var out = std_io.StringBuilder.init(self.allocator);
+        defer out.deinit();
+        out.writer().print("{f}\n", .{std.json.fmt(.{
+            .type = "system",
+            .subtype = "transcript_trimmed",
+            .uuid = &minted,
+            .timestamp = timestamp,
+            .isSidechain = false,
+            .droppedBytes = dropped_bytes,
+            .droppedRecords = keep_from,
+        }, .{})}) catch return;
+        for (lines.items[keep_from..]) |line| {
+            out.writer().print("{s}\n", .{line}) catch return;
+        }
+
+        writeJsonlAtomic(self.allocator, path, out.items()) catch {};
     }
 
     /// Read the PR links for `session_id` (one per line). Returns a
@@ -1025,6 +1521,116 @@ pub const Store = struct {
         return decryptRecord(self.allocator, key, nonce_hex, tag_hex, cipher_hex);
     }
 
+    /// Read the `uuid` of the LAST record already on disk at `path`
+    /// (sessions-storage-01 `parentUuid` chaining). Best-effort thin
+    /// wrapper over `lastRecordField`.
+    fn lastRecordUuid(self: *Store, path: []const u8) ?[]u8 {
+        return self.lastRecordField(path, "uuid");
+    }
+
+    /// Read a top-level string `field` off the LAST record already on disk
+    /// at `path` (sessions-storage-01 `parentUuid` chaining;
+    /// sessions-storage-missed-201's `readBranch`/`readFirstPrompt`
+    /// sidecar-free fallback -- mirrors the reference's own
+    /// `extractFieldFromLastEntryStrict` JSONL-native metadata extraction
+    /// rather than a side file). Reads only the tail of the file (64 KiB,
+    /// mirroring `core/logger.reseedPrevHashFromFile`'s tail-read idiom) so
+    /// this stays cheap even on a very large session. Returns null when the
+    /// file doesn't exist, is empty, the last line is corrupt/unparseable/
+    /// larger than the tail window, or lacks that field -- every caller
+    /// treats a miss as "no such record", not an error. Best-effort by
+    /// design: no error is ever propagated to the caller.
+    fn lastRecordField(self: *Store, path: []const u8, field: []const u8) ?[]u8 {
+        const file = std.Io.Dir.cwd().openFile(rt.io, path, .{}) catch return null;
+        defer file.close(rt.io);
+
+        const end_pos = file.length(rt.io) catch return null;
+        if (end_pos == 0) return null;
+
+        const tail_cap: u64 = 64 * 1024;
+        const tail_len: u64 = @min(end_pos, tail_cap);
+        const tail_start = end_pos - tail_len;
+
+        const buf = self.allocator.alloc(u8, @intCast(tail_len)) catch return null;
+        defer self.allocator.free(buf);
+        const read_len = file.readPositionalAll(rt.io, buf, tail_start) catch return null;
+        if (read_len == 0) return null;
+        const tail = buf[0..read_len];
+
+        // The file always ends with '\n' (every append writes one), so walk
+        // back past trailing newlines, then back to the start of that line.
+        var end: usize = tail.len;
+        while (end > 0 and tail[end - 1] == '\n') : (end -= 1) {}
+        if (end == 0) return null;
+        var start: usize = end;
+        while (start > 0 and tail[start - 1] != '\n') : (start -= 1) {}
+        const last_line = tail[start..end];
+        if (last_line.len == 0) return null;
+        // A last "line" spanning the entire tail window with no newline
+        // before it, when the file is bigger than the window, means a
+        // single record wider than 64 KiB precedes it -- we can't safely
+        // tell where it starts. Skip rather than guess.
+        if (start == 0 and tail_start > 0) return null;
+
+        const decoded = self.decodeRecordLine(last_line) catch return null;
+        defer self.allocator.free(decoded);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, decoded, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const found = getString(parsed.value.object, field) orelse return null;
+        if (found.len == 0) return null;
+        return self.allocator.dupe(u8, found) catch null;
+    }
+
+    /// Scan `path` from the START for the first "user"-typed turn record's
+    /// `message.content` (sessions-storage-missed-201: mirrors the
+    /// reference's `extractFirstPromptFromEntries` -- the very first user
+    /// message already IS the session's "first prompt", no separate write
+    /// needed). Reads at most `first_prompt_scan_cap` bytes so a very large
+    /// session cannot make this scan expensive; returns null on any error,
+    /// a missing file, or no user turn found in that scanned prefix.
+    /// Best-effort: never propagates an error.
+    fn firstUserTurnContent(self: *Store, path: []const u8) ?[]u8 {
+        const first_prompt_scan_cap: usize = 256 * 1024;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, self.allocator, .limited(first_prompt_scan_cap)) catch return null;
+        defer self.allocator.free(bytes);
+
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const decoded = self.decodeRecordLine(line) catch continue;
+            defer self.allocator.free(decoded);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, decoded, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const obj = parsed.value.object;
+            const kind = getString(obj, "type") orelse continue;
+            if (!(std.mem.eql(u8, kind, "user") or std.mem.eql(u8, kind, "turn"))) continue;
+            if (getString(obj, "subtype") != null) continue; // a structural marker, not a turn
+            // Legacy `{"type":"turn","role":"user",...}` shape.
+            if (std.mem.eql(u8, kind, "turn")) {
+                const role = getString(obj, "role") orelse continue;
+                if (!std.mem.eql(u8, role, "user")) continue;
+                const content = getString(obj, "content") orelse continue;
+                if (content.len == 0) continue;
+                return self.allocator.dupe(u8, content) catch null;
+            }
+            // sessions-storage-01-shaped `{"type":"user","message":{"role":...}}`.
+            const message_obj = switch (obj.get("message") orelse continue) {
+                .object => |m| m,
+                else => continue,
+            };
+            const role = getString(message_obj, "role") orelse continue;
+            if (!std.mem.eql(u8, role, "user")) continue;
+            const content = getString(message_obj, "content") orelse continue;
+            if (content.len == 0) continue;
+            return self.allocator.dupe(u8, content) catch null;
+        }
+        return null;
+    }
+
     pub const TurnCounts = struct {
         total: usize = 0,
         user: usize = 0,
@@ -1051,9 +1657,25 @@ pub const Store = struct {
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0) continue;
-            if (std.mem.indexOf(u8, trimmed, "\"type\":\"turn\"") == null) continue;
+
+            // sessions-storage-01: a fresh session writes `"type":"user"` /
+            // `"type":"assistant"` turn records instead of the legacy
+            // `"type":"turn","role":"..."` shape. Recognize both so /stats
+            // and /insights don't undercount sessions written post-migration.
+            // (Encrypted lines match neither substring and are silently
+            // undercounted here, same pre-existing limitation as before --
+            // this heuristic never decrypts.)
+            const legacy_turn = std.mem.indexOf(u8, trimmed, "\"type\":\"turn\"") != null;
+            const new_user = std.mem.indexOf(u8, trimmed, "\"type\":\"user\"") != null;
+            const new_assistant = std.mem.indexOf(u8, trimmed, "\"type\":\"assistant\"") != null;
+            if (!legacy_turn and !new_user and !new_assistant) continue;
+
             counts.total += 1;
-            if (std.mem.indexOf(u8, trimmed, "\"role\":\"user\"") != null) {
+            if (new_user) {
+                counts.user += 1;
+            } else if (new_assistant) {
+                counts.assistant += 1;
+            } else if (std.mem.indexOf(u8, trimmed, "\"role\":\"user\"") != null) {
                 counts.user += 1;
             } else if (std.mem.indexOf(u8, trimmed, "\"role\":\"assistant\"") != null) {
                 counts.assistant += 1;
@@ -1062,11 +1684,108 @@ pub const Store = struct {
         return counts;
     }
 
+    /// Resolve `session_id` to its `.jsonl` path, transparently handling
+    /// both the pre-migration flat layout AND the sessions-storage-02
+    /// per-project layout: (1) `<zcode_home>/projects/<slug(active_cwd)>/`
+    /// when a session already lives there, (2) the legacy flat
+    /// `sessions_dir`, (3) a scan across every OTHER project bucket
+    /// (sessions-storage-04 cross-directory resume: the session may have
+    /// been started from a different cwd than the one we're running from
+    /// now). When none of those find it, this is a brand-new session: it
+    /// lands in the project bucket when `active_cwd` is known, else the
+    /// legacy flat dir -- so every caller that never sets `active_cwd`
+    /// keeps writing exactly where it always did.
     pub fn sessionPath(self: *Store, session_id: []const u8) ![]u8 {
         try validateSessionId(session_id);
+
         const filename = try std.fmt.allocPrint(self.allocator, "{s}.jsonl", .{session_id});
         defer self.allocator.free(filename);
-        return std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+
+        var project_candidate: ?[]u8 = null;
+        errdefer if (project_candidate) |p| self.allocator.free(p);
+        if (self.active_cwd.len > 0) {
+            const project_dir = try self.projectDirForCwd(self.active_cwd);
+            defer self.allocator.free(project_dir);
+            const candidate = try std.fs.path.join(self.allocator, &.{ project_dir, filename });
+            if (fileExists(candidate)) return candidate;
+            project_candidate = candidate;
+        }
+
+        const legacy = try std.fs.path.join(self.allocator, &.{ self.sessions_dir, filename });
+        errdefer self.allocator.free(legacy);
+        if (fileExists(legacy)) {
+            if (project_candidate) |p| self.allocator.free(p);
+            return legacy;
+        }
+
+        if (self.findInAnyProject(filename)) |found| {
+            self.allocator.free(legacy);
+            if (project_candidate) |p| self.allocator.free(p);
+            return found;
+        }
+
+        if (project_candidate) |p| {
+            self.allocator.free(legacy);
+            return p;
+        }
+        return legacy;
+    }
+
+    /// `<zcode_home>/projects/<slug(cwd)>` (sessions-storage-02), resolving
+    /// `cwd` to its git worktree's shared main-repo root first
+    /// (sessions-storage-missed-202) so every worktree of one repo lands in
+    /// the same bucket. Does not create the directory -- callers that are
+    /// about to write into it call `paths.ensureDir` on the result (or its
+    /// dirname) themselves.
+    fn projectDirForCwd(self: *Store, cwd: []const u8) ![]u8 {
+        const resolved = self.resolveWorktreeRoot(cwd);
+        defer if (resolved) |r| self.allocator.free(r);
+        const effective = resolved orelse cwd;
+
+        const slug = try paths.projectSlug(self.allocator, effective);
+        defer self.allocator.free(slug);
+        return std.fs.path.join(self.allocator, &.{ self.zcode_home, "projects", slug });
+    }
+
+    /// sessions-storage-missed-202: resolve `cwd` to its git worktree's
+    /// shared main-repo root via `.git`'s `commondir` pointer, so a worktree
+    /// checkout and its main checkout share one project bucket instead of
+    /// being sharded by literal path. Returns null for a non-repo cwd, a
+    /// main checkout (no `commondir` redirect), or any resolution failure --
+    /// callers fall back to the literal `cwd`, which is exactly the
+    /// pre-this-gap behavior. Caller owns a non-null result.
+    fn resolveWorktreeRoot(self: *Store, cwd: []const u8) ?[]u8 {
+        const git_dir = git_fs.resolveGitDir(self.allocator, cwd) orelse return null;
+        defer self.allocator.free(git_dir);
+        const common_dir = git_fs.getCommonDir(self.allocator, git_dir) orelse return null;
+        defer self.allocator.free(common_dir);
+        // commondir points at the shared `.git`; its parent is the shared
+        // repo's working-tree root.
+        const root = std.fs.path.dirname(common_dir) orelse return null;
+        return self.allocator.dupe(u8, root) catch null;
+    }
+
+    /// Scan every `<zcode_home>/projects/<slug>/` bucket for `filename`
+    /// (sessions-storage-04 cross-directory resume: the id may belong to a
+    /// DIFFERENT project than the one `active_cwd` resolves to). Best-effort:
+    /// any error reading `projects/` itself, or a given bucket, is treated
+    /// as "not found there" rather than propagated. Caller owns a non-null
+    /// result.
+    fn findInAnyProject(self: *Store, filename: []const u8) ?[]u8 {
+        const projects_root = std.fs.path.join(self.allocator, &.{ self.zcode_home, "projects" }) catch return null;
+        defer self.allocator.free(projects_root);
+
+        var dir = std.Io.Dir.cwd().openDir(rt.io, projects_root, .{ .iterate = true }) catch return null;
+        defer dir.close(rt.io);
+
+        var it = dir.iterate();
+        while (it.next(rt.io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            const candidate = std.fs.path.join(self.allocator, &.{ projects_root, entry.name, filename }) catch continue;
+            if (fileExists(candidate)) return candidate;
+            self.allocator.free(candidate);
+        }
+        return null;
     }
 
     /// Remove the turn record whose `uuid` matches `turn_uuid` from the
@@ -1145,7 +1864,13 @@ pub const Store = struct {
         if (parsed.value != .object) return false;
         const obj = parsed.value.object;
         const kind = getString(obj, "type") orelse return false;
-        if (!std.mem.eql(u8, kind, "turn")) return false;
+        // sessions-storage-01: a `"user"`/`"assistant"`/`"system"` record is
+        // a turn UNLESS it carries `subtype` (the `compact_boundary` marker,
+        // sessions-storage-missed-199, which is never a removal candidate).
+        const is_turn = std.mem.eql(u8, kind, "turn") or
+            ((std.mem.eql(u8, kind, "user") or std.mem.eql(u8, kind, "assistant") or std.mem.eql(u8, kind, "system")) and
+                getString(obj, "subtype") == null);
+        if (!is_turn) return false;
         const rec_uuid = getString(obj, "uuid") orelse return false;
         return std.mem.eql(u8, rec_uuid, turn_uuid);
     }
@@ -1299,6 +2024,13 @@ pub fn validateSessionId(session_id: []const u8) !void {
             ch == '-' or ch == '_' or ch == '.' or ch == ':';
         if (!ok) return error.InvalidSessionId;
     }
+}
+
+/// True when `path` exists and is accessible. Used by the session-path
+/// resolver (sessions-storage-02/04) to probe candidate locations without
+/// opening/reading them.
+fn fileExists(path: []const u8) bool {
+    return if (std.Io.Dir.cwd().access(rt.io, path, .{})) |_| true else |_| false;
 }
 
 fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1497,6 +2229,73 @@ fn parseRole(role: []const u8) types.HistoryRole {
     return .user;
 }
 
+/// sessions-storage-01: top-level `type` for a turn record in the
+/// Claude-Code-shaped schema. There is no dedicated "tool" record type in
+/// the reference -- a tool result is a `user`-typed message carrying a
+/// sibling `toolUseResult` field (appendTurn attaches it separately).
+fn ccRecordTypeForRole(role: types.HistoryRole) []const u8 {
+    return switch (role) {
+        .user, .tool => "user",
+        .assistant => "assistant",
+        .system => "system",
+    };
+}
+
+/// Format `epoch_seconds` as `YYYY-MM-DDTHH:MM:SS.000Z` (sessions-storage-01:
+/// the reference timestamps every transcript record this way, not as a raw
+/// epoch integer). Negative input clamps to the epoch. Caller owns the
+/// result. Paired with `parseIso8601ToEpoch` below for the read path --
+/// together they round-trip exactly this fixed shape; neither is a general
+/// ISO-8601 parser/formatter.
+fn formatIso8601(allocator: std.mem.Allocator, epoch_seconds: i64) ![]u8 {
+    const secs: u64 = if (epoch_seconds < 0) 0 else @intCast(epoch_seconds);
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const year_day = es.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = es.getDaySeconds();
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        @as(u32, month_day.day_index) + 1,
+        day_secs.getHoursIntoDay(),
+        day_secs.getMinutesIntoHour(),
+        day_secs.getSecondsIntoMinute(),
+    });
+}
+
+/// Inverse of `formatIso8601`: parse exactly the
+/// `YYYY-MM-DDTHH:MM:SS(.sss)?Z` shape our own writer produces back into
+/// epoch seconds, so a reloaded turn/snapshot keeps its true original
+/// timestamp instead of showing "now". Returns null for any other shape
+/// (hand-edited file, a future format change, pre-1970 date) so the caller
+/// can fall back to a sane default rather than fail the whole load.
+fn parseIso8601ToEpoch(s: []const u8) ?i64 {
+    if (s.len < 19) return null;
+    if (s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':') return null;
+
+    const year = std.fmt.parseInt(u16, s[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u4, s[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, s[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(u8, s[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(u8, s[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(u8, s[17..19], 10) catch return null;
+    if (month < 1 or month > 12 or day < 1) return null;
+    if (year < std.time.epoch.epoch_year) return null; // pre-1970 not needed here
+
+    var days: i64 = 0;
+    var y: std.time.epoch.Year = std.time.epoch.epoch_year;
+    while (y < year) : (y += 1) days += std.time.epoch.getDaysInYear(y);
+
+    var m: u4 = 1;
+    while (m < month) : (m += 1) {
+        days += std.time.epoch.getDaysInMonth(year, @enumFromInt(m));
+    }
+    days += @as(i64, day) - 1;
+
+    return days * @as(i64, std.time.epoch.secs_per_day) +
+        @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+}
+
 fn copyJsonArrayStrings(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8, out: *std.array_list.Managed([]u8)) !void {
     const v = obj.get(key) orelse return;
     if (v != .array) return;
@@ -1627,14 +2426,42 @@ test "createSessionId produces unique, well-formed ids" {
     const b = try store.createSessionId();
     defer testing.allocator.free(b);
 
-    // Two ids created back-to-back should differ in the 128-bit nonce
-    // even when they share a timestamp.
+    // Two ids created back-to-back should differ.
     try testing.expect(!std.mem.eql(u8, a, b));
 
-    // Format is "<timestamp>-<32 hex chars>".
-    const dash = std.mem.indexOfScalar(u8, a, '-') orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 32), a.len - dash - 1);
-    for (a[dash + 1 ..]) |c| try testing.expect(std.ascii.isHex(c));
+    // sessions-storage-03: ids are canonical UUIDv4 (8-4-4-4-12), matching
+    // Claude Code's own session-id shape, not the legacy
+    // "<epoch>-<32-hex-nonce>" format.
+    try testing.expectEqual(@as(usize, 36), a.len);
+    try testing.expectEqual(@as(u8, '-'), a[8]);
+    try testing.expectEqual(@as(u8, '-'), a[13]);
+    try testing.expectEqual(@as(u8, '-'), a[18]);
+    try testing.expectEqual(@as(u8, '-'), a[23]);
+    try testing.expectEqual(@as(u8, '4'), a[14]); // version nibble
+    for (a, 0..) |c, i| {
+        if (i == 8 or i == 13 or i == 18 or i == 23) continue;
+        try testing.expect(std.ascii.isHex(c));
+    }
+}
+
+test "pinNextSessionId overrides exactly the next createSessionId call" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.pinNextSessionId("11111111-1111-4111-8111-111111111111");
+    const pinned = try store.createSessionId();
+    defer testing.allocator.free(pinned);
+    try testing.expectEqualStrings("11111111-1111-4111-8111-111111111111", pinned);
+
+    // Only the ONE call after pinning is overridden; the next mint is a
+    // fresh UUID again.
+    const fresh = try store.createSessionId();
+    defer testing.allocator.free(fresh);
+    try testing.expect(!std.mem.eql(u8, fresh, pinned));
 }
 
 test "appendTurn persists an explicit uuid that load reads back" {
@@ -2389,4 +3216,673 @@ test "cleanupOldSessions skips non-jsonl files" {
     const result = try store.cleanupOldSessions(30);
     try testing.expectEqual(@as(usize, 0), result.deleted);
     try tmp.dir.access(rt.io, "notes.txt", .{});
+}
+
+// ── sessions-storage-01: Claude-Code-shaped JSONL schema ───────────────────
+
+test "appendTurn writes the Claude-Code-shaped record with all required keys" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    store.active_cwd = root;
+    // Force plaintext regardless of a pre-existing keychain entry on the
+    // host running this test -- this test asserts the exact on-disk JSON
+    // shape, which encryption would otherwise wrap.
+    store.encryption_key = null;
+
+    try store.appendTurn("sess-cc-schema", .user, "hello", "");
+    try store.appendTurn("sess-cc-schema", .assistant, "hi there", "");
+    try store.appendTurn("sess-cc-schema", .tool, "tool output here", "");
+
+    const path = try store.sessionPath("sess-cc-schema");
+    defer testing.allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, bytes, "\n"), '\n');
+    var seen: usize = 0;
+    // `parsed` (and every string slice it hands back, including "uuid") is
+    // freed by `parsed.deinit()` at the end of THIS iteration's block --
+    // `prev_uuid` must be copied into a buffer that outlives that free, not
+    // kept as a slice into the freed arena (that was a use-after-free: the
+    // next iteration read poisoned/reused memory instead of the real uuid).
+    var prev_uuid_buf: [36]u8 = undefined;
+    var prev_uuid: []const u8 = "";
+    while (lines.next()) |line| {
+        seen += 1;
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+
+        inline for (.{ "type", "uuid", "sessionId", "timestamp", "cwd", "version", "gitBranch", "message", "isSidechain", "userType" }) |key| {
+            try testing.expect(obj.contains(key));
+        }
+        try testing.expect(obj.get("message").? == .object);
+        try testing.expect(obj.get("message").?.object.contains("role"));
+        try testing.expect(obj.get("message").?.object.contains("content"));
+        try testing.expectEqualStrings("sess-cc-schema", obj.get("sessionId").?.string);
+        try testing.expectEqualStrings(root, obj.get("cwd").?.string);
+
+        // parentUuid chains: first turn's is JSON null, every later turn's
+        // equals the previous turn's uuid.
+        if (seen == 1) {
+            try testing.expect(obj.get("parentUuid").? == .null);
+        } else {
+            try testing.expectEqualStrings(prev_uuid, obj.get("parentUuid").?.string);
+        }
+        const this_uuid = obj.get("uuid").?.string;
+        std.mem.copyForwards(u8, prev_uuid_buf[0..this_uuid.len], this_uuid);
+        prev_uuid = prev_uuid_buf[0..this_uuid.len];
+
+        if (seen == 3) {
+            // The tool-result turn carries toolUseResult.
+            try testing.expect(obj.contains("toolUseResult"));
+            try testing.expectEqualStrings("tool output here", obj.get("toolUseResult").?.string);
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "load transparently reads a legacy pre-migration session file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    // Hand-write an OLD-shape file: exactly what appendTurn/appendSnapshot
+    // produced before sessions-storage-01 -- no migration/rewrite happens,
+    // load() must still parse it.
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "sess-legacy-shape.jsonl",
+        .data =
+        \\{"type":"turn","role":"user","content":"old shape hi","timestamp":1000,"uuid":"aaaaaaaa-0000-0000-0000-000000000001"}
+        \\{"type":"turn","role":"assistant","content":"old shape hello","timestamp":1001,"uuid":"aaaaaaaa-0000-0000-0000-000000000002"}
+        \\
+        ,
+    });
+
+    var loaded = try store.load("sess-legacy-shape");
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), loaded.history.len);
+    try testing.expect(loaded.history[0].role == .user);
+    try testing.expectEqualStrings("old shape hi", loaded.history[0].content);
+    try testing.expect(loaded.history[1].role == .assistant);
+    try testing.expectEqualStrings("old shape hello", loaded.history[1].content);
+}
+
+test "appendTurn + load round-trips through the new schema with timestamp fidelity" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-cc-roundtrip", .user, "roundtrip me", "");
+    var loaded = try store.load("sess-cc-roundtrip");
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), loaded.history.len);
+    try testing.expectEqualStrings("roundtrip me", loaded.history[0].content);
+    try testing.expect(loaded.history[0].role == .user);
+    // clock.nowSeconds() is stubbed to a fixed value under the test runtime,
+    // so the reloaded ISO-8601 timestamp must decode to exactly that value,
+    // not to whatever "now" is when the assertion runs.
+    try testing.expectEqual(clock.nowSeconds(), loaded.history[0].timestamp);
+}
+
+test "appendTurn preserves the tool role across a reload (not flattened to user)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-tool-role", .tool, "the tool result", "");
+    var loaded = try store.load("sess-tool-role");
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), loaded.history.len);
+    try testing.expect(loaded.history[0].role == .tool);
+}
+
+test "countTurns counts new-schema user/assistant records" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    // countTurns scans raw on-disk bytes without decrypting; force
+    // plaintext regardless of a pre-existing keychain entry on the host.
+    store.encryption_key = null;
+
+    try store.appendTurn("sess-count-new", .user, "one", "");
+    try store.appendTurn("sess-count-new", .assistant, "two", "");
+    try store.appendTurn("sess-count-new", .user, "three", "");
+
+    const counts = try store.countTurns("sess-count-new");
+    try testing.expectEqual(@as(usize, 3), counts.total);
+    try testing.expectEqual(@as(usize, 2), counts.user);
+    try testing.expectEqual(@as(usize, 1), counts.assistant);
+}
+
+test "removeTurnByUuid drops a matching new-schema turn record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-rm-new", .user, "keep", "rm11111-0000-0000-0000-000000000001");
+    try store.appendTurn("sess-rm-new", .assistant, "drop", "rm22222-0000-0000-0000-000000000002");
+
+    const removed = try store.removeTurnByUuid("sess-rm-new", "rm22222-0000-0000-0000-000000000002");
+    try testing.expectEqual(@as(usize, 1), removed);
+
+    var loaded = try store.load("sess-rm-new");
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), loaded.history.len);
+    try testing.expectEqualStrings("keep", loaded.history[0].content);
+}
+
+test "appendSnapshot marked compact writes a compact_boundary record and isCompactSummary=true" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    // This test asserts the raw on-disk JSON shape of the boundary/summary
+    // records; force plaintext regardless of a pre-existing keychain entry
+    // on the host running this test.
+    store.encryption_key = null;
+
+    try store.appendTurn("sess-compact", .user, "before compaction", "");
+    store.markNextSnapshotAsCompact();
+    const snapshot = emptySnapshot();
+    try store.appendSnapshot("sess-compact", &snapshot, "summarized", "");
+
+    const path = try store.sessionPath("sess-compact");
+    defer testing.allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, bytes, "\n"), '\n');
+    var records = std.array_list.Managed([]const u8).init(testing.allocator);
+    defer records.deinit();
+    while (lines.next()) |l| try records.append(l);
+    try testing.expectEqual(@as(usize, 3), records.items.len); // turn, boundary, summary
+
+    var boundary = try std.json.parseFromSlice(std.json.Value, testing.allocator, records.items[1], .{});
+    defer boundary.deinit();
+    try testing.expectEqualStrings("system", boundary.value.object.get("type").?.string);
+    try testing.expectEqualStrings("compact_boundary", boundary.value.object.get("subtype").?.string);
+
+    var summary = try std.json.parseFromSlice(std.json.Value, testing.allocator, records.items[2], .{});
+    defer summary.deinit();
+    try testing.expectEqualStrings("summary", summary.value.object.get("type").?.string);
+    try testing.expect(summary.value.object.get("isCompactSummary").?.bool);
+
+    // The flag is one-shot: a later, un-marked appendSnapshot doesn't repeat it.
+    try store.appendSnapshot("sess-compact", &snapshot, "second summary", "");
+    const loaded_bytes_2 = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(loaded_bytes_2);
+    try testing.expect(std.mem.count(u8, loaded_bytes_2, "compact_boundary") == 1);
+}
+
+// ── sessions-storage-02: per-project session directory sharding ───────────
+
+test "appendTurn with active_cwd set lands under zcode_home/projects/<slug>" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    store.active_cwd = root;
+
+    try store.appendTurn("sess-sharded", .user, "hi", "");
+
+    const slug = try paths.projectSlug(testing.allocator, root);
+    defer testing.allocator.free(slug);
+    const expected_dir = try std.fs.path.join(testing.allocator, &.{ root, "projects", slug });
+    defer testing.allocator.free(expected_dir);
+    const expected_path = try std.fs.path.join(testing.allocator, &.{ expected_dir, "sess-sharded.jsonl" });
+    defer testing.allocator.free(expected_path);
+
+    try std.Io.Dir.cwd().access(rt.io, expected_path, .{});
+
+    // Legacy flat sessions_dir must NOT have received this session.
+    const legacy_path = try std.fs.path.join(testing.allocator, &.{ sessions_dir, "sess-sharded.jsonl" });
+    defer testing.allocator.free(legacy_path);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(rt.io, legacy_path, .{}));
+
+    // sessionPath resolves to the same sharded location.
+    const resolved = try store.sessionPath("sess-sharded");
+    defer testing.allocator.free(resolved);
+    try testing.expectEqualStrings(expected_path, resolved);
+}
+
+test "two different cwds shard into two distinct project directories" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+
+    const cwd_a = try std.fs.path.join(testing.allocator, &.{ root, "proj-a" });
+    defer testing.allocator.free(cwd_a);
+    const cwd_b = try std.fs.path.join(testing.allocator, &.{ root, "proj-b" });
+    defer testing.allocator.free(cwd_b);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    store.active_cwd = cwd_a;
+    try store.appendTurn("sess-a", .user, "from a", "");
+
+    store.active_cwd = cwd_b;
+    try store.appendTurn("sess-b", .user, "from b", "");
+
+    // Listing from cwd A's perspective shows only sess-a; switching the
+    // active cwd to B shows only sess-b (sessions-storage-04 default filter).
+    store.active_cwd = cwd_a;
+    {
+        const entries = try store.listForActiveProject();
+        defer store.freeSessionEntries(entries);
+        try testing.expectEqual(@as(usize, 1), entries.len);
+        try testing.expectEqualStrings("sess-a", entries[0].id);
+    }
+    store.active_cwd = cwd_b;
+    {
+        const entries = try store.listForActiveProject();
+        defer store.freeSessionEntries(entries);
+        try testing.expectEqual(@as(usize, 1), entries.len);
+        try testing.expectEqualStrings("sess-b", entries[0].id);
+    }
+
+    // --all-projects sees both.
+    {
+        const entries = try store.listAllProjects();
+        defer store.freeSessionEntries(entries);
+        try testing.expectEqual(@as(usize, 2), entries.len);
+    }
+}
+
+test "sessionPath finds a session that lives in a DIFFERENT project's bucket (cross-project resume)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+
+    const cwd_a = try std.fs.path.join(testing.allocator, &.{ root, "proj-a" });
+    defer testing.allocator.free(cwd_a);
+    const cwd_b = try std.fs.path.join(testing.allocator, &.{ root, "proj-b" });
+    defer testing.allocator.free(cwd_b);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    store.active_cwd = cwd_a;
+    try store.appendTurn("sess-cross", .user, "started in a", "");
+
+    // Now "resume" from B: active_cwd is B, but the session lives in A's
+    // bucket. sessionPath must still find it via the cross-project scan.
+    store.active_cwd = cwd_b;
+    const resolved = try store.sessionPath("sess-cross");
+    defer testing.allocator.free(resolved);
+    try testing.expect(std.mem.indexOf(u8, resolved, "sess-cross.jsonl") != null);
+
+    var loaded = try store.load("sess-cross");
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), loaded.history.len);
+}
+
+test "no active_cwd keeps writing to the pre-migration flat sessions_dir" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    // active_cwd left at its default "" -- every current non-cwd-aware
+    // caller (background replay, bundle helpers, most tests) behaves
+    // exactly as it did before this migration.
+
+    try store.appendTurn("sess-flat", .user, "hi", "");
+    const path = try std.fs.path.join(testing.allocator, &.{ sessions_dir, "sess-flat.jsonl" });
+    defer testing.allocator.free(path);
+    try std.Io.Dir.cwd().access(rt.io, path, .{});
+}
+
+// ── sessions-storage-04: origin breadcrumb + parent-session sidecar ───────
+
+test "appendTurn records a cheap origin breadcrumb readable via readOrigin" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+    const cwd = try std.fs.path.join(testing.allocator, &.{ root, "proj-a" });
+    defer testing.allocator.free(cwd);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    store.active_cwd = cwd;
+
+    try store.appendTurn("sess-origin-cheap", .user, "hi", "");
+
+    const origin = (try store.readOrigin("sess-origin-cheap")) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(origin);
+    try testing.expectEqualStrings(cwd, origin);
+
+    // listForActiveProject() surfaces the same breadcrumb without a full
+    // Store.load (this session lives under active_cwd's project bucket,
+    // not the flat sessions_dir plain list() scans).
+    const entries = try store.listForActiveProject();
+    defer store.freeSessionEntries(entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings(cwd, entries[0].origin_cwd.?);
+}
+
+test "setParentSessionId / readParentSessionId roundtrip" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try testing.expect((try store.readParentSessionId("sess-new")) == null);
+    try store.setParentSessionId("sess-new", "sess-old");
+    const parent = (try store.readParentSessionId("sess-new")) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(parent);
+    try testing.expectEqualStrings("sess-old", parent);
+}
+
+test "regenerateSessionForClear mints a fresh id, snapshots the old session, and links parentage" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-preclear", .user, "before /clear", "");
+
+    const snapshot = emptySnapshot();
+    const new_id = try store.regenerateSessionForClear("sess-preclear", &snapshot, "cleared via /clear");
+    defer testing.allocator.free(new_id);
+
+    // A brand-new UUIDv4, distinct from the old id.
+    try testing.expect(!std.mem.eql(u8, new_id, "sess-preclear"));
+    try testing.expectEqual(@as(usize, 36), new_id.len);
+
+    // The old session gained a final snapshot but its pre-clear turn is
+    // untouched, and the new session has no turns of its own yet.
+    var old_loaded = try store.load("sess-preclear");
+    defer old_loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), old_loaded.history.len);
+    try testing.expectEqualStrings("before /clear", old_loaded.history[0].content);
+    try testing.expectEqualStrings("cleared via /clear", old_loaded.conversation_summary);
+
+    // The new session has no turns of its own yet -- exactly like a
+    // brand-new session, its .jsonl does not exist until the first turn is
+    // appended (the very next user prompt after /clear).
+    const new_path = try store.sessionPath(new_id);
+    defer testing.allocator.free(new_path);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(rt.io, new_path, .{}));
+
+    // Parentage sidecar links the new session back to the pre-clear one.
+    const parent = (try store.readParentSessionId(new_id)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(parent);
+    try testing.expectEqualStrings("sess-preclear", parent);
+}
+
+// ── sessions-storage-missed-200: size-based transcript trimming ───────────
+
+test "trimIfOversized drops the oldest turns and leaves a transcript_trimmed marker" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    // Force plaintext: this test asserts the raw on-disk shape.
+    store.encryption_key = null;
+    // A tiny cap so a handful of turns already trips the trim path without
+    // writing hundreds of megabytes. Each Claude-Code-shaped turn envelope
+    // (uuid/parentUuid/sessionId/timestamp/version/message/... ) runs a few
+    // hundred bytes on its own, so the cap must comfortably exceed one
+    // line + the trim marker or trimming could never get back under it.
+    store.max_session_bytes = 3000;
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const content = std.fmt.bufPrint(&buf, "turn number {d} with some padding text", .{i}) catch unreachable;
+        try store.appendTurn("sess-oversized", .user, content, "");
+    }
+
+    const path = try store.sessionPath("sess-oversized");
+    defer testing.allocator.free(path);
+    const stat = try std.Io.Dir.cwd().statFile(rt.io, path, .{});
+    // Trimmed back down to at most the cap (the marker record can push it
+    // slightly over half the cap, but never anywhere near the untrimmed
+    // ~20-turn size).
+    try testing.expect(stat.size <= store.max_session_bytes);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "transcript_trimmed") != null);
+    // The earliest turns are gone; the most recent turn survives.
+    try testing.expect(std.mem.indexOf(u8, bytes, "turn number 0 with") == null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "turn number 19 with") != null);
+
+    // load() still parses the trimmed file (the marker record has no
+    // `message` field and is skipped, not mistaken for a turn).
+    var loaded = try store.load("sess-oversized");
+    defer loaded.deinit(testing.allocator);
+    try testing.expect(loaded.history.len > 0);
+    try testing.expect(loaded.history.len < 20);
+}
+
+test "trimIfOversized is a no-op below the cap" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-small", .user, "just one small turn", "");
+
+    const path = try store.sessionPath("sess-small");
+    defer testing.allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "transcript_trimmed") == null);
+}
+
+// ── sessions-storage-missed-201: JSONL-native metadata fallback ───────────
+
+test "readBranch falls back to the last record's gitBranch field when the sidecar is absent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    // No .branch sidecar was ever written -- only the .jsonl's own turn
+    // records carry gitBranch (sessions-01), and only when there's a real
+    // git repo at active_cwd. Set active_cwd to this test's own repo
+    // checkout so git_fs.currentBranch resolves something non-empty.
+    store.active_cwd = "."; // the zcode repo checkout the test runs from
+    try store.appendTurn("sess-branch-fallback", .user, "hi", "");
+
+    const branch = try store.readBranch("sess-branch-fallback");
+    if (branch) |b| {
+        defer testing.allocator.free(b);
+        try testing.expect(b.len > 0);
+    } else {
+        // A CI checkout in detached-HEAD state reports no branch name --
+        // acceptable as long as no error was raised.
+    }
+
+    // Explicit no-fallback case: a session with a blank gitBranch (no
+    // active_cwd, so no git detection ran) has nothing to fall back to.
+    var store2 = try Store.init(testing.allocator, sessions_dir, false);
+    defer store2.deinit();
+    try store2.appendTurn("sess-no-branch", .user, "hi", "");
+    try testing.expect((try store2.readBranch("sess-no-branch")) == null);
+}
+
+test "readBranch prefers the .branch sidecar over the jsonl fallback" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-sidecar-branch", .user, "hi", "");
+    try store.setBranch("sess-sidecar-branch", "feature/explicit");
+
+    const branch = (try store.readBranch("sess-sidecar-branch")) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(branch);
+    try testing.expectEqualStrings("feature/explicit", branch);
+}
+
+test "readFirstPrompt falls back to the jsonl's first user turn when the sidecar is absent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    // No .firstprompt sidecar written -- mirrors a .jsonl copied to another
+    // machine without its sidecars.
+    try store.appendTurn("sess-fp-fallback", .user, "what is the first prompt here", "");
+    try store.appendTurn("sess-fp-fallback", .assistant, "an answer", "");
+    try store.appendTurn("sess-fp-fallback", .user, "a second question", "");
+
+    const fp = (try store.readFirstPrompt("sess-fp-fallback")) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(fp);
+    try testing.expectEqualStrings("what is the first prompt here", fp);
+}
+
+test "readFirstPrompt prefers the .firstprompt sidecar over the jsonl fallback" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-fp-sidecar", .user, "the real first prompt", "");
+    _ = try store.setFirstPromptIfAbsent("sess-fp-sidecar", "a cached, edited preview");
+
+    const fp = (try store.readFirstPrompt("sess-fp-sidecar")) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(fp);
+    try testing.expectEqualStrings("a cached, edited preview", fp);
+}
+
+// ── sessions-storage-03: UUIDv4 session ids, sessions-storage-missed-202 ──
+
+test "projectDirForCwd resolves a worktree checkout to the SAME bucket as its main repo" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const main_repo = try std.fs.path.join(allocator, &.{ root, "main" });
+    defer allocator.free(main_repo);
+    try paths.ensureDir(main_repo);
+
+    const runGit = struct {
+        fn run(alloc: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) bool {
+            const result = std.process.run(alloc, rt.io, .{
+                .argv = argv,
+                .cwd = .{ .path = cwd },
+                .stdout_limit = .limited(64 * 1024),
+                .stderr_limit = .limited(64 * 1024),
+            }) catch return false;
+            defer alloc.free(result.stdout);
+            defer alloc.free(result.stderr);
+            return switch (result.term) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+        }
+    }.run;
+
+    if (!runGit(allocator, main_repo, &.{ "git", "init", "-q" })) return error.SkipZigTest;
+    _ = runGit(allocator, main_repo, &.{ "git", "config", "user.email", "t@example.com" });
+    _ = runGit(allocator, main_repo, &.{ "git", "config", "user.name", "T" });
+    _ = runGit(allocator, main_repo, &.{ "git", "config", "commit.gpgsign", "false" });
+    {
+        const f = try std.fs.path.join(allocator, &.{ main_repo, "a.txt" });
+        defer allocator.free(f);
+        const file = try std.Io.Dir.cwd().createFile(rt.io, f, .{ .truncate = true });
+        defer file.close(rt.io);
+        try file.writeStreamingAll(rt.io, "hi\n");
+    }
+    if (!runGit(allocator, main_repo, &.{ "git", "add", "a.txt" })) return error.SkipZigTest;
+    if (!runGit(allocator, main_repo, &.{ "git", "commit", "-q", "-m", "init" })) return error.SkipZigTest;
+
+    const worktree_path = try std.fs.path.join(allocator, &.{ root, "wt" });
+    defer allocator.free(worktree_path);
+    if (!runGit(allocator, main_repo, &.{ "git", "worktree", "add", "-q", worktree_path, "-b", "wt-branch" })) {
+        return error.SkipZigTest;
+    }
+
+    const sessions_dir = try std.fs.path.join(allocator, &.{ root, "sessions" });
+    defer allocator.free(sessions_dir);
+    var store = try Store.init(allocator, sessions_dir, false);
+    defer store.deinit();
+
+    const dir_from_main = try store.projectDirForCwd(main_repo);
+    defer allocator.free(dir_from_main);
+    const dir_from_worktree = try store.projectDirForCwd(worktree_path);
+    defer allocator.free(dir_from_worktree);
+
+    try testing.expectEqualStrings(dir_from_main, dir_from_worktree);
 }

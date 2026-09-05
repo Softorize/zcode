@@ -1456,14 +1456,14 @@ fn dispatch(
             }
             break :blk;
         },
-        .session_list => try session_mgmt.cmdSessionList(allocator, store, stdout),
-        .session_resume => session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent) catch |err| switch (err) {
+        .session_list => try session_mgmt.cmdSessionList(allocator, store, cwd, opts.all_projects, stdout),
+        .session_resume => session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session) catch |err| switch (err) {
             // session_cmds printed the targeted message already; exit
             // 2 cleanly without the Zig error trace.
             error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
             else => return err,
         },
-        .session_continue => try session_mgmt.cmdSessionContinue(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.prompt, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent),
+        .session_continue => try session_mgmt.cmdSessionContinue(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.prompt, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session),
         .session_compact => session_mgmt.cmdSessionCompact(allocator, cfg, store, opts.subject, stdout) catch |err| switch (err) {
             error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
             else => return err,
@@ -1602,7 +1602,10 @@ fn dispatch(
             // Reuse the exact interactive-resume path `--resume`/`session
             // resume` already implements, just with the id resolved from
             // the background-session registry instead of typed by hand.
-            session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, sid, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent) catch |err| switch (err) {
+            // `attach` reconnects to an already-registered background
+            // session by its known id -- never forks it (that would attach
+            // to a copy the background process never actually ran).
+            session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, sid, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, false) catch |err| switch (err) {
                 error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
                 else => return err,
             };

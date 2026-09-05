@@ -181,6 +181,44 @@ pub fn workspaceDirNameAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]u
     return allocator.dupe(u8, PRIMARY_WORKSPACE_DIR);
 }
 
+/// Cap on a sanitized per-project session-directory slug before a stable
+/// hash suffix is appended (sessions-storage-02), matching Claude Code's own
+/// `MAX_SANITIZED_LENGTH` in `sessionStoragePortable.ts`.
+pub const MAX_SANITIZED_PROJECT_SLUG_LEN: usize = 200;
+
+/// Derive a filesystem-safe per-project directory slug from an absolute
+/// `cwd`, mirroring Claude Code's `sanitizePath`: every byte outside
+/// `[a-zA-Z0-9]` becomes `-`, and a slug longer than
+/// `MAX_SANITIZED_PROJECT_SLUG_LEN` is truncated with a stable FNV-1a hash
+/// suffix (computed over the FULL sanitized string, not just the truncated
+/// prefix) so two long paths sharing a 200-char prefix never collide.
+/// Empty `cwd` maps to `"unknown"` -- sessions-storage-02's
+/// `Store.projectDirForCwd` uses this for sessions with no known origin
+/// rather than silently dropping them. Mirrors (in spirit, not literal
+/// implementation) the simpler per-project key `core/kairos_lock.projectKey`
+/// already uses for the KAIROS lock directory. Caller owns the result.
+pub fn projectSlug(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
+    if (cwd.len == 0) return allocator.dupe(u8, "unknown");
+
+    const sanitized = try allocator.alloc(u8, cwd.len);
+    defer allocator.free(sanitized);
+    for (cwd, 0..) |c, i| {
+        const is_alnum = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
+        sanitized[i] = if (is_alnum) c else '-';
+    }
+
+    if (sanitized.len <= MAX_SANITIZED_PROJECT_SLUG_LEN) {
+        return allocator.dupe(u8, sanitized);
+    }
+
+    var hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for (sanitized) |b| {
+        hash ^= b;
+        hash *%= 0x100000001b3; // FNV-1a prime
+    }
+    return std.fmt.allocPrint(allocator, "{s}-{x}", .{ sanitized[0..MAX_SANITIZED_PROJECT_SLUG_LEN], hash });
+}
+
 pub fn ensureDir(path: []const u8) !void {
     std.Io.Dir.cwd().createDirPath(rt.io, path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -243,4 +281,26 @@ test "managedSettingsJsonPath honors the ZCODE_MANAGED_SETTINGS_JSON test overri
     const path = (try managedSettingsJsonPath(alloc)).?;
     defer alloc.free(path);
     try testing.expectEqualStrings("/tmp/fake-managed-settings.json", path);
+}
+
+test "projectSlug sanitizes non-alnum bytes and handles empty/long input" {
+    const alloc = testing.allocator;
+
+    const empty = try projectSlug(alloc, "");
+    defer alloc.free(empty);
+    try testing.expectEqualStrings("unknown", empty);
+
+    const simple = try projectSlug(alloc, "/Users/dev/zig-code");
+    defer alloc.free(simple);
+    try testing.expectEqualStrings("-Users-dev-zig-code", simple);
+
+    // Two different long paths sharing the same 200-char prefix must
+    // produce different slugs (via the hash suffix), not collide.
+    const prefix = "/Users/dev/" ++ ("x" ** 200);
+    const a = try projectSlug(alloc, prefix ++ "/project-a");
+    defer alloc.free(a);
+    const b = try projectSlug(alloc, prefix ++ "/project-b");
+    defer alloc.free(b);
+    try testing.expect(!std.mem.eql(u8, a, b));
+    try testing.expect(a.len > MAX_SANITIZED_PROJECT_SLUG_LEN);
 }

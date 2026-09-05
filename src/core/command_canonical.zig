@@ -41,9 +41,14 @@ const map = [_]Pair{
 const dispatch_fallback = [_]Pair{
     .{ .spelling = "/output-style", .canonical = "/style" },
     .{ .spelling = "/terminalSetup", .canonical = "/terminal-setup" },
-    // commands-sweep-02: reference `/branch` carries alias `['fork']`. zcode's
-    // dispatcher matches `/branch`, so resolve the reference `/fork` spelling to it.
-    .{ .spelling = "/fork", .canonical = "/branch" },
+    // sessions-storage-09: 2.1.261 ships `/fork` and `/branch` as two
+    // DISTINCT top-level commands with different descriptions ("Copy this
+    // conversation into a new background session and keep working here" vs
+    // "Create a branch of the current conversation at this point") -- unlike
+    // the older edualc snapshot this codebase was originally checked
+    // against, `/branch` does NOT carry a `/fork` alias in the current
+    // reference. zcode's dispatcher (repl_commands.zig) now has its own
+    // `/fork` arm, so `/fork` must NOT be redirected to `/branch` here.
     // commands-sweep-04: reference `/resume` carries alias `['continue']`. zcode's
     // dispatcher matches `/resume`, so resolve the reference `/continue` spelling
     // to it (handles `/continue <id>` and `/continue list`; the bare-`/continue`
@@ -114,10 +119,12 @@ test "toDispatch leaves already-accepted spellings unchanged" {
     try testing.expectEqualStrings("/model", toDispatch("/model"));
 }
 
-test "toDispatch resolves the reference /fork alias to /branch" {
-    try testing.expectEqualStrings("/branch", toDispatch("/fork"));
-    try testing.expectEqualStrings("/branch", toDispatch("/FORK"));
-    // /branch itself is the accepted form and passes through unchanged.
+test "sessions-storage-09: /fork is its own command, no longer redirected to /branch" {
+    // 2.1.261 ships /fork and /branch as distinct commands with distinct
+    // semantics (copy-to-background vs switch-current-session), so toDispatch
+    // must leave /fork exactly as typed for the dispatcher's own /fork arm.
+    try testing.expectEqualStrings("/fork", toDispatch("/fork"));
+    try testing.expectEqualStrings("/FORK", toDispatch("/FORK"));
     try testing.expectEqualStrings("/branch", toDispatch("/branch"));
 }
 

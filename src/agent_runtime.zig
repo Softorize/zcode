@@ -3303,6 +3303,11 @@ pub const AgentRuntime = struct {
         emitProgress(reporter, "saving session state");
         // Record the working directory as the session's origin breadcrumb
         // (sessions-04) so a picker can later show "(from <dir>)".
+        // sessions-storage-missed-199: mark this snapshot as a post-compaction
+        // summary (compact_boundary marker + isCompactSummary:true) exactly
+        // when THIS turn actually ran compaction -- every other turn's
+        // periodic snapshot save stays a plain "summary" record.
+        if (compaction_applied_any) self.store.markNextSnapshotAsCompact();
         try self.store.appendSnapshot(self.session_id, &self.snapshot, summary_text, self.cwd);
 
         // Check if automatic dream consolidation should run
