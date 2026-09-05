@@ -128,6 +128,22 @@ pub fn load(allocator: std.mem.Allocator, cwd: []const u8, opts: *const cli.CliO
 /// on a shared key, mirroring `mergedScalarBool`'s precedence. Called BEFORE
 /// the TOML config layers in `load()`, so an explicit TOML key for the same
 /// setting -- zcode-native config -- always wins on conflict.
+/// config-layout-17: parse the reference's `autoCompactWindow` string format
+/// -- "auto" (returns 0, meaning "unset"), a bare token count ("200000"), or
+/// a "<n>k" shorthand ("500k" -> 500000). Returns null for anything else
+/// (an invalid value is silently ignored, matching the JSON-bridge's general
+/// leniency elsewhere in this function -- a typo'd settings.json value
+/// should never crash startup).
+fn parseAutoCompactWindow(raw: []const u8) ?u32 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto") or trimmed.len == 0) return 0;
+    if (trimmed.len > 1 and (trimmed[trimmed.len - 1] == 'k' or trimmed[trimmed.len - 1] == 'K')) {
+        const n = std.fmt.parseInt(u32, trimmed[0 .. trimmed.len - 1], 10) catch return null;
+        return std.math.mul(u32, n, 1000) catch std.math.maxInt(u32);
+    }
+    return std.fmt.parseInt(u32, trimmed, 10) catch null;
+}
+
 fn applySettingsJsonBridge(allocator: std.mem.Allocator, cfg: *Config, cwd: []const u8) !void {
     for (settings_sources.sourceOrder()) |source| {
         var parsed = (settings_sources.readSource(allocator, cwd, source, null) catch null) orelse continue;
@@ -159,6 +175,32 @@ fn applySettingsJsonBridge(allocator: std.mem.Allocator, cfg: *Config, cwd: []co
         // cannot make later cutoff arithmetic misbehave.
         if (settings_sources.getInt(parsed.value, "cleanupPeriodDays")) |days| {
             if (days >= 0) cfg.session_retention_days = @min(@as(u32, @intCast(@min(days, std.math.maxInt(u32)))), 3650);
+        }
+
+        // config-layout-17: "alwaysThinkingEnabled" (bool) -> always_thinking_enabled.
+        if (settings_sources.getBool(parsed.value, "alwaysThinkingEnabled")) |v| {
+            cfg.always_thinking_enabled = v;
+        }
+
+        // config-layout-17: "autoCompactWindow" -> auto_compact_window (a
+        // token count). The reference accepts a raw/shorthand string
+        // ("auto", "500k", "200000") or a bare number; both forms are
+        // supported here. See `parseAutoCompactWindow`'s doc comment.
+        if (settings_sources.getString(parsed.value, "autoCompactWindow")) |raw| {
+            if (parseAutoCompactWindow(raw)) |tokens| cfg.auto_compact_window = tokens;
+        } else if (settings_sources.getInt(parsed.value, "autoCompactWindow")) |n| {
+            if (n >= 0) cfg.auto_compact_window = @intCast(@min(n, std.math.maxInt(u32)));
+        }
+
+        // config-layout-17: "includeCoAuthoredBy" (bool, default true) ->
+        // include_co_authored_by. The reference documents `attribution` as
+        // the newer, preferred key with `includeCoAuthoredBy` "deprecated:
+        // use attribution instead" -- an explicit `attribution.commit`/
+        // `attribution.pr` override is a separate, larger surface (custom
+        // trailer TEXT, not just an on/off gate) left for a follow-up; this
+        // wires the still-live, simpler boolean gate.
+        if (settings_sources.getBool(parsed.value, "includeCoAuthoredBy")) |v| {
+            cfg.include_co_authored_by = v;
         }
 
         // config-layout-14: top-level "env" object, applied through the same
@@ -2688,4 +2730,46 @@ test "config-layout-17: .claude/settings.json theme and cleanupPeriodDays bridge
 
     try testing.expectEqualStrings("dark", loaded.config.ui_theme);
     try testing.expectEqual(@as(u32, 7), loaded.config.session_retention_days);
+}
+
+test "config-layout-17: .claude/settings.json alwaysThinkingEnabled/autoCompactWindow/includeCoAuthoredBy bridge into Config" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"alwaysThinkingEnabled\":true,\"autoCompactWindow\":\"500k\",\"includeCoAuthoredBy\":false}",
+    });
+
+    var opts: cli.CliOptions = .{};
+    var loaded = try load(allocator, root, &opts);
+    defer loaded.deinit(allocator);
+
+    try testing.expect(loaded.config.always_thinking_enabled);
+    try testing.expectEqual(@as(u32, 500_000), loaded.config.auto_compact_window);
+    try testing.expect(!loaded.config.include_co_authored_by);
+}
+
+test "config-layout-17: autoCompactWindow accepts a bare number and \"auto\"" {
+    try testing.expectEqual(@as(?u32, 200_000), parseAutoCompactWindow("200000"));
+    try testing.expectEqual(@as(?u32, 0), parseAutoCompactWindow("auto"));
+    try testing.expectEqual(@as(?u32, 0), parseAutoCompactWindow("AUTO"));
+    try testing.expectEqual(@as(?u32, null), parseAutoCompactWindow("not-a-number"));
+}
+
+test "config-layout-17: includeCoAuthoredBy default is true when unset" {
+    const allocator = testing.allocator;
+    var cfg = try Config.init(allocator);
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.include_co_authored_by);
 }

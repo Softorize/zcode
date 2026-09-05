@@ -858,6 +858,15 @@ pub const AgentRuntime = struct {
     /// them from different points.
     setup_fired: bool = false,
     session_end_fired: bool = false,
+    /// hooks-permissions-03: true once InstructionsLoaded has fired at least
+    /// once this session. The FIRST genuine instruction-discovery miss (see
+    /// the `prompt_engine.build` call site) reports `load_reason:
+    /// "session_start"`; every subsequent miss (caused by /clear, /compact,
+    /// or an axis-epoch bump) reports "compact" -- the closest fit in the
+    /// reference's five-value enum for "something forced a re-discovery
+    /// mid-session" (zcode has no finer-grained distinction between those
+    /// triggers at this call site).
+    instructions_loaded_fired: bool = false,
 
     /// Phase 11 Task 6 (sessions-06): set once we have attempted AI-title
     /// generation for this session so the best-effort generator never re-runs
@@ -1881,6 +1890,20 @@ pub const AgentRuntime = struct {
         // skips Stop hooks when the last turn is an API error). Set true in the
         // error-break path below; consulted at the turn-end Stop-hook gate.
         var api_error_break = false;
+        // hooks-permissions-02 (corrected semantics): StopFailure fires
+        // INSTEAD OF Stop when this turn ends because the model/API call
+        // itself errored -- see `fireStopFailureHook`'s doc comment for the
+        // correction from the original gap guess. `stop_failure_error`/
+        // `stop_failure_error_details` are static strings (error-name /
+        // describeProviderError switch arms), so borrowing them past the
+        // catch block below is safe with no allocation. `last_assistant`
+        // borrows the prior assistant turn's content straight out of
+        // `self.history` (captured before the error turn is appended, so it
+        // still points at the PRECEDING turn) -- best-effort and optional,
+        // matching the reference schema.
+        var stop_failure_error: []const u8 = "";
+        var stop_failure_details: []const u8 = "";
+        var stop_failure_last_assistant: ?[]const u8 = null;
         stop_retry: while (true) {
             while (!skip_model_loop and rounds < round_budget) : (rounds += 1) {
                 // sdk-headless-06: an SDK `interrupt` control_request sets a
@@ -2103,6 +2126,16 @@ pub const AgentRuntime = struct {
                 // visible. Best-effort -- a skills-dir scan error must not break the
                 // turn.
                 self.updateActivatedConditionalSkills() catch {};
+                // hooks-permissions-03: InstructionsLoaded fires exactly when
+                // `prompt_engine.build` below performs a genuine
+                // CLAUDE.md/ZCODE.md/rules re-discovery, not on every round --
+                // `instructions_mod.DiscoveryCache.misses` only increments on
+                // an actual filesystem re-walk (a cache hit leaves it
+                // untouched; see `core/instructions.zig`'s `discover`), which
+                // happens at session start and again whenever the prompt
+                // engine's instructions axis epoch bumps (/clear, /compact,
+                // an explicit reload).
+                const instructions_misses_before = self.instruction_cache.misses;
                 var built = try prompt_engine.build(
                     self.allocator,
                     self.cfg,
@@ -2127,6 +2160,16 @@ pub const AgentRuntime = struct {
                     !self.interactive,
                 );
                 defer built.envelope.deinit();
+
+                // hooks-permissions-03: a genuine miss just refreshed
+                // `self.instruction_cache.entries` (`cacheStore` runs on
+                // every miss, `discover`'s early-return-on-hit path never
+                // touches `entries`) -- fire one InstructionsLoaded per
+                // loaded memory file. Best-effort: never blocks the turn.
+                if (self.instruction_cache.misses != instructions_misses_before) {
+                    self.fireInstructionsLoadedHooks(!self.instructions_loaded_fired);
+                    self.instructions_loaded_fired = true;
+                }
 
                 const next_summary_text = try self.allocator.dupe(u8, built.conversation_summary);
                 self.allocator.free(summary_text);
@@ -2244,6 +2287,25 @@ pub const AgentRuntime = struct {
                         break;
                     }
                     const description = common.describeProviderError(err);
+                    // hooks-permissions-02 (corrected): capture StopFailure's
+                    // fields BEFORE this error becomes the newest history
+                    // turn, so `last_assistant_message` still reflects what
+                    // the assistant said before the API error (null on the
+                    // very first turn). Both `@errorName(err)` and
+                    // `description` are static strings (comptime literals in
+                    // `describeProviderError`'s switch), so no allocation is
+                    // needed to keep them alive past this catch block.
+                    stop_failure_error = @errorName(err);
+                    stop_failure_details = description;
+                    stop_failure_last_assistant = blk: {
+                        const turns = self.history.view();
+                        var idx = turns.len;
+                        while (idx > 0) {
+                            idx -= 1;
+                            if (turns[idx].role == .assistant) break :blk turns[idx].content;
+                        }
+                        break :blk null;
+                    };
                     const err_msg = try std.fmt.allocPrint(self.allocator, "Model error: {s} (provider={s}, model={s})\n\n{s}", .{ @errorName(err), self.active_provider, self.active_model, description });
                     try self.appendHistoryTurn(.assistant, err_msg);
                     self.allocator.free(final_text);
@@ -3279,6 +3341,13 @@ pub const AgentRuntime = struct {
                     continue :stop_retry;
                 }
                 if (stop_outcome.reason) |r| self.allocator.free(r);
+            } else if (self.depth == 0 and self.pending_plan_markdown == null and api_error_break) {
+                // hooks-permissions-02 (corrected semantics): StopFailure
+                // fires exactly where Stop was skipped for the death-spiral
+                // guard above -- the turn ended because the model/API call
+                // itself errored, so there is no force-continue semantic
+                // (fire-and-forget, like Notification/PostToolBatch).
+                self.fireStopFailureHook(stop_failure_error, stop_failure_details, stop_failure_last_assistant);
             }
             break :stop_retry;
         }
@@ -4018,11 +4087,13 @@ pub const AgentRuntime = struct {
                 // From here the worktree exists on disk; tear it down (and free
                 // its path) if building the notice / cwd dup fails.
                 errdefer {
+                    self.fireWorktreeRemoveHook(wt_path);
                     agent_isolation.removeWorktree(self.allocator, self.cwd, wt_path);
                     self.allocator.free(wt_path);
                 }
                 const notice = try agent_isolation.buildWorktreeNotice(self.allocator, wt_path);
                 errdefer self.allocator.free(notice);
+                self.fireWorktreeCreateHook(wt_path);
                 return .{
                     .cwd = try self.allocator.dupe(u8, wt_path),
                     .worktree_path = wt_path,
@@ -4062,6 +4133,7 @@ pub const AgentRuntime = struct {
         };
         defer self.allocator.free(iso.cwd);
         defer if (iso.worktree_path) |wp| {
+            self.fireWorktreeRemoveHook(wp);
             agent_isolation.removeWorktree(self.allocator, self.cwd, wp);
             self.allocator.free(wp);
         };
@@ -4590,6 +4662,7 @@ pub const AgentRuntime = struct {
                 const decision = shouldResetCwd(canonical, self.original_cwd, self.additional_directories, maintain);
                 if (decision.reset) {
                     const restored = self.allocator.dupe(u8, self.original_cwd) catch return;
+                    self.fireCwdChangedHook(self.shell_cwd, restored);
                     self.allocator.free(self.shell_cwd);
                     self.shell_cwd = restored;
                     if (decision.note) self.pending_cwd_reset_note = true;
@@ -4597,10 +4670,32 @@ pub const AgentRuntime = struct {
                 }
 
                 const next = self.allocator.dupe(u8, canonical) catch return;
+                self.fireCwdChangedHook(self.shell_cwd, next);
                 self.allocator.free(self.shell_cwd);
                 self.shell_cwd = next;
             } else |_| {}
         }
+    }
+
+    /// hooks-permissions-03: fire `CwdChanged` whenever `shell_cwd` actually
+    /// mutates -- both real trigger points: a Bash `cd` detected by
+    /// `updateShellCwd` above (including the bash-shell-12 out-of-project
+    /// reset back to `original_cwd`), and the `/cd` REPL command (called from
+    /// repl_commands.zig, which has no direct access to hooks_mod). Public so
+    /// the REPL command layer can call it. Fire-and-forget like
+    /// `fireNotificationHook`: CwdChanged is observability-only.
+    pub fn fireCwdChangedHook(self: *AgentRuntime, old_cwd: []const u8, new_cwd: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        if (std.mem.eql(u8, old_cwd, new_cwd)) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .cwd_changed,
+            .cwd = new_cwd,
+            .old_cwd = old_cwd,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
     }
 
     /// Resolve `path` to a canonical absolute path (symlinks, `.`, and `..`
@@ -5564,6 +5659,149 @@ pub const AgentRuntime = struct {
             // Notification hook's matcher now tests against this, not the
             // free-text message (see hooks.matchFieldFor).
             .notification_type = "idle",
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-02 (CORRECTED from the original gap guess): fires
+    /// `StopFailure` in place of `Stop` when this turn ended because the
+    /// model/API call itself errored. The original gap description guessed
+    /// this event meant "a configured Stop *hook's* own execution failed
+    /// (spawn error / timeout)" -- verified against the live 2.1.261 bundle
+    /// (cc_strings.txt: the `Boe` zod schema `{hook_event_name:"StopFailure",
+    /// error, error_details?, last_assistant_message?}`, the bundled hooks
+    /// doc's "Fires instead of Stop when an API error (rate limit, auth
+    /// failure, etc.) ended the turn. Fire-and-forget -- hook output and exit
+    /// code [are ignored]", and the reference's `executeStopFailureHooks`
+    /// trigger site, which fires on a model-call error object, not a hook
+    /// execution failure) this guess was WRONG: StopFailure is the reference's
+    /// death-spiral-guard sibling to Stop, firing exactly where zcode's own
+    /// `api_error_break` guard above already skips Stop. `error_msg`/
+    /// `error_details` are zcode's `@errorName`/`describeProviderError` for
+    /// the model-call error; `last_assistant_message` is the assistant's last
+    /// real reply before the error, when there was one. Fire-and-forget like
+    /// `fireNotificationHook`: StopFailure is not blocking-capable
+    /// (`hook_event.isBlockingCapable`), and the turn has already ended by
+    /// the time this runs.
+    fn fireStopFailureHook(self: *AgentRuntime, error_msg: []const u8, error_details: []const u8, last_assistant_message: ?[]const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .stop_failure,
+            .cwd = self.cwd,
+            .error_message = error_msg,
+            .error_details = error_details,
+            .last_assistant_message = last_assistant_message orelse "",
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-03: fire one `InstructionsLoaded` per memory file
+    /// `self.instruction_cache` just (re-)discovered (called immediately
+    /// after a genuine cache miss -- see the `prompt_engine.build` call
+    /// site). `first` selects `load_reason: "session_start"` for the very
+    /// first discovery this session, `"compact"` for every later one
+    /// (/clear, /compact, or any other axis-epoch bump -- see
+    /// `instructions_loaded_fired`'s doc comment for why zcode cannot
+    /// distinguish those triggers more finely here). `memory_type` is
+    /// best-effort classified from the entry's own absolute path:
+    /// `.local.`-suffixed candidates are "Local" (reference: highest
+    /// precedence, VCS-ignored), a path under $HOME is "User", everything
+    /// else is "Project" -- zcode has no distinct enterprise-managed
+    /// instructions path to map to "Managed". Fire-and-forget.
+    fn fireInstructionsLoadedHooks(self: *AgentRuntime, first: bool) void {
+        if (!hooksLiveEnabled()) return;
+        const load_reason = if (first) "session_start" else "compact";
+        const home = env_mod.getOwned(self.allocator, "HOME") catch null;
+        defer if (home) |h| self.allocator.free(h);
+        for (self.instruction_cache.entries) |entry| {
+            const memory_type = classifyMemoryType(entry.source, home);
+            var result = hooks_mod.runEvent(self.allocator, .{
+                .event = .instructions_loaded,
+                .cwd = self.cwd,
+                .file_path = entry.source,
+                .memory_type = memory_type,
+                .load_reason = load_reason,
+                .session_id = self.session_id,
+                .transcript_path = self.transcript_path,
+                .permission_mode = self.effectiveLivePermissionModeString(),
+            }) catch continue;
+            result.deinit(self.allocator);
+        }
+    }
+
+    /// hooks-permissions-03: see `fireInstructionsLoadedHooks`'s doc comment.
+    /// A free function (no `self`) so it is independently unit-testable.
+    fn classifyMemoryType(source: []const u8, home: ?[]const u8) []const u8 {
+        if (std.mem.indexOf(u8, source, ".local.") != null) return "Local";
+        if (home) |h| {
+            if (h.len > 0 and std.mem.startsWith(u8, source, h)) return "User";
+        }
+        return "Project";
+    }
+
+    /// hooks-permissions-03: fire `ConfigChange` when settings actually
+    /// change mid-session. `source` is the reference's enum ("user_settings"
+    /// | "project_settings" | "local_settings" | "policy_settings" |
+    /// "skills"); `file_path` is optional (the reference schema marks it
+    /// `.optional()` -- zcode's own trigger points, `/config set` and
+    /// `/reload-skills`, are both in-memory/rescan operations that never
+    /// write a settings.json, so both pass null). Called from
+    /// repl_commands.zig (not owned by this package), which has no direct
+    /// access to hooks_mod. Fire-and-forget, like `fireCwdChangedHook`.
+    pub fn fireConfigChangeHook(self: *AgentRuntime, source: []const u8, file_path: ?[]const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .config_change,
+            .cwd = self.cwd,
+            .source = source,
+            .file_path = file_path orelse "",
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-03: fire `WorktreeCreate` after a fresh per-agent
+    /// worktree is created for an AgentRun with `isolation:"worktree"`
+    /// (`resolveChildCwd` above). `name` is the worktree's basename (e.g.
+    /// "agent-<suffix>") -- the reference schema is `{name: string}`. Also
+    /// covered: the model-facing EnterWorktree tool
+    /// (tools/tool_dispatch.zig's own `fireWorktreeCreateHook`, a plain
+    /// cwd-only firing since that dispatch layer has no session/runtime
+    /// context). Fire-and-forget, like `fireNotificationHook`.
+    fn fireWorktreeCreateHook(self: *AgentRuntime, worktree_path: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .worktree_create,
+            .cwd = self.cwd,
+            .worktree_name = std.fs.path.basename(worktree_path),
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-03: fire `WorktreeRemove` wherever an AgentRun's
+    /// isolated worktree is torn down (both the synchronous `spawnChildAgent`
+    /// path and `resolveChildCwd`'s own post-create failure cleanup). Not
+    /// wired into the DETACHED background-agent cleanup path
+    /// (`BackgroundCtx.run` further below), which has no `*AgentRuntime` to
+    /// call this on -- a real remaining gap, documented rather than faked.
+    /// Fire-and-forget.
+    fn fireWorktreeRemoveHook(self: *AgentRuntime, worktree_path: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .worktree_remove,
+            .cwd = self.cwd,
+            .worktree_path = worktree_path,
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
             .permission_mode = self.effectiveLivePermissionModeString(),
@@ -6745,6 +6983,14 @@ const SkillGuardHarness = struct {
         self.allocator.destroy(self);
     }
 };
+
+test "hooks-permissions-03: classifyMemoryType distinguishes Local/User/Project" {
+    try testing.expectEqualStrings("Local", AgentRuntime.classifyMemoryType("/repo/ZCODE.local.md", "/home/user"));
+    try testing.expectEqualStrings("User", AgentRuntime.classifyMemoryType("/home/user/.claude/CLAUDE.md", "/home/user"));
+    try testing.expectEqualStrings("Project", AgentRuntime.classifyMemoryType("/repo/ZCODE.md", "/home/user"));
+    // No HOME available -> never misclassify as User.
+    try testing.expectEqualStrings("Project", AgentRuntime.classifyMemoryType("/repo/ZCODE.md", null));
+}
 
 test "hooks-permissions-09: transcript_path is derived from session_id at construction" {
     const test_helpers = @import("core/test_helpers.zig");

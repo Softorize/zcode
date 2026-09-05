@@ -124,6 +124,35 @@ pub const HookContext = struct {
     // JSON array literal -- see `hook_io.buildPostToolBatchPayload`'s doc
     // comment for why the caller (not this module) assembles each element.
     tool_calls_json: []const u8 = "",
+    // hooks-permissions-03: the remaining lifecycle events' discriminating
+    // fields (verified against the reference's zod schemas). `source` above
+    // already covers SessionStart AND ConfigChange (same JSON key, different
+    // enum values). `file_path` is shared by ConfigChange (optional),
+    // InstructionsLoaded (required), and FileChanged (required).
+    file_path: []const u8 = "",
+    // InstructionsLoaded only.
+    memory_type: []const u8 = "",
+    load_reason: []const u8 = "",
+    // CwdChanged: the cwd BEFORE the change. The "new" cwd is `ctx.cwd`
+    // itself (every event's payload already carries the current cwd there).
+    old_cwd: []const u8 = "",
+    // FileChanged only: "change" | "add" | "unlink".
+    file_change_event: []const u8 = "",
+    // TeammateIdle only.
+    teammate_name: []const u8 = "",
+    team_name: []const u8 = "",
+    // WorktreeCreate only (the worktree's logical name).
+    worktree_name: []const u8 = "",
+    // WorktreeRemove only (the removed worktree's absolute path).
+    worktree_path: []const u8 = "",
+    // hooks-permissions-02 (corrected semantics): StopFailure fields -- see
+    // `hook_io.LifecycleFields`'s doc comment and agent_runtime.zig's
+    // `fireStopFailureHook` for the full correction from the original gap
+    // guess ("a Stop hook's own execution failed") to the reference's actual
+    // semantics ("fires instead of Stop when an API error ended the turn").
+    error_message: []const u8 = "",
+    error_details: []const u8 = "",
+    last_assistant_message: []const u8 = "",
 };
 
 /// True for the tool-shaped events: the 3 original events with an on-disk
@@ -158,6 +187,17 @@ fn matchFieldFor(ctx: HookContext) []const u8 {
         // TaskCreated / TaskCompleted match against the task subject so a hook
         // can scope itself with a matcher (swarm-tasks-15).
         .task_created, .task_completed => ctx.task_subject,
+        // hooks-permissions-03: reference matchFieldFor (bundle offset
+        // ~20940163) -- ConfigChange matches `source`, InstructionsLoaded
+        // matches `load_reason`, FileChanged matches `file_path`.
+        // CwdChanged/TeammateIdle/WorktreeCreate/WorktreeRemove are not in
+        // that switch (fall to its `default: return` -- no discriminator),
+        // matching this function's own `else => ""` below.
+        .config_change => ctx.source,
+        .instructions_loaded => ctx.load_reason,
+        .file_changed => ctx.file_path,
+        // hooks-permissions-02 (corrected): StopFailure matches `error`.
+        .stop_failure => ctx.error_message,
         else => "",
     };
 }
@@ -236,6 +276,42 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
         // for why this reuses the generic carrier rather than a dedicated
         // field.
         .elicitation, .elicitation_result => fields.message = nonEmptyOrNull(ctx.message),
+        // hooks-permissions-03: the remaining lifecycle events, wired at
+        // their real runtime trigger points in agent_runtime.zig /
+        // agent_tools.zig (see each fire*Hook helper's doc comment).
+        .teammate_idle => {
+            fields.teammate_name = nonEmptyOrNull(ctx.teammate_name);
+            fields.team_name = nonEmptyOrNull(ctx.team_name);
+        },
+        .config_change => {
+            fields.source = nonEmptyOrNull(ctx.source);
+            fields.file_path = nonEmptyOrNull(ctx.file_path);
+        },
+        .instructions_loaded => {
+            fields.file_path = nonEmptyOrNull(ctx.file_path);
+            fields.memory_type = nonEmptyOrNull(ctx.memory_type);
+            fields.load_reason = nonEmptyOrNull(ctx.load_reason);
+        },
+        .cwd_changed => {
+            fields.old_cwd = nonEmptyOrNull(ctx.old_cwd);
+            // The "new" cwd is the event's own top-level `cwd` (ctx.cwd),
+            // which the reference also names `new_cwd` -- see
+            // buildLifecycleEventPayload's CwdChanged handling.
+            fields.new_cwd = nonEmptyOrNull(ctx.cwd);
+        },
+        .file_changed => {
+            fields.file_path = nonEmptyOrNull(ctx.file_path);
+            fields.change_event = nonEmptyOrNull(ctx.file_change_event);
+        },
+        .worktree_create => fields.worktree_name = nonEmptyOrNull(ctx.worktree_name),
+        .worktree_remove => fields.worktree_path = nonEmptyOrNull(ctx.worktree_path),
+        // hooks-permissions-02 (corrected semantics): StopFailure -- see
+        // agent_runtime.fireStopFailureHook's doc comment for the correction.
+        .stop_failure => {
+            fields.@"error" = nonEmptyOrNull(ctx.error_message);
+            fields.error_details = nonEmptyOrNull(ctx.error_details);
+            fields.last_assistant_message = nonEmptyOrNull(ctx.last_assistant_message);
+        },
         else => {},
     }
     return hook_io.buildLifecycleEventPayload(allocator, name, ctx.cwd, fields, baseFieldsFor(ctx));
@@ -2316,4 +2392,272 @@ test "Task 16: command hook broadcasts started + response and statusMessage" {
     // The hook's statusMessage reached the spinner callback.
     try testing.expectEqual(@as(usize, 1), EventCapture.status);
     try testing.expectEqualStrings("booting", EventCapture.lastStatus());
+}
+
+// ── hooks-permissions-03 / hooks-permissions-02 (corrected): the seven
+// remaining lifecycle events, engine-level (runEvent dispatches the right
+// stdin payload and honors each event's matcher). The real runtime trigger
+// points (teammate.zig has no live idle-detection loop today -- see
+// agent_runtime.zig's `fireCwdChangedHook` neighborhood for the others) are
+// covered by hooks_runtime_wire_test.zig.
+
+test "hooks-permissions-03: ConfigChange carries source and matches on it" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "config_change.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"ConfigChange":[{{"matcher":"skills","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{ .event = .config_change, .cwd = cwd, .source = "skills" });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ConfigChange", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("skills", parsed.value.object.get("source").?.string);
+
+    // A matcher for a different source does not fire.
+    var miss = try runEvent(alloc, .{ .event = .config_change, .cwd = cwd, .source = "user_settings" });
+    defer miss.deinit(alloc);
+    try testing.expect(!miss.ran);
+}
+
+test "hooks-permissions-03: InstructionsLoaded carries file_path/memory_type/load_reason" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "instructions_loaded.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"InstructionsLoaded":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .instructions_loaded,
+        .cwd = cwd,
+        .file_path = "/repo/ZCODE.md",
+        .memory_type = "Project",
+        .load_reason = "session_start",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo/ZCODE.md", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("Project", parsed.value.object.get("memory_type").?.string);
+    try testing.expectEqualStrings("session_start", parsed.value.object.get("load_reason").?.string);
+}
+
+test "hooks-permissions-03: CwdChanged carries old_cwd and the current cwd as new_cwd" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "cwd_changed.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"CwdChanged":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{ .event = .cwd_changed, .cwd = cwd, .old_cwd = "/repo" });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo", parsed.value.object.get("old_cwd").?.string);
+    try testing.expectEqualStrings(cwd, parsed.value.object.get("new_cwd").?.string);
+}
+
+test "hooks-permissions-03: FileChanged carries file_path/event and matches on file_path" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "file_changed.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"FileChanged":[{{"matcher":"*.zig","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .file_changed,
+        .cwd = cwd,
+        .file_path = "src/a.zig",
+        .file_change_event = "add",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("src/a.zig", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("add", parsed.value.object.get("event").?.string);
+}
+
+test "hooks-permissions-03: WorktreeCreate carries name, WorktreeRemove carries worktree_path" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const create_sentinel = try std.fs.path.join(alloc, &.{ root, "worktree_create.json" });
+    defer alloc.free(create_sentinel);
+    const remove_sentinel = try std.fs.path.join(alloc, &.{ root, "worktree_remove.json" });
+    defer alloc.free(remove_sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"WorktreeCreate":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}],"WorktreeRemove":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{ create_sentinel, remove_sentinel });
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var create_result = try runEvent(alloc, .{ .event = .worktree_create, .cwd = cwd, .worktree_name = "feature-x" });
+    defer create_result.deinit(alloc);
+    try testing.expect(create_result.ran);
+    const create_data = try std.Io.Dir.cwd().readFileAlloc(rt.io, create_sentinel, alloc, .limited(4096));
+    defer alloc.free(create_data);
+    var create_parsed = try std.json.parseFromSlice(std.json.Value, alloc, create_data, .{});
+    defer create_parsed.deinit();
+    try testing.expectEqualStrings("feature-x", create_parsed.value.object.get("name").?.string);
+
+    var remove_result = try runEvent(alloc, .{ .event = .worktree_remove, .cwd = cwd, .worktree_path = "/repo/../feature-x" });
+    defer remove_result.deinit(alloc);
+    try testing.expect(remove_result.ran);
+    const remove_data = try std.Io.Dir.cwd().readFileAlloc(rt.io, remove_sentinel, alloc, .limited(4096));
+    defer alloc.free(remove_data);
+    var remove_parsed = try std.json.parseFromSlice(std.json.Value, alloc, remove_data, .{});
+    defer remove_parsed.deinit();
+    try testing.expectEqualStrings("/repo/../feature-x", remove_parsed.value.object.get("worktree_path").?.string);
+}
+
+test "hooks-permissions-03: TeammateIdle carries teammate_name/team_name" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "teammate_idle.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"TeammateIdle":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{ .event = .teammate_idle, .cwd = cwd, .teammate_name = "worker", .team_name = "alpha" });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("worker", parsed.value.object.get("teammate_name").?.string);
+    try testing.expectEqualStrings("alpha", parsed.value.object.get("team_name").?.string);
+}
+
+test "hooks-permissions-02 (corrected): StopFailure carries error/error_details/last_assistant_message and matches on error" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "stop_failure.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"StopFailure":[{{"matcher":"RateLimited","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .stop_failure,
+        .cwd = cwd,
+        .error_message = "RateLimited",
+        .error_details = "Rate limited by the API provider.",
+        .last_assistant_message = "Working on it...",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+    // Observability-only: exit 0 from `cat` never blocks the (already-over)
+    // turn, matching hook_event.isBlockingCapable(.stop_failure) == false.
+    try testing.expect(!result.blocked);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("StopFailure", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("RateLimited", parsed.value.object.get("error").?.string);
+    try testing.expectEqualStrings("Rate limited by the API provider.", parsed.value.object.get("error_details").?.string);
+    try testing.expectEqualStrings("Working on it...", parsed.value.object.get("last_assistant_message").?.string);
 }
