@@ -483,7 +483,7 @@ fn renderSystemPromptPacket(allocator: std.mem.Allocator, env: *const types.Prom
             "For repository change questions (what changed/additions/removals), call GitDiff with relevant args (path, staged, context) and use tool output as source of truth.\n" ++
             "When GitDiff returns changes, include one or more exact hunks in assistant output using ```diff.\n" ++
             "When including multi-line source code or command snippets in assistant text, always wrap them in fenced code blocks with an explicit language tag (for example ```typescript or ```bash).\n" ++
-            "When launching background work, use TaskRun and then TaskPoll/TaskOutput before claiming completion.\n" ++
+            "When launching background work, use TaskRun and then TaskGet/TaskOutput before claiming completion.\n" ++
             "Use Bash only for non-interactive commands. Interactive terminal commands such as vim, less, top, ssh, or REPLs require the local `/!` interactive-shell workflow instead of Bash.\n" ++
             "CRITICAL: Never claim a background service (dev server, daemon, API, database) is 'still running' based on memory of launching it earlier. Processes die -- they crash, get killed by OOM, get reaped by signals, or never started at all. Before telling the user a service is up, you MUST verify with a FRESH tool call in the current round: `curl -s -o /dev/null -w '%{http_code}' http://localhost:PORT` for HTTP servers, `kill -0 PID` for tracked PIDs, `lsof -i :PORT` for port listeners, or `ps -p PID` for process checks. If the check shows the service is dead, say so plainly and offer to restart it. Do NOT say 'the server is already running' without a verification call in the same turn.\n" ++
             "For long or piped Bash commands, prefix the command with a single `# label` first line describing what the command does (e.g. `# regenerate generated parser`). zcode renders that label as the bash card title so the user can skim activity without parsing the raw command.\n" ++
@@ -675,7 +675,7 @@ fn renderOrchestrationReminder(allocator: std.mem.Allocator, env: *const types.P
     var out = std_io.StringBuilder.init(allocator);
     defer out.deinit();
 
-    const has_task_tools = hasAnyTool(env.tool_schemas, &.{ "TodoWrite", "TodoRead", "TaskCreate", "TaskUpdate", "TaskList", "TaskRun", "TaskPoll", "TaskOutput" });
+    const has_task_tools = hasAnyTool(env.tool_schemas, &.{ "TodoWrite", "TodoRead", "TaskCreate", "TaskUpdate", "TaskList", "TaskRun", "TaskGet", "TaskOutput" });
     // tools-01 (wp2-tools-surface): the advertised schema name is now "Agent"
     // (AgentRun kept only as a dispatch-only legacy synonym), so this check
     // must look for either name to keep matching a live turn's actual schema

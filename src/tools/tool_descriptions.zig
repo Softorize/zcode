@@ -14,7 +14,7 @@
 // "Command output is displayed to you, not reliably to the user" caveat, the
 // interactive-flags-unsupported note, the `gh` CLI steer, "branch first if on
 // the default branch", and a Monitor/until-loop pointer instead of the stale
-// TaskPoll reference. Attribution lines are reworded to zcode's own identity
+// stale task-polling reference. Attribution lines are reworded to zcode's own identity
 // (never claim to be Claude Code / Anthropic's product) while keeping the
 // underlying-model co-author line, which is a factual attribution, not a
 // brand claim.

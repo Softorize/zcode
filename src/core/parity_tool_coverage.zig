@@ -27,7 +27,7 @@ const handled = [_][]const u8{
     "Sleep", // handleSleep in tool_dispatch.zig
     "TodoWrite", // handleTodoWrite in tool_dispatch.zig (V1 shim over V2 task.zig)
     "McpAuth", // handleMcpAuth in tool_dispatch.zig (wraps mcp/oauth.zig loginForMcpServer)
-    "REPLTool", // handleRepl in tool_dispatch.zig (minimal batch port; dispatch wiring deferred)
+    "REPLTool", // handleRepl in tool_dispatch.zig (tools-17: dispatch wired, advertised as "REPL")
 };
 
 /// Tools not yet ported, with a documented reason. These are real gaps,

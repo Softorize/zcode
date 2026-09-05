@@ -201,7 +201,7 @@ fn workspacePathRequired(tool_name: []const u8) bool {
         "task_update",  "TaskList",      "task_list",
         "TaskStop",     "task_stop",     "TaskOutput",
         "task_output",  "TaskRun",       "task_run",
-        "TaskPoll",     "task_poll",
+        "task_poll",
     });
 }
 
@@ -493,8 +493,8 @@ test "workspace-write blocks relative parent traversal" {
     try testing.expect(!d.allowed);
 }
 
-test "read-only allows task poll" {
-    const d = authorizeTool("read-only", "/repo/work", "TaskPoll", "id=task-1");
+test "read-only allows task get" {
+    const d = authorizeTool("read-only", "/repo/work", "TaskGet", "id=task-1");
     try testing.expect(d.allowed);
 }
 
