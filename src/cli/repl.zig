@@ -158,6 +158,12 @@ pub const Options = struct {
     status_branch: []const u8 = "",
     status_model_context_window: usize = 0,
     status_approval_mode: []const u8 = "tiered-auto",
+    /// repl-ux-01: the live reference permission mode (default/acceptEdits/
+    /// plan/bypassPermissions/dontAsk), refreshed every render tick from the
+    /// REPL's Shift+Tab-cyclable `permission_mode` var. Only meaningful when
+    /// `permission_mode_active` (a reference mode name was configured); the
+    /// footer renders a persistent chip for every value except `.default`.
+    live_permission_mode: permission_decision.Mode = .default,
     status_sandbox: []const u8 = "workspace-write",
     status_show_workspace: bool = true,
     status_show_model: bool = true,
@@ -188,6 +194,10 @@ pub const Options = struct {
     enable_spinner: bool = true,
     enable_thinking_summary: bool = true,
     brief_mode: bool = false,
+    /// commands-16: /focus -- a second, distinct transcript view-mode
+    /// toggle from brief_mode (reference: "Toggle focus view: just your
+    /// prompt, summary, and response"). Session-only.
+    focus_mode: bool = false,
     ui_density: UiDensity = .full,
     ui_leader_key: []const u8 = "ctrl+x",
     show_top_bar: bool = true,
@@ -2056,6 +2066,93 @@ fn computePromptSuggestion(example_prompt: ?[]const u8, input_text: []const u8, 
     if (input_text.len != 0) return "";
     if (submitted_prompt_count > 0) return "";
     return example_prompt orelse "";
+}
+
+/// commands-17: the /tui reply text, factored out for unit testing
+/// (the interactive line-processing loop that calls this isn't
+/// unit-testable directly). `requested` is the trimmed argument after
+/// `/tui` ("" for the bare form); `use_fullscreen` is the session's
+/// actual active renderer, decided once at startup.
+pub fn buildTuiCommandMessage(buf: []u8, requested: []const u8, use_fullscreen: bool) []const u8 {
+    const active_name: []const u8 = if (use_fullscreen) "fullscreen" else "default";
+    if (requested.len == 0) {
+        return std.fmt.bufPrint(buf, "tui renderer: {s}", .{active_name}) catch "tui renderer status unavailable";
+    }
+    if (!std.mem.eql(u8, requested, "default") and !std.mem.eql(u8, requested, "fullscreen")) {
+        return std.fmt.bufPrint(buf, "usage: /tui [default|fullscreen] (active: {s})", .{active_name}) catch "usage: /tui [default|fullscreen]";
+    }
+    if (std.mem.eql(u8, requested, active_name)) {
+        return std.fmt.bufPrint(buf, "tui renderer already {s}", .{active_name}) catch "tui renderer unchanged";
+    }
+    return std.fmt.bufPrint(
+        buf,
+        "switching the tui renderer mid-session isn't supported yet -- relaunch {s} --no-fullscreen to use the {s} renderer",
+        .{ if (std.mem.eql(u8, requested, "default")) "with" else "without", requested },
+    ) catch "switching the tui renderer mid-session isn't supported yet";
+}
+
+/// repl-ux-missed-129 / sessions-storage-11: what a given idle-composer
+/// Escape press should do, and the press-count carried into the next
+/// press. Pure so the double-tap detection/branching is unit-testable
+/// without driving the interactive key-read loop.
+pub const IdleEscapeOutcome = enum { none, show_hint, clear_input, open_rewind };
+pub const IdleEscapeDecision = struct {
+    outcome: IdleEscapeOutcome,
+    next_press_count: usize,
+};
+
+/// `now_ms`/`last_escape_ms` reset the double-tap window after 3s of
+/// inactivity, mirroring the spinner's own mid-turn escape-press counter
+/// (repl_spinner.zig) so both surfaces agree on how fast a "double tap"
+/// must be. A second press within the window either clears a non-empty
+/// draft or, when the composer is already empty, opens the rewind
+/// picker; a first press against a non-empty draft shows the "Esc again
+/// to clear" discoverability hint (edualc usePromptInputPlaceholder.ts;
+/// cc_strings.txt key:"escape-again-to-clear").
+pub fn classifyIdleEscapePress(now_ms: i64, last_escape_ms: i64, press_count_before: usize, input_is_empty: bool) IdleEscapeDecision {
+    const press_count: usize = if (now_ms - last_escape_ms > 3000) 1 else press_count_before + 1;
+    if (press_count >= 2) {
+        return .{ .outcome = if (input_is_empty) .open_rewind else .clear_input, .next_press_count = 0 };
+    }
+    return .{ .outcome = if (input_is_empty) .none else .show_hint, .next_press_count = press_count };
+}
+
+/// repl-ux-05: cap on how many once-per-second ticks the "Press up to edit
+/// queued messages" discoverability hint is shown before falling back to
+/// the normal placeholder, mirroring the reference's budgeted
+/// `queuedCommandUpHintCount` (cc_strings.txt) without needing a new
+/// persisted config key -- the budget is per-session here, reset to 0 at
+/// the start of every REPL launch.
+const QUEUED_UP_HINT_TICK_CAP: usize = 5;
+
+/// repl-ux-05 / repl-ux-09: choose the dim in-box placeholder shown while
+/// the composer is empty. Priority order:
+///  1. "Press up to edit queued messages" (edualc
+///     usePromptInputPlaceholder.ts:50-54) while there is an editable
+///     queued message and the hint hasn't exhausted its per-session budget
+///     -- beats the starter suggestion so the user learns Up recalls it.
+///  2. A "start"-tagged example prompt, wrapped in `Try "..."` the same
+///     way the one-time startup banner tip already is (cc_strings.txt:
+///     `` `Try "${sample}"` ``) -- previously shown as the bare example
+///     text with no quoting.
+///  3. A "recent"-tagged real recalled prompt shown as-is: it is an
+///     actual past prompt, not a hypothetical example, so it is not
+///     wrapped in the "Try" framing.
+fn computeIdlePlaceholder(
+    buf: []u8,
+    has_editable_queued_prompt: bool,
+    up_hint_shown_ticks: usize,
+    starter_text: []const u8,
+    starter_tag: []const u8,
+) []const u8 {
+    if (has_editable_queued_prompt and up_hint_shown_ticks < QUEUED_UP_HINT_TICK_CAP) {
+        return "Press up to edit queued messages";
+    }
+    if (starter_text.len == 0) return "";
+    if (std.mem.eql(u8, starter_tag, "start")) {
+        return std.fmt.bufPrint(buf, "Try \"{s}\"", .{starter_text}) catch starter_text;
+    }
+    return starter_text;
 }
 
 fn insertPromptAttachmentToken(
@@ -5718,10 +5815,31 @@ fn appendWelcomeTip(allocator: std.mem.Allocator, transcript: *UiTranscript, col
     try transcript.appendLine(allocator, line);
 }
 
-/// Write a compact welcome header for the non-fullscreen / piped-output
-/// path. Same content as the fullscreen banner but collapsed to a single
-/// accent line and three info rows so it stays readable when redirected
-/// to a log or pager.
+fn writeWelcomeHeaderRow(writer: anytype, color: bool, label: []const u8, value: []const u8) !void {
+    if (value.len == 0) return;
+    if (color) {
+        try writer.print("    {s}\xe2\x94\x82{s}   {s}{s: <9}{s}  {s}\n", .{ ANSI_DIM, ANSI_RESET, ANSI_DIM, label, ANSI_RESET, value });
+    } else {
+        try writer.print("    |   {s: <9}  {s}\n", .{ label, value });
+    }
+}
+
+fn writeWelcomeHeaderCommand(writer: anytype, color: bool, options: Options, command: []const u8, description: []const u8) !void {
+    if (color) {
+        try writer.print("      {s}{s: <10}{s}  {s}{s}{s}\n", .{
+            repl_markdown_mod.brandAccentBoldAnsi(options), command, ANSI_RESET, ANSI_DIM, description, ANSI_RESET,
+        });
+    } else {
+        try writer.print("      {s: <10}  {s}\n", .{ command, description });
+    }
+}
+
+/// Write the welcome header for the non-fullscreen / piped-output path.
+/// repl-ux-10: previously a plain 4-line dump with none of the fullscreen
+/// banner's card border, "Quick reference" section, or git-history `Try
+/// "..."` tip; now ports that same structure so every real terminal
+/// session (including one downgraded from fullscreen, e.g. a small
+/// terminal) sees a consistent welcome surface.
 fn writeWelcomeHeader(allocator: std.mem.Allocator, writer: anytype, options: Options) !void {
     const color = shouldUseColor(options);
     // Same shouldShowProjectOnboarding gate as the fullscreen banner: the
@@ -5731,12 +5849,18 @@ fn writeWelcomeHeader(allocator: std.mem.Allocator, writer: anytype, options: Op
     if (needs_instruction_file) {
         onboarding_mod.incrementSeenCount(allocator, options.status_workspace);
     }
+
+    var model_value_buf: [160]u8 = undefined;
+    const model_value = std.fmt.bufPrint(&model_value_buf, "{s}/{s}", .{ options.status_provider, options.status_model }) catch options.status_model;
+
+    try writer.writeAll("\n");
     if (color) {
-        try writer.print("\n  {s}{s}{s} {s}zcode{s} {s}v{s}{s}  {s}terminal workbench for agentic code tasks{s}\n", .{
-            repl_markdown_mod.brandAccentAnsi(options),
-            figures.BLACK_DIAMOND,
+        try writer.print("    {s}\xe2\x95\xad" ++ ("\xe2\x94\x80" ** 66) ++ "\xe2\x95\xae{s}\n", .{ repl_markdown_mod.brandAccentDimAnsi(options), ANSI_RESET });
+        try writer.print("    {s}\xe2\x94\x82{s}  {s}{s} zcode{s} {s}v{s}{s}  {s}terminal workbench for agentic code{s}\n", .{
+            repl_markdown_mod.brandAccentDimAnsi(options),
             ANSI_RESET,
-            ANSI_BOLD,
+            repl_markdown_mod.brandAccentBoldAnsi(options),
+            figures.BLACK_DIAMOND,
             ANSI_RESET,
             ANSI_DIM,
             options.app_version,
@@ -5744,24 +5868,64 @@ fn writeWelcomeHeader(allocator: std.mem.Allocator, writer: anytype, options: Op
             ANSI_DIM,
             ANSI_RESET,
         });
-        try writer.print("  {s}workspace{s} {s}\n", .{ ANSI_DIM, ANSI_RESET, options.status_workspace });
-        try writer.print("  {s}model    {s} {s}/{s}\n", .{ ANSI_DIM, ANSI_RESET, options.status_provider, options.status_model });
-        try writer.print("  {s}safety   {s} {s}\n\n", .{ ANSI_DIM, ANSI_RESET, options.status_approval_mode });
-        if (needs_instruction_file) {
+    } else {
+        try writer.print("    +" ++ ("-" ** 66) ++ "+\n", .{});
+        try writer.print("    |  * zcode v{s}  terminal workbench for agentic code\n", .{options.app_version});
+    }
+    try writeWelcomeHeaderRow(writer, color, "workspace", options.status_workspace);
+    try writeWelcomeHeaderRow(writer, color, "model", model_value);
+    try writeWelcomeHeaderRow(writer, color, "safety", options.status_approval_mode);
+    if (color) {
+        try writer.print("    {s}\xe2\x95\xb0" ++ ("\xe2\x94\x80" ** 66) ++ "\xe2\x95\xaf{s}\n\n", .{ repl_markdown_mod.brandAccentDimAnsi(options), ANSI_RESET });
+    } else {
+        try writer.print("    +" ++ ("-" ** 66) ++ "+\n\n", .{});
+    }
+
+    if (color) {
+        try writer.print("    {s}{s}{s} {s}Quick reference{s}\n", .{ repl_markdown_mod.brandAccentAnsi(options), figures.BLOCKQUOTE_BAR, ANSI_RESET, ANSI_BOLD, ANSI_RESET });
+    } else {
+        try writer.print("    {s} Quick reference\n", .{figures.BLOCKQUOTE_BAR});
+    }
+    try writeWelcomeHeaderCommand(writer, color, options, "type", "ask a task in plain English, then press Enter");
+    try writeWelcomeHeaderCommand(writer, color, options, "@file", "attach a file as context");
+    try writeWelcomeHeaderCommand(writer, color, options, "/", "browse commands; / + i for /init, / + h for help");
+    try writeWelcomeHeaderCommand(writer, color, options, options.ui_leader_key, "command palette (h), pick model (m), sessions (s)");
+    try writeWelcomeHeaderCommand(writer, color, options, "Esc Esc", "cancel turn  \xe2\x80\xa2  Ctrl+C x3 to exit");
+
+    // Same git-history example tip as the fullscreen banner
+    // (core/example_commands.zig). Best-effort: silently skipped when
+    // unavailable (no git repo, no candidates, etc).
+    if (options.status_workspace.len > 0) {
+        const example_commands = @import("../core/example_commands.zig");
+        if (example_commands.getExamplePrompt(allocator, options.status_workspace) catch null) |prompt| {
+            defer allocator.free(prompt);
+            var tip_buf: [512]u8 = undefined;
+            const tip = std.fmt.bufPrint(&tip_buf, "Try \"{s}\"", .{prompt}) catch "";
+            if (tip.len > 0) {
+                if (color) {
+                    try writer.print("      {s}" ++ figures.BULLET ++ "{s} {s}{s}{s}\n", .{ repl_markdown_mod.brandAccentAnsi(options), ANSI_RESET, ANSI_DIM, tip, ANSI_RESET });
+                } else {
+                    try writer.print("      " ++ figures.BULLET ++ " {s}\n", .{tip});
+                }
+            }
+        }
+    }
+    try writer.writeAll("\n");
+
+    if (needs_instruction_file) {
+        if (color) {
             try writer.print(
-                "  {s}" ++ figures.ARROW_HOOK ++ "{s} {s}run /init to create ZCODE.md for this workspace (/onboarding shows setup help){s}\n",
+                "  {s}" ++ figures.ARROW_HOOK ++ "{s} {s}run /init to create ZCODE.md for this workspace (/onboarding shows setup help){s}\n\n",
                 .{ repl_markdown_mod.brandAccentAnsi(options), ANSI_RESET, ANSI_DIM, ANSI_RESET },
             );
+        } else {
+            try writer.print("  " ++ figures.ARROW_HOOK ++ " run /init to create ZCODE.md for this workspace (/onboarding shows setup help)\n\n", .{});
         }
+    }
+
+    if (color) {
         try writer.print("  {s}Enter submit  " ++ figures.BULLET_OPERATOR ++ "  Shift+Enter newline  " ++ figures.BULLET_OPERATOR ++ "  Ctrl+X H palette  " ++ figures.BULLET_OPERATOR ++ "  ? shortcuts{s}\n\n", .{ ANSI_DIM, ANSI_RESET });
     } else {
-        try writer.print("\n  * zcode v{s}  terminal workbench for agentic code tasks\n", .{options.app_version});
-        try writer.print("  workspace: {s}\n", .{options.status_workspace});
-        try writer.print("      model: {s}/{s}\n", .{ options.status_provider, options.status_model });
-        try writer.print("     safety: {s}\n\n", .{options.status_approval_mode});
-        if (needs_instruction_file) {
-            try writer.print("  " ++ figures.ARROW_HOOK ++ " run /init to create ZCODE.md for this workspace (/onboarding shows setup help)\n", .{});
-        }
         try writer.print("  Enter submit | Shift+Enter newline | Ctrl+X H palette | ? shortcuts\n\n", .{});
     }
 }
@@ -5811,6 +5975,38 @@ fn emitTurnProgressClear(writer: anytype) void {
 /// `false` when the workspace is already trusted, the user accepted, or there
 /// was nothing to show. On accept, trust is persisted via `trust.allow` so a
 /// trusted repo never re-prompts.
+// repl-ux-08: reference-style trust-gate copy (cc_strings.txt: "Accessing
+// workspace:" title; "Quick safety check: Is this a project you created or
+// one you trust? (Like your own code, a well-known open source project, or
+// work from your team). If not, take a moment to review what's in this
+// folder first." opening sentence; "These will apply without asking. Only
+// proceed if you trust this configuration." closing caveat; "Yes, I trust
+// this folder" affirmative option) -- factored into named constants and a
+// pure body-line composer so the copy is unit-testable without driving the
+// interactive overlay loop.
+const TRUST_GATE_TITLE: []const u8 = "Accessing workspace:";
+const TRUST_GATE_INTRO: []const u8 =
+    "Quick safety check: Is this a project you created or one you trust? " ++
+    "(Like your own code, a well-known open source project, or work from " ++
+    "your team). If not, take a moment to review what's in this folder first.";
+const TRUST_GATE_CLOSING: []const u8 = "These will apply without asking. Only proceed if you trust this configuration.";
+const TRUST_GATE_CHOICES = [_][]const u8{ "No, exit", "Yes, I trust this folder" };
+
+/// Assemble the trust-gate body: the safety-check intro, a blank line, the
+/// per-capability bullet lines (or a fallback line when there are none),
+/// a blank line, then the closing "applies without asking" caveat.
+fn buildTrustGateBodyLines(list: *std.array_list.Managed([]const u8), capability_lines: []const []const u8) void {
+    list.append(TRUST_GATE_INTRO) catch {};
+    list.append("") catch {};
+    if (capability_lines.len == 0) {
+        list.append("No project MCP servers, hooks, or command helpers detected.") catch {};
+    } else {
+        for (capability_lines) |l| list.append(l) catch {};
+    }
+    list.append("") catch {};
+    list.append(TRUST_GATE_CLOSING) catch {};
+}
+
 fn runTrustGate(allocator: std.mem.Allocator, cwd: []const u8, bottom_margin_rows: usize) !bool {
     // Fast path: a workspace already in the user trust store never re-prompts
     // (the `checkHasTrustDialogAccepted` equivalent).
@@ -5835,17 +6031,12 @@ fn runTrustGate(allocator: std.mem.Allocator, cwd: []const u8, bottom_margin_row
     // Build the borrowed const view the overlay expects.
     var body_view = std.array_list.Managed([]const u8).init(allocator);
     defer body_view.deinit();
-    if (body_lines.len == 0) {
-        body_view.append("No project MCP servers, hooks, or command helpers detected.") catch {};
-    } else {
-        for (body_lines) |l| body_view.append(l) catch {};
-    }
+    buildTrustGateBodyLines(&body_view, body_lines);
 
-    const choices = [_][]const u8{ "No, exit", "Yes, proceed" };
     const selected = repl_overlay_mod.runTrustGateOverlayLoop(
-        "Do you trust the files in this folder?",
+        TRUST_GATE_TITLE,
         body_view.items,
-        &choices,
+        &TRUST_GATE_CHOICES,
         bottom_margin_rows,
     ) catch return true; // a read error on the gate declines (safe default).
 
@@ -5941,7 +6132,7 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
     var trust_declined = false;
     defer if (trust_declined) {
         const msg = "zcode: exited without starting -- this folder is not trusted.\n" ++
-            "  Run zcode again and choose \"Yes, proceed\" to trust it for future sessions,\n" ++
+            "  Run zcode again and choose \"Yes, I trust this folder\" to trust it for future sessions,\n" ++
             "  or trust it up front with: zcode trust allow .\n";
         _ = std.c.write(std.Io.File.stderr().handle, msg.ptr, msg.len);
     };
@@ -6152,6 +6343,19 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
     var footer_tmux_state_buf: [48]u8 = undefined;
     var footer_worktree_state_buf: [48]u8 = undefined;
     var footer_state_refresh_at_ms: i64 = 0;
+    // repl-ux-05: once-per-session budget for the "Press up to edit queued
+    // messages" placeholder hint, ticked at most once per second (piggy-
+    // backing the existing footer-state refresh cadence below) and only
+    // while the hint is actually the one being shown.
+    var queued_up_hint_ticks: usize = 0;
+    // repl-ux-missed-129 / sessions-storage-11: idle-composer double-Escape
+    // state. Mirrors the 3-second reset window the spinner's own mid-turn
+    // escape-press counter already uses (repl_spinner.zig), kept as a
+    // separate counter since these two gate different actions (clear the
+    // draft vs. cancel an in-flight turn) and this one only fires when the
+    // prompt is idle and empty of any overlay/selection.
+    var idle_escape_press_count: usize = 0;
+    var idle_last_escape_ms: i64 = 0;
     var prompt_surface_selection: ?usize = null;
     var prompt_frame_current = false;
 
@@ -6219,6 +6423,11 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             }
         } else if (use_fullscreen) {
             while (true) {
+                // repl-ux-01: keep the footer's persistent permission-mode
+                // chip in sync with the live cycle var every render tick
+                // (Shift+Tab in the idle composer, or inside the approval
+                // overlay via the shared pointer, can change it between ticks).
+                options.live_permission_mode = permission_mode;
                 var merged_hint_buf: [320]u8 = undefined;
                 var default_input_hint_buf: [128]u8 = undefined;
                 const live_input_hint = if (input_hint_len > 0)
@@ -6257,6 +6466,15 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                 const now_ms = clock.nowMillis();
                 if (now_ms >= footer_state_refresh_at_ms) {
                     footer_state_refresh_at_ms = now_ms + 1000;
+                    // repl-ux-05: tick the "Press up to edit queued messages"
+                    // hint budget once per second, only while it is the hint
+                    // actually being shown (queue non-empty, input empty) --
+                    // matches the reference's budgeted-then-fades behavior
+                    // without redrawing-the-frame-is-a-tick semantics, which
+                    // would exhaust the budget in well under a second.
+                    if (queued_prompt_backlog.count() > 0 and input_buf.items().len == 0) {
+                        queued_up_hint_ticks += 1;
+                    }
                     options.footer_tasks_state = fetchCompactFooterState(allocator, handler, "__tasks_footer_state", footer_tasks_state_buf[0..]);
                     options.footer_teams_state = fetchCompactFooterState(allocator, handler, "__teams_footer_state", footer_teams_state_buf[0..]);
                     options.footer_bridge_state = fetchCompactFooterState(allocator, handler, "__bridge_footer_state", footer_bridge_state_buf[0..]);
@@ -6310,7 +6528,12 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                     appendReferenceFooterRows(&footer_rows, reference_suggestions.visible(), reference_suggestion_selection);
                 } else if (slash_suggestion_count > 0) {
                     appendCommandFooterRows(&footer_rows, command_suggestions.visible(), slash_suggestion_selection);
-                } else {
+                } else if (starter_suggestions.count > 1) {
+                    // repl-ux-09: with exactly one starter suggestion, this
+                    // footer row would duplicate the in-box ghost placeholder
+                    // below verbatim. Only show the dropdown once there is a
+                    // second option (the recent-history suggestion) actually
+                    // worth picking between.
                     appendStarterFooterRows(&footer_rows, starter_suggestions.visible(), starter_suggestion_selection);
                 }
                 if (prompt_surface_selection) |selected_idx| {
@@ -6333,10 +6556,14 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                     queued_prompt_restore_to_editor,
                     plan_approved_pending,
                 );
-                options.prompt_suggestion = if (starter_suggestions.count > 0)
-                    starter_suggestions.items[@min(starter_suggestion_selection, starter_suggestions.count - 1)].text
-                else
-                    "";
+                var idle_placeholder_buf: [220]u8 = undefined;
+                options.prompt_suggestion = computeIdlePlaceholder(
+                    &idle_placeholder_buf,
+                    queued_prompt_backlog.count() > 0 and input_buf.items().len == 0,
+                    queued_up_hint_ticks,
+                    if (starter_suggestions.count > 0) starter_suggestions.items[@min(starter_suggestion_selection, starter_suggestions.count - 1)].text else "",
+                    if (starter_suggestions.count > 0) starter_suggestions.items[@min(starter_suggestion_selection, starter_suggestions.count - 1)].tag else "",
+                );
                 options.prompt_placeholder = "";
                 var inline_ghost_buf: [256]u8 = undefined;
                 options.inline_ghost_text = if (reference_suggestion_count > 0)
@@ -6521,6 +6748,64 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                             }
                             syncVimUiState(&options, &vim_state, &input_buf, &input_cursor);
                             setHint(&input_hint_buf, &input_hint_len, options.input_mode_label);
+                            resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
+                            resetReferenceSuggestionSelection(&reference_suggestion_selection, &reference_suggestion_selection_touched);
+                            continue;
+                        }
+
+                        // repl-ux-missed-129 / sessions-storage-11: a second
+                        // Escape within 3s at the idle, non-overlay composer
+                        // either clears a non-empty draft (matching the
+                        // reference's "double tap esc to clear input" /
+                        // "Esc again to clear" pair) or, when the composer is
+                        // already empty, opens the rewind picker (the
+                        // reference's primary "Double-tap esc to rewind the
+                        // conversation to a previous point in time" discovery
+                        // path), independent of typing `/rewind`.
+                        const escape_now_ms = clock.nowMillis();
+                        const escape_decision = classifyIdleEscapePress(
+                            escape_now_ms,
+                            idle_last_escape_ms,
+                            idle_escape_press_count,
+                            input_buf.items().len == 0,
+                        );
+                        idle_escape_press_count = escape_decision.next_press_count;
+                        idle_last_escape_ms = escape_now_ms;
+
+                        switch (escape_decision.outcome) {
+                            .none => {},
+                            .show_hint => setHint(&input_hint_buf, &input_hint_len, "Esc again to clear"),
+                            .clear_input => {
+                                try prompt_undo.snapshot(allocator, input_buf.items(), input_cursor);
+                                input_buf.clearRetainingCapacity();
+                                input_cursor = 0;
+                                syncVimUiState(&options, &vim_state, &input_buf, &input_cursor);
+                                prompt_history.resetBrowse(allocator);
+                                clearHint(&input_hint_len);
+                                queued_prompt_restored_draft = false;
+                            },
+                            .open_rewind => {
+                                if (use_fullscreen and handler.command != null) {
+                                    try runRewindSelectorUi(
+                                        allocator,
+                                        writer,
+                                        &transcript,
+                                        &input_buf,
+                                        &input_cursor,
+                                        &prompt_attachments,
+                                        &prompt_history,
+                                        &prompt_undo,
+                                        &input_hint_buf,
+                                        &input_hint_len,
+                                        &runtime_hint_buf,
+                                        &runtime_hint_len,
+                                        scroll_offset,
+                                        mode,
+                                        options,
+                                        handler,
+                                    );
+                                }
+                            },
                         }
                         resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
                         resetReferenceSuggestionSelection(&reference_suggestion_selection, &reference_suggestion_selection_touched);
@@ -6997,10 +7282,30 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                         continue;
                     },
                     .toggle_mode => {
-                        mode = togglePrimaryMode(mode);
-                        var hint_buf: [128]u8 = undefined;
-                        const hint = std.fmt.bufPrint(&hint_buf, "mode switched to {s}", .{modeLabel(mode)}) catch "mode switched";
-                        setHint(&input_hint_buf, &input_hint_len, hint);
+                        // repl-ux-01: Claude Code's idle-composer Shift+Tab
+                        // cycles the persistent permission-mode chip
+                        // (default -> accept edits on -> plan mode on ->
+                        // auto mode on -> default), not a session mode. Give
+                        // it that reference behavior whenever the session has
+                        // opted into reference-style permission modes
+                        // (permission_mode_active); legacy tiered-auto/
+                        // manual/strict sessions keep zcode's own
+                        // execution/planning/brainstorm/review toggle
+                        // unchanged (still reachable via `/mode <name>`).
+                        if (permission_mode_active) {
+                            const permission_mode_cycle = @import("../core/permission_mode_cycle.zig");
+                            permission_mode = permission_mode_cycle.getNext(permission_mode, options.yolo_mode);
+                            options.live_permission_mode = permission_mode;
+                            pushPermissionModeToRuntime(handler, allocator, permission_mode);
+                            var hint_buf: [128]u8 = undefined;
+                            const hint = std.fmt.bufPrint(&hint_buf, "permission mode: {s}", .{permission_mode_cycle.shortLabel(permission_mode)}) catch "permission mode switched";
+                            setHint(&input_hint_buf, &input_hint_len, hint);
+                        } else {
+                            mode = togglePrimaryMode(mode);
+                            var hint_buf: [128]u8 = undefined;
+                            const hint = std.fmt.bufPrint(&hint_buf, "mode switched to {s}", .{modeLabel(mode)}) catch "mode switched";
+                            setHint(&input_hint_buf, &input_hint_len, hint);
+                        }
                         resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
                         continue;
                     },
@@ -8219,6 +8524,46 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             continue;
         }
 
+        // commands-16: /focus, a second, distinct view-mode toggle from
+        // zcode's existing /brief (cc_commands_full.json: "Toggle focus
+        // view: just your prompt, summary, and response"). Session-only
+        // (unlike /brief it is not persisted to config), handled inline
+        // the same way /mode is: no repl_commands.zig dispatch needed.
+        if (std.mem.eql(u8, line, "/focus")) {
+            options.focus_mode = !options.focus_mode;
+            var msg_buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "focus view: {s}", .{if (options.focus_mode) "on" else "off"}) catch "focus view toggled";
+            if (use_fullscreen) {
+                try transcript.appendLine(allocator, msg);
+                try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+            } else {
+                try writer.print("{s}\n", .{msg});
+            }
+            continue;
+        }
+
+        // commands-17: /tui [default|fullscreen] -- "Set the terminal UI
+        // renderer (default | fullscreen)". `use_fullscreen` is decided
+        // once at startup from --no-fullscreen/config/terminal capability
+        // and threads through the whole session (raw single-byte reads +
+        // alt-screen vs. buffered line reads), so a genuine live swap mid-
+        // session is out of scope for this pass; `/tui` reports the active
+        // renderer accurately and, when asked for the other one, says so
+        // plainly (with the flag to relaunch with) rather than silently
+        // no-oping or pretending to switch.
+        if (std.mem.eql(u8, line, "/tui") or std.mem.startsWith(u8, line, "/tui ")) {
+            const requested = if (line.len > "/tui".len) std.mem.trim(u8, line["/tui".len..], " \t") else "";
+            var msg_buf: [256]u8 = undefined;
+            const msg = buildTuiCommandMessage(&msg_buf, requested, use_fullscreen);
+            if (use_fullscreen) {
+                try transcript.appendLine(allocator, msg);
+                try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+            } else {
+                try writer.print("{s}\n", .{msg});
+            }
+            continue;
+        }
+
         if (std.mem.eql(u8, line, "/model") and use_fullscreen and handler.command != null) {
             try runModelPickerUi(
                 allocator,
@@ -9260,6 +9605,59 @@ test "deriveThinkingTopicTitle maps common progress text" {
     try testing.expectEqualStrings("Calling Model", topic);
 }
 
+test "writeWelcomeHeader (non-fullscreen path) matches the fullscreen banner's card border and Quick reference section" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    // Empty workspace: skips the git-history tip and the /init nudge (both
+    // gated on status_workspace.len > 0), so the test stays hermetic and
+    // focuses on the always-present structure this gap is about.
+    const options = Options{
+        .app_version = "test",
+        .status_provider = "anthropic",
+        .status_model = "claude",
+        .status_workspace = "",
+        .status_approval_mode = "tiered-auto",
+        .color_enabled = false,
+    };
+    try writeWelcomeHeader(testing.allocator, buf.writer(), options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "+----") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Quick reference") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "type") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "@file") != null);
+}
+
+test "trust gate copy matches the reference's Quick-safety-check framing and I-trust-this-folder option" {
+    try testing.expectEqualStrings("Accessing workspace:", TRUST_GATE_TITLE);
+    try testing.expectEqualStrings("No, exit", TRUST_GATE_CHOICES[0]);
+    try testing.expectEqualStrings("Yes, I trust this folder", TRUST_GATE_CHOICES[1]);
+
+    var list = std.array_list.Managed([]const u8).init(testing.allocator);
+    defer list.deinit();
+    const caps = [_][]const u8{"This folder pre-approves 2 tool permission(s)"};
+    buildTrustGateBodyLines(&list, &caps);
+
+    try testing.expectEqualStrings(TRUST_GATE_INTRO, list.items[0]);
+    try testing.expect(std.mem.indexOf(u8, TRUST_GATE_INTRO, "Quick safety check") != null);
+    try testing.expectEqualStrings("This folder pre-approves 2 tool permission(s)", list.items[2]);
+    try testing.expectEqualStrings(TRUST_GATE_CLOSING, list.items[list.items.len - 1]);
+    try testing.expect(std.mem.indexOf(u8, TRUST_GATE_CLOSING, "apply without asking") != null);
+}
+
+test "trust gate body falls back to a no-capabilities line when none are detected" {
+    var list = std.array_list.Managed([]const u8).init(testing.allocator);
+    defer list.deinit();
+    const no_caps = [_][]const u8{};
+    buildTrustGateBodyLines(&list, &no_caps);
+    var found = false;
+    for (list.items) |line| {
+        if (std.mem.eql(u8, line, "No project MCP servers, hooks, or command helpers detected.")) found = true;
+    }
+    try testing.expect(found);
+}
+
 test "togglePrimaryMode cycles all three modes" {
     try testing.expect(togglePrimaryMode(.execution) == .planning);
     try testing.expect(togglePrimaryMode(.planning) == .brainstorm);
@@ -9537,6 +9935,90 @@ test "appendStarterFooterRows marks the selected starter row" {
     try testing.expectEqual(@as(?usize, 1), footer_rows.selected_index);
     try testing.expectEqualStrings("first", footer_rows.visible()[0].primary);
     try testing.expectEqualStrings("second", footer_rows.visible()[1].primary);
+}
+
+test "buildTuiCommandMessage reports the active renderer for the bare form" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("tui renderer: fullscreen", buildTuiCommandMessage(&buf, "", true));
+    try testing.expectEqualStrings("tui renderer: default", buildTuiCommandMessage(&buf, "", false));
+}
+
+test "buildTuiCommandMessage confirms a no-op when the requested renderer is already active" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("tui renderer already fullscreen", buildTuiCommandMessage(&buf, "fullscreen", true));
+    try testing.expectEqualStrings("tui renderer already default", buildTuiCommandMessage(&buf, "default", false));
+}
+
+test "buildTuiCommandMessage explains that switching mid-session isn't supported, with a relaunch hint" {
+    var buf: [256]u8 = undefined;
+    const msg = buildTuiCommandMessage(&buf, "fullscreen", false);
+    try testing.expect(std.mem.indexOf(u8, msg, "isn't supported yet") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "--no-fullscreen") != null);
+}
+
+test "buildTuiCommandMessage rejects an unknown argument with a usage line" {
+    var buf: [256]u8 = undefined;
+    const msg = buildTuiCommandMessage(&buf, "bogus", true);
+    try testing.expect(std.mem.indexOf(u8, msg, "usage: /tui") != null);
+}
+
+test "classifyIdleEscapePress shows the clear hint on the first press, then clears on the second" {
+    const first = classifyIdleEscapePress(1_000, 0, 0, false);
+    try testing.expectEqual(IdleEscapeOutcome.show_hint, first.outcome);
+    try testing.expectEqual(@as(usize, 1), first.next_press_count);
+
+    const second = classifyIdleEscapePress(1_500, 1_000, first.next_press_count, false);
+    try testing.expectEqual(IdleEscapeOutcome.clear_input, second.outcome);
+    try testing.expectEqual(@as(usize, 0), second.next_press_count);
+}
+
+test "classifyIdleEscapePress opens the rewind picker on a double-tap with an empty composer" {
+    const first = classifyIdleEscapePress(1_000, 0, 0, true);
+    try testing.expectEqual(IdleEscapeOutcome.none, first.outcome);
+    try testing.expectEqual(@as(usize, 1), first.next_press_count);
+
+    const second = classifyIdleEscapePress(1_200, 1_000, first.next_press_count, true);
+    try testing.expectEqual(IdleEscapeOutcome.open_rewind, second.outcome);
+}
+
+test "classifyIdleEscapePress resets the count once the window has elapsed" {
+    const first = classifyIdleEscapePress(1_000, 0, 0, false);
+    try testing.expectEqual(@as(usize, 1), first.next_press_count);
+
+    // Second press arrives 5s later (window is 3s) -- treated as a fresh
+    // first press, not the completion of a double-tap.
+    const late = classifyIdleEscapePress(6_000, 1_000, first.next_press_count, false);
+    try testing.expectEqual(IdleEscapeOutcome.show_hint, late.outcome);
+    try testing.expectEqual(@as(usize, 1), late.next_press_count);
+}
+
+test "computeIdlePlaceholder shows the queued-message hint before its budget is exhausted" {
+    var buf: [220]u8 = undefined;
+    const shown = computeIdlePlaceholder(&buf, true, 0, "fix lint errors", "start");
+    try testing.expectEqualStrings("Press up to edit queued messages", shown);
+
+    const still_shown = computeIdlePlaceholder(&buf, true, QUEUED_UP_HINT_TICK_CAP - 1, "fix lint errors", "start");
+    try testing.expectEqualStrings("Press up to edit queued messages", still_shown);
+}
+
+test "computeIdlePlaceholder falls back once the queued-message hint budget is exhausted or the queue is empty" {
+    var buf: [220]u8 = undefined;
+    const budget_exhausted = computeIdlePlaceholder(&buf, true, QUEUED_UP_HINT_TICK_CAP, "fix lint errors", "start");
+    try testing.expectEqualStrings("Try \"fix lint errors\"", budget_exhausted);
+
+    const queue_empty = computeIdlePlaceholder(&buf, false, 0, "fix lint errors", "start");
+    try testing.expectEqualStrings("Try \"fix lint errors\"", queue_empty);
+}
+
+test "computeIdlePlaceholder wraps a start-tagged example in Try quotes but leaves a recent prompt bare" {
+    var buf: [220]u8 = undefined;
+    const example = computeIdlePlaceholder(&buf, false, 0, "refactor src/core/format.zig", "start");
+    try testing.expectEqualStrings("Try \"refactor src/core/format.zig\"", example);
+
+    const recent = computeIdlePlaceholder(&buf, false, 0, "add a test for the parser", "recent");
+    try testing.expectEqualStrings("add a test for the parser", recent);
+
+    try testing.expectEqualStrings("", computeIdlePlaceholder(&buf, false, 0, "", ""));
 }
 
 test "extractReferenceToken finds active @file tokens" {
