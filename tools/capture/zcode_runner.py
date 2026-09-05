@@ -11,8 +11,16 @@ shape: one 'result' record for the final JSON, plus synthetic records
 derived from the tool_calls array so the comparison runner (#564) can
 diff against the reference's richer stream.
 
+r3-mock-02 adds a second, interactive mode (`--pty`) for scenarios whose
+class is UX (docs/capture/scenario_corpus.md #9-10: ux-permission-prompt,
+ux-spinner-basic) -- these need a live fullscreen REPL, not the headless
+--print path above, so they drive pty_capture.run_interactive instead and
+write frames.bin (+ a per-run meta.json) under the same scenarios/<name>/zcode/
+directory.
+
 Usage:
     python3 tools/capture/zcode_runner.py <scenario_name> [--bin <path>]
+    python3 tools/capture/zcode_runner.py <scenario_name> --pty [--bin <path>]
 """
 
 from __future__ import annotations
@@ -23,8 +31,12 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pty_capture  # noqa: E402 (needs sys.path tweak above)
 
 
 SCENARIOS_ROOT = Path(__file__).resolve().parent.parent.parent / "scenarios"
@@ -36,6 +48,24 @@ def load_meta(scenario_name: str) -> dict:
     if not meta_path.exists():
         raise SystemExit(f"scenario not found: {meta_path}")
     return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+def resolve_seed_cwd(meta: dict) -> str:
+    """Resolve seed.cwd to an absolute path.
+
+    A path already rooted at "/" is used as-is (matches every existing
+    scenario, e.g. command-commit-basic's "/tmp"). A scenario that ships its
+    own fixture directory (so the capture is self-contained and reproducible
+    in CI, not just on the machine that first recorded it) instead names it
+    relative to the repo root, e.g. "scenarios/ux-spinner-basic/fixture" --
+    resolve that against the repo root (SCENARIOS_ROOT's parent).
+    """
+    cwd = meta.get("seed", {}).get("cwd", "")
+    if not cwd:
+        return os.getcwd()
+    if os.path.isabs(cwd):
+        return cwd
+    return str((SCENARIOS_ROOT.parent / cwd).resolve())
 
 
 def check_env_denylist(meta: dict) -> None:
@@ -174,11 +204,97 @@ def write_run_meta(out_dir: Path, bin_path: str, meta: dict, wire_count: int, ba
     )
 
 
+def _pty_trust_cwd(bin_path: str, cwd: str, env: dict) -> None:
+    """Pre-trust `cwd` under the isolated HOME (via `zcode trust allow`) so
+    the interactive first-run trust gate never blocks the capture waiting
+    for a keypress this runner does not know how to answer."""
+    try:
+        subprocess.run(
+            [bin_path, "trust", "allow", cwd],
+            env=env,
+            capture_output=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"[zcode_runner] warning: pre-trust of {cwd} failed: {e}", file=sys.stderr)
+
+
+def run_pty_scenario(bin_path: str, meta: dict, out_dir: Path) -> int:
+    """r3-mock-02: drive an interactive scenario over a real PTY and write
+    scenarios/<name>/zcode/{frames.bin,meta.json} per ADR 0010's frames.bin
+    shape (the top-level scenario meta.json is the scenario's own spec; this
+    is a separate, per-run capture-metadata file of the same name living
+    under zcode/, mirroring write_run_meta's run_meta.json for the headless
+    path above but named to match this gap's acceptance test verbatim).
+    """
+    seed = meta.get("seed", {})
+    cwd = resolve_seed_cwd(meta)
+    if not os.path.isdir(cwd):
+        raise SystemExit(f"scenario cwd does not exist: {cwd}")
+
+    cols = seed.get("terminal_size", {}).get("cols", 110)
+    rows = seed.get("terminal_size", {}).get("rows", 36)
+
+    env = os.environ.copy()
+    env.update(seed.get("env_fixed", {}))
+    env["TERM"] = env.get("TERM", "xterm-256color")
+    env["COLUMNS"] = str(cols)
+    env["LINES"] = str(rows)
+
+    cmd = [bin_path, "--provider", seed.get("provider", "mock"), "--model", seed.get("model", "mock-agent")]
+    timeout_s = meta.get("timeout_ms", 30000) / 1000.0
+
+    print(f"[zcode_runner] scenario={meta.get('scenario_name')} bin={bin_path} mode=pty")
+    print(f"[zcode_runner] cwd={cwd} size={cols}x{rows}")
+
+    # A per-run scratch HOME (outside scenarios/, never committed) so the
+    # trust state / config the interactive session writes never touches the
+    # developer's real ~/.zcode and never lands in the captured fixture.
+    with tempfile.TemporaryDirectory(prefix="zcode-pty-home-") as home:
+        env["HOME"] = home
+        _pty_trust_cwd(bin_path, cwd, env)
+        frames = pty_capture.run_interactive(
+            cmd, cwd, env, meta.get("inputs", []), timeout_s, cols=cols, rows=rows
+        )
+
+    frame_count = pty_capture.write_frames_multi(out_dir, frames)
+    total_bytes = sum(len(c) for _, c in frames)
+
+    version = subprocess.run([bin_path, "version"], capture_output=True, text=True, timeout=10).stdout.strip()
+    capture_meta = {
+        "scenario_name": meta.get("scenario_name"),
+        "mode": "pty",
+        "zcode_binary": bin_path,
+        "zcode_version": version,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "cwd": cwd,
+        "terminal_size": {"cols": cols, "rows": rows},
+        "inputs_sent": len(meta.get("inputs", [])),
+        "frame_count": frame_count,
+        "frame_bytes_total": total_bytes,
+    }
+    (out_dir / "meta.json").write_text(
+        json.dumps(capture_meta, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+    print(f"[zcode_runner] frames captured: {frame_count} ({total_bytes} bytes)")
+    print(f"[zcode_runner] output: {out_dir}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario_name")
     ap.add_argument("--bin", default=DEFAULT_BIN, help="path to zcode binary")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--pty",
+        action="store_true",
+        help="drive an interactive (fullscreen REPL) scenario over a real PTY "
+        "instead of the headless --print path (r3-mock-02; needed for the "
+        "UX-class scenarios in docs/capture/scenario_corpus.md, e.g. "
+        "ux-spinner-basic, ux-permission-prompt)",
+    )
     args = ap.parse_args()
 
     meta = load_meta(args.scenario_name)
@@ -186,6 +302,15 @@ def main() -> int:
 
     out_dir = SCENARIOS_ROOT / args.scenario_name / "zcode"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.pty:
+        if args.dry_run:
+            print(f"[zcode_runner] scenario={args.scenario_name} bin={args.bin} mode=pty")
+            print(f"[zcode_runner] cwd={resolve_seed_cwd(meta)}")
+            print(f"[zcode_runner] inputs={len(meta.get('inputs', []))}")
+            print("[zcode_runner] dry-run: not spawning")
+            return 0
+        return run_pty_scenario(args.bin, meta, out_dir)
 
     prompt = build_prompt(meta)
     print(f"[zcode_runner] scenario={args.scenario_name} bin={args.bin}")

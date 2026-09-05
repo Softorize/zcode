@@ -7077,23 +7077,58 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                         }
                         if (reference_suggestion_count > 0) {
                             try prompt_undo.snapshot(allocator, input_buf.items(), input_cursor);
-                            if (try acceptSelectedReferenceSuggestion(&input_buf, &input_cursor, &reference_suggestions, reference_suggestion_selection)) {
-                                prompt_history.resetBrowse(allocator);
-                                clearHint(&input_hint_len);
-                            }
+                            const changed = try acceptSelectedReferenceSuggestion(&input_buf, &input_cursor, &reference_suggestions, reference_suggestion_selection);
                             resetReferenceSuggestionSelection(&reference_suggestion_selection, &reference_suggestion_selection_touched);
                             resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
-                            continue;
-                        }
-                        if (slash_suggestion_count > 0) {
-                            if (try acceptSelectedCommandSuggestion(&input_buf, &input_cursor, &command_suggestions, slash_suggestion_selection)) {
+                            if (changed) {
                                 prompt_history.resetBrowse(allocator);
                                 clearHint(&input_hint_len);
+                                continue;
                             }
+                            // r3-mock-01: `changed == false` means the buffer
+                            // already exactly equals the selected reference
+                            // (nothing left to complete) -- fall through to the
+                            // same submit below instead of looping on `continue`
+                            // forever. See the slash_suggestion_count branch
+                            // below for the full explanation.
+                        } else if (slash_suggestion_count > 0) {
+                            const changed = try acceptSelectedCommandSuggestion(&input_buf, &input_cursor, &command_suggestions, slash_suggestion_selection);
                             resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
+                            if (changed) {
+                                prompt_history.resetBrowse(allocator);
+                                clearHint(&input_hint_len);
+                                continue;
+                            }
+                            // r3-mock-01: while any command/reference/starter
+                            // suggestion is visible, `prompt_context` resolves to
+                            // `.PromptSuggestions` (see the `prompt_context` blk
+                            // above) whose default "enter" binding is
+                            // `.prompt_open`, not `.submit` -- so a fully-typed
+                            // slash command NEVER reaches the `.submit` case's
+                            // dispatch pipeline while its own suggestion row is
+                            // still showing. Since a command's suggestion text
+                            // matches the typed command itself, that row never
+                            // goes away on its own, so every previous Enter press
+                            // here just called `acceptSelectedCommandSuggestion`
+                            // (a no-op once the text already matches: it returns
+                            // `false` and leaves the buffer untouched) and
+                            // `continue`d -- meaning commands like `/exit` or
+                            // `/help` could never actually run: each Enter press
+                            // silently re-affirmed the identical suggestion
+                            // forever. `changed == false` is exactly the signal
+                            // that there is nothing left to accept, so treat this
+                            // Enter as a real submit instead, through the same
+                            // `owned_line` -> `line` pipeline every other submit
+                            // path (queued prompts, bound commands, the
+                            // non-fullscreen fallback) already uses.
+                        } else {
                             continue;
                         }
-                        continue;
+                        owned_line = try allocator.dupe(u8, input_buf.items());
+                        input_buf.clearRetainingCapacity();
+                        input_cursor = 0;
+                        prompt_history.resetBrowse(allocator);
+                        break;
                     },
                     .backspace => {
                         if (vim_state.enabled and vim_state.mode == .normal) {
