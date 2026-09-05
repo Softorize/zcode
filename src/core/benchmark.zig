@@ -59,6 +59,7 @@ pub fn run(allocator: std.mem.Allocator, cwd: []const u8, cfg: *const config_mod
             null,
             "",
             .execution,
+            false,
         );
         built.envelope.deinit();
         const elapsed_ns = timer.read();

@@ -113,6 +113,11 @@ pub fn build(
     /// so the model knows what to PRODUCE (a structured plan vs
     /// free discussion) not just what tools are blocked.
     prompt_mode: types.PromptMode,
+    /// system-prompt-missed-74: true when this session is running
+    /// non-interactively (headless / `--print`, no user watching in real
+    /// time). Threaded straight through to
+    /// prompt_helpers.renderDynamicSystemPolicy -- see its doc comment.
+    is_headless: bool,
 ) !BuildOutput {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -179,7 +184,7 @@ pub fn build(
 
     const tool_schemas_owned = try prompt_helpers.cloneToolSchemas(a, tool_schemas);
     const system_policy = try prompt_helpers.renderSystemPolicy(a, cfg, policy, cwd, user_turn, output_style_name, session_system_prompt, preferred_language, prompt_mode);
-    const dynamic_policy = try prompt_helpers.renderDynamicSystemPolicy(a, cfg, policy, cwd, user_turn, output_style_name, session_system_prompt, preferred_language, prompt_mode);
+    const dynamic_policy = try prompt_helpers.renderDynamicSystemPolicy(a, cfg, policy, cwd, user_turn, output_style_name, session_system_prompt, preferred_language, prompt_mode, is_headless);
     const context_candidates = try context.gather(a, cwd, user_turn, snapshot, git_capture_cache);
     const context_blocks = try selectBudgetedContextBlocks(
         a,
@@ -423,6 +428,22 @@ fn renderSystemPromptPacket(allocator: std.mem.Allocator, env: *const types.Prom
         try writeEscapedSystemReminder(buf.writer(), env.dynamic_policy);
         try buf.writer().writeAll("\n</system-reminder>\n\n");
     }
+
+    // system-prompt-missed-75: ported from cc_system_prompt_2.1.261.md's
+    // "# Session-specific guidance" section. Only the two bullets that map
+    // 1:1 onto features zcode actually has are ported: the shell-passthrough
+    // hint (phrased for zcode's own `/!` interactive-shell syntax, verified
+    // in src/cli/repl.zig, rather than the reference's bare `! <command>`)
+    // and the /<skill-name>-invokes-via-Skill rule. The reference's third
+    // bullet (an "ultrareview" explainer for /code-review ultra) is omitted:
+    // zcode has no such command, and claiming one exists would violate the
+    // "never make zcode claim features it doesn't have" rule.
+    try buf.writer().writeAll(
+        "<system-reminder name=\"zcode-session-tips\">\n" ++
+            " - If you need the user to run a shell command themselves (e.g., an interactive login like `gcloud auth login`), suggest they type `/! <command>` in the prompt -- the `/!` prefix runs the command in this session so its output lands directly in the conversation.\n" ++
+            " - When the user types `/<skill-name>`, invoke it via Skill. Only use skills listed in the user-invocable skills section -- don't guess.\n" ++
+            "</system-reminder>\n\n",
+    );
 
     // Skill awareness: the model discovers available skills here and invokes
     // them via the Skill tool (or the user via /<name>). Per-turn + dynamic so
@@ -908,6 +929,35 @@ test "response-contract section is gated by suppress_response_contract" {
     try testing.expect(std.mem.indexOf(u8, without, "zcode-response-contract") == null);
 }
 
+test "renderSystemPromptPacket includes the session-specific guidance tips (system-prompt-missed-75)" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const env = types.PromptEnvelope{
+        .system_policy = "system",
+        .instruction_stack = &.{},
+        .user_turn = "hi",
+        .tool_schemas = &.{},
+        .history = &.{},
+        .context_blocks = &.{},
+        .budget_plan = types.BudgetPlan.init(100, 10, 10),
+        .cache_hints = &.{},
+    };
+
+    const rendered = try renderSystemPromptPacket(a, &env);
+    try testing.expect(std.mem.indexOf(u8, rendered, "zcode-session-tips") != null);
+    // Phrased for zcode's actual `/!` interactive-shell syntax, not the
+    // reference's bare `!` -- zcode reserves bare `!` for a different,
+    // non-interactive fast path (see src/cli/repl.zig).
+    try testing.expect(std.mem.indexOf(u8, rendered, "/! <command>") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "invoke it via Skill") != null);
+    // Never claim the ultrareview command exists -- zcode has no such
+    // command yet.
+    try testing.expect(std.mem.indexOf(u8, rendered, "ultrareview") == null);
+}
+
 test "renderPromptPacket builds system and user packets" {
     const allocator = testing.allocator;
     const env = types.PromptEnvelope{
@@ -1135,6 +1185,7 @@ test "prompt fixture preserves instruction precedence" {
         null,
         "goal=Update tests and keep behavior stable\nrequired_next_action=inspect_or_act",
         .execution,
+        false,
     );
     defer built.envelope.deinit();
 
@@ -1203,6 +1254,7 @@ test "prompt build includes configured output style and orchestration reminder" 
         null,
         "",
         .execution,
+        false,
     );
     defer built.envelope.deinit();
 
@@ -1213,4 +1265,73 @@ test "prompt build includes configured output style and orchestration reminder" 
     try testing.expect(std.mem.indexOf(u8, rendered.system, "zcode-orchestration-playbook") != null);
     try testing.expect(std.mem.indexOf(u8, rendered.system, "task checklist") != null);
     try testing.expect(std.mem.indexOf(u8, rendered.system, "AgentRun") != null);
+}
+
+test "build threads is_headless through to the rendered dynamic policy (system-prompt-missed-74)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(rt.io, "repo");
+    const cwd = try allocator.dupe(u8, "repo");
+    defer allocator.free(cwd);
+
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const snapshot = types.SessionSnapshot{
+        .facts = &.{},
+        .decisions = &.{},
+        .open_tasks = &.{},
+        .file_focus = &.{},
+        .recent_tool_outcomes = &.{},
+        .handoff_summary = "",
+    };
+
+    var headless_built = try build(
+        allocator,
+        &cfg,
+        &policy,
+        "do the thing",
+        &.{},
+        &.{},
+        cwd,
+        &snapshot,
+        null,
+        cfg.output_style,
+        "",
+        "",
+        null,
+        0,
+        null,
+        "",
+        .execution,
+        true,
+    );
+    defer headless_built.envelope.deinit();
+    try testing.expect(std.mem.indexOf(u8, headless_built.envelope.envelope.dynamic_policy, "operating autonomously") != null);
+
+    var interactive_built = try build(
+        allocator,
+        &cfg,
+        &policy,
+        "do the thing",
+        &.{},
+        &.{},
+        cwd,
+        &snapshot,
+        null,
+        cfg.output_style,
+        "",
+        "",
+        null,
+        0,
+        null,
+        "",
+        .execution,
+        false,
+    );
+    defer interactive_built.envelope.deinit();
+    try testing.expect(std.mem.indexOf(u8, interactive_built.envelope.envelope.dynamic_policy, "operating autonomously") == null);
 }
