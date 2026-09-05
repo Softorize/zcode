@@ -7919,6 +7919,36 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             try renderFullScreen(writer, &transcript, false, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
         }
 
+        // commands-12: `/background` (alias `/bg`) sends this session
+        // detached and frees the terminal, matching the reference's
+        // local-jsx command of the same name. Dispatched through the normal
+        // command callback (repl_commands_parity.zig actually spawns the
+        // detached re-`--resume`'d process and builds the pid/logs/kill
+        // hint), then this REPL loop tears down exactly like `/exit` --
+        // minus the worktree-cleanup prompt and goodbye line, which are
+        // `/exit`-specific and not relevant to a session that keeps running.
+        if (std.mem.eql(u8, line, "/background") or std.mem.startsWith(u8, line, "/background ") or
+            std.mem.eql(u8, line, "/bg") or std.mem.startsWith(u8, line, "/bg "))
+        {
+            if (handler.command) |cmd_cb| {
+                const maybe_output = cmd_cb(handler.ctx, allocator, line) catch |err| {
+                    try writer.print("error: {s}\n", .{@errorName(err)});
+                    continue;
+                };
+                if (maybe_output) |output| {
+                    defer allocator.free(output);
+                    try writer.writeAll(output);
+                    if (!std.mem.endsWith(u8, output, "\n")) try writer.writeByte('\n');
+                }
+            }
+            if (use_fullscreen) {
+                fullscreen_active = false;
+                raw_mode.disable();
+                try leaveAltScreen(writer);
+            }
+            return;
+        }
+
         if (std.mem.eql(u8, line, "/exit") or std.mem.eql(u8, line, "/quit")) {
             // ExitFlow.tsx WorktreeExitDialog branch: when the session is
             // running inside a zcode-managed worktree, offer to clean it up
@@ -8932,6 +8962,17 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                 defer allocator.free(requested_mode);
                 if (parseModeName(requested_mode)) |parsed| {
                     mode = parsed;
+                }
+            }
+            // commands-34 (/goal): end-of-turn check for an active goal.
+            // Auto-queues another turn (via the existing queued_prompt
+            // mechanism -- the same one restore-on-interrupt and cron use)
+            // until the model reports the condition met, `/goal clear` runs,
+            // or the handler's own safety cap trips. Never overrides a
+            // prompt something else already queued this round.
+            if (queued_prompt == null) {
+                if (cmd_cb(handler.ctx, allocator, "__goal_nudge") catch null) |nudge| {
+                    queued_prompt = nudge;
                 }
             }
         }

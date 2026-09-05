@@ -314,6 +314,12 @@ comptime {
     // socket so `tmux kill-server` via Bash cannot touch the user's real
     // session (phase-26 daemon-background-06). Register so its tests run.
     _ = @import("core/tmux_socket.zig");
+    // wp1b-commands-new: new-in-2.1.261 commands (background/list-agents/
+    // subtask/goal/team-onboarding/fewer-permission-prompts/auto-mode-setup/
+    // bug/import/skill-doctor/reload-skills) + the codex/gemini config
+    // importer they share with the `zcode import` CLI subcommand.
+    _ = @import("repl_commands_parity.zig");
+    _ = @import("core/import_agent_config.zig");
 }
 
 fn verboseLogsEnabled(opts: *const cli.CliOptions) bool {
