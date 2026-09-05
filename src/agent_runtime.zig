@@ -373,6 +373,48 @@ fn resolvePermissionRulesPath(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, path_set.permission_rules_path);
 }
 
+/// config-layout-13: union `cfg.additional_directories` -- the wp4 CLI
+/// carrier for repeated `--add-dir <path>` flags, comma-joined by
+/// `cli.args.appendCommaJoined` -- into `base` (already the persisted
+/// `/add-dir` list unioned with settings.json's `permissions
+/// .additionalDirectories`, per `workspace_dirs.loadWithSettings`).
+/// Consumes (frees) `base` and returns a new owned slice; on error `base`
+/// is left untouched so the caller's `catch base` fallback stays valid.
+/// Empty entries (an empty `cfg.additional_directories`, or a stray comma)
+/// contribute nothing. Deduplicated against `base` and against itself.
+fn unionCliAdditionalDirectories(allocator: std.mem.Allocator, base: [][]u8, cli_joined: []const u8) ![][]u8 {
+    if (cli_joined.len == 0) return base;
+
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    try out.ensureUnusedCapacity(allocator, base.len);
+    for (base) |p| out.appendAssumeCapacity(try allocator.dupe(u8, p));
+
+    var it = std.mem.splitScalar(u8, cli_joined, ',');
+    while (it.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var dup = false;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, trimmed)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try out.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+    // Take ownership of the new slice BEFORE freeing `base` so a failure in
+    // `toOwnedSlice` (the only fallible step left) leaves `base` intact for
+    // the caller's `catch base` fallback -- freeing it first then failing
+    // would hand the caller a dangling slice.
+    const owned = try out.toOwnedSlice(allocator);
+    workspace_dirs_mod.freeList(allocator, base);
+    return owned;
+}
+
 /// True for WebFetch / WebSearch / HttpRequest. agent_tools classifies
 /// these as inspection-only because they don't mutate local state, but
 /// for the read-only-stall counter they ARE forward motion -- they're
@@ -898,7 +940,15 @@ pub const AgentRuntime = struct {
             // `permissions.additionalDirectories` so a checked-in team
             // declaration widens the workspace without a `/add-dir` ever
             // having been run.
-            additional_directories = workspace_dirs_mod.loadWithSettings(allocator, cwd, null) catch empty;
+            const from_settings = workspace_dirs_mod.loadWithSettings(allocator, cwd, null) catch empty;
+            // config-layout-13: consume the wp4 CLI carrier `cfg.additional_directories`
+            // (a comma-joined list built from repeated `--add-dir <path>` flags,
+            // src/main.zig / src/cli/args.zig) directly now that it exists,
+            // unioning single-invocation `--add-dir` roots in alongside the
+            // persisted `/add-dir` list and settings.json's array. Deduplicated
+            // against `from_settings` (which is itself already deduplicated
+            // against the persisted list).
+            additional_directories = unionCliAdditionalDirectories(allocator, from_settings, cfg.additional_directories) catch from_settings;
         }
 
         // bash-shell-02: source the user's rc once at session start and

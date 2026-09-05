@@ -606,31 +606,6 @@ fn appendCommaJoined(allocator: std.mem.Allocator, owned: *?[]u8, value: []const
     return owned.*.?;
 }
 
-/// True once per process: guards the `--permission-mode auto` /
-/// `--approval-mode auto` degraded-synonym note so a script that somehow
-/// passes the flag twice doesn't get the note twice.
-var printed_auto_degraded_note = false;
-
-/// cli-flags-01: normalize an `--approval-mode`/`--permission-mode` value.
-/// Every reference spelling (acceptEdits/plan/bypassPermissions/dontAsk and
-/// their hyphenated forms) and zcode's own three legacy modes pass through
-/// unchanged -- the engine already understands them (see
-/// `Config.isKnownApprovalMode`). "auto" has no zcode equivalent (no
-/// ant-only cloud classifier), so it degrades to "tiered-auto" with a
-/// one-time stderr note, per the wp4-cli-flags package notes.
-fn normalizeApprovalModeValue(raw: []const u8) ![]const u8 {
-    if (std.ascii.eqlIgnoreCase(raw, "auto")) {
-        if (!printed_auto_degraded_note) {
-            printed_auto_degraded_note = true;
-            std_io.stderrWriter().writeAll(
-                "note: --permission-mode auto has no zcode equivalent (no ant-only cloud classifier); using tiered-auto instead.\n",
-            ) catch {};
-        }
-        return "tiered-auto";
-    }
-    return raw;
-}
-
 /// True once per process: guards the `--effort xhigh` degraded-synonym note.
 var printed_xhigh_degraded_note = false;
 
@@ -1109,13 +1084,15 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
                 // Both land in the same `approval_mode` field so the live
                 // approval engine (which already understands every reference
                 // spelling; see permission_decision.isReferenceModeName)
-                // picks it up unchanged. "auto" has no zcode equivalent (no
-                // ant-only cloud classifier), so it degrades to the closest
-                // built-in mode -- tiered-auto -- with a one-time note.
+                // picks it up unchanged. hooks-permissions-05: "auto" is now a
+                // first-class (approximated) reference mode -- see
+                // permission_decision.Mode's doc comment -- so it passes
+                // through unchanged like every other reference spelling
+                // instead of degrading to "tiered-auto".
                 const raw = try parseFlagValue(argv, &i, arg, "--permission-mode");
                 try rejectControlChars("--permission-mode", raw);
                 options.used_permission_mode_flag = true;
-                options.approval_mode = try normalizeApprovalModeValue(raw);
+                options.approval_mode = raw;
             } else if (std.mem.eql(u8, arg, "--dangerously-skip-permissions")) {
                 // Claude Code's spelling for what zcode already calls --yolo
                 // (approval.evaluate's yolo_mode branch approves everything
@@ -2732,7 +2709,7 @@ pub fn printUsage(writer: anytype) !void {
         \\      --profile <name>
         \\      --approval-mode, --permission-mode <mode>
         \\                                  tiered-auto (default) | manual | strict | acceptEdits | plan |
-        \\                                  bypassPermissions | dontAsk | auto (degrades to tiered-auto)
+        \\                                  bypassPermissions | dontAsk | auto (approximated: no cloud classifier)
         \\      --dangerously-skip-permissions   Alias for -y/--yolo (Claude Code's own spelling)
         \\      --allow-dangerously-skip-permissions  Permit (but do not itself enable) bypassing permission checks
         \\      --sandbox <profile>         read-only | workspace-write | no-network | danger-full-access
@@ -3836,12 +3813,16 @@ test "cli-flags-01: --approval-mode bypassPermissions is unaffected by the permi
     try testing.expectEqualStrings("bypassPermissions", opts.approval_mode.?);
 }
 
-test "cli-flags-01: --permission-mode auto degrades to tiered-auto" {
+test "hooks-permissions-05: --permission-mode auto passes through as a first-class reference mode" {
+    // Superseded by hooks-permissions-05: `auto` is now a real (approximated)
+    // permission_decision.Mode, so it no longer degrades to "tiered-auto" --
+    // it round-trips like every other reference spelling (acceptEdits/plan/
+    // bypassPermissions/dontAsk).
     const allocator = testing.allocator;
     const argv = [_][]const u8{ "--permission-mode", "auto", "run", "x" };
     var opts = try parse(allocator, argv[0..]);
     defer opts.deinit(allocator);
-    try testing.expectEqualStrings("tiered-auto", opts.approval_mode.?);
+    try testing.expectEqualStrings("auto", opts.approval_mode.?);
 }
 
 test "cli-flags-02: --dangerously-skip-permissions behaves exactly like --yolo" {

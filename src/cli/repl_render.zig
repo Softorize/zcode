@@ -941,6 +941,13 @@ fn permissionModeChipText(buf: []u8, live_mode: permission_decision.Mode) []cons
         .acceptEdits => std.fmt.bufPrint(buf, "\xe2\x8f\xb5\xe2\x8f\xb5 accept edits on", .{}) catch "accept edits on",
         .plan => std.fmt.bufPrint(buf, "\xe2\x8f\xb8 plan mode on", .{}) catch "plan mode on",
         .bypassPermissions => std.fmt.bufPrint(buf, "\xe2\x8f\xb5\xe2\x8f\xb5 auto mode on", .{}) catch "auto mode on",
+        // hooks-permissions-05: the reference's sixth mode, distinct from the
+        // `bypassPermissions` chip above (whose text predates `.auto` and
+        // reuses "auto mode on" for an unrelated concept). Reference
+        // mode-metadata: `auto:{indicator:"auto mode",color:"warning"}` --
+        // used verbatim (no "on" suffix) so the two chips never read as the
+        // same mode.
+        .auto => std.fmt.bufPrint(buf, "\xe2\x8f\xb5\xe2\x8f\xb5 auto mode", .{}) catch "auto mode",
     };
 }
 
@@ -950,6 +957,10 @@ fn permissionModeChipTone(live_mode: permission_decision.Mode) FooterSegmentTone
         .acceptEdits => .accent,
         .plan => .dim,
         .bypassPermissions => .danger,
+        // hooks-permissions-05: reference color "warning" -- `.danger` is the
+        // closest existing footer tone (also used for bypassPermissions' own
+        // warning-colored chip).
+        .auto => .danger,
     };
 }
 
