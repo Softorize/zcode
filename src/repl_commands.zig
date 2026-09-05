@@ -1015,6 +1015,13 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return handleConfigCommand(allocator, runtime, command);
     }
 
+    // NOTE (commands-33 follow-up): the gap's acceptance test says "reported
+    // by /context/features", but /features is itself a zcode-only command
+    // intentionally short-circuited by removed_commands.isRemoved (it has no
+    // 2.1.261 counterpart -- see core/removed_commands.zig), so this branch
+    // is dead/unreachable code and is NOT a valid place to surface the
+    // auto-compact threshold; /context (below, not removed) is the one real
+    // surface and is where the threshold is actually exposed.
     if (std.mem.eql(u8, command, "/features")) {
         return @as(?[]u8, try feature_gates_mod.renderEffective(allocator, runtime.cfg));
     }
@@ -1743,6 +1750,18 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
     // flag owned by a different work package) -- use the in-process
     // env-override map as the session-scoped stand-in, same mechanism
     // /autocompact and /scroll-speed use.
+    //
+    // The reference restricts this investigation to allowedTools:
+    // ["Read","Grep","Glob"]. The prompt text alone is advisory -- the model
+    // could still call Edit/Write/Bash if they are offered. zcode's actual
+    // read-only-tools enforcement (agent_runtime.zig's
+    // `read_only_tools = effective_mode == .planning or effective_mode ==
+    // .review`, which drives agent_tools.filterReadOnlySchemas to strip
+    // write/exec tool schemas from what the model is offered) only engages in
+    // `.review`/`.planning` mode, so dispatch the investigation via
+    // handlePromptWithModeAndReporter(..., .review) -- exactly how /advisor
+    // and /security-review get real tool restriction -- rather than the
+    // `.execution`-mode runtime.handlePrompt.
     if (std.mem.eql(u8, command, "/debug") or std.mem.startsWith(u8, command, "/debug ")) {
         const issue = if (std.mem.startsWith(u8, command, "/debug "))
             std.mem.trim(u8, command["/debug ".len..], " \t")
@@ -1761,7 +1780,7 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
             .{issue},
         );
         defer allocator.free(prompt);
-        return @as(?[]u8, try runtime.handlePrompt(prompt));
+        return @as(?[]u8, try runtime.handlePromptWithModeAndReporter(prompt, null, .review));
     }
 
     // commands-28: reference /claude-api -- "Build and debug apps that use
@@ -1844,12 +1863,13 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
     // commands-21: reference /pause-memory (+ aliases /memory-pause,
     // /toggle-memory) -- "Pause automemory for this session". Also ships
     // hardcoded disabled for all 2.1.261 users (isEnabled:()=>!1), so this is
-    // treated as low priority: the session-scoped toggle itself is wired
-    // here (env-override, same mechanism as /autocompact); actually
-    // suppressing the automemory system-prompt section on the paused flag is
-    // a call-site change in core/memory_prompt.zig's callers (prompt_helpers
-    // / prompt_sections / prompt_engine / agent_runtime), none of which this
-    // package owns -- left as a follow-up for whichever package does.
+    // treated as low priority. The session-scoped toggle sets
+    // ZCODE_AUTOMEMORY_PAUSED via env-override (same mechanism as
+    // /autocompact); core/memory_gate.zig's isAutoMemoryEnabled() -- the
+    // single source of truth every automemory call site (taxonomy prompt,
+    // MEMORY.md index render, turn-end extraction) gates on -- consults this
+    // flag as its highest-priority check, so a subsequent turn genuinely
+    // omits the automemory system-prompt section while paused.
     if (std.mem.eql(u8, command, "/pause-memory") or std.mem.eql(u8, command, "/memory-pause") or std.mem.eql(u8, command, "/toggle-memory")) {
         if (env_mod.isEnvTruthy("ZCODE_AUTOMEMORY_PAUSED")) {
             try env_mod.setOverride("ZCODE_AUTOMEMORY_PAUSED", "");
@@ -8214,8 +8234,18 @@ fn renderStatusSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntim
 }
 
 fn handleContextCommand(allocator: std.mem.Allocator, runtime: *AgentRuntime) !?[]u8 {
-    _ = allocator;
-    return @as(?[]u8, try runtime.promptContextReport("(context diagnostic probe)"));
+    const inspection = try runtime.promptContextReport("(context diagnostic probe)");
+    // commands-33 (verifier follow-up): renderPromptInspection is a
+    // tool-schema/prompt-inspection report with no reference to the
+    // auto-compact threshold, so a /autocompact override was only ever
+    // confirmable by re-invoking /autocompact itself. Append the same
+    // autocompactReport() line /autocompact renders so the effective
+    // threshold -- including any session override -- is externally
+    // verifiable from /context too, without needing a second command.
+    const compact_line = try autocompactReport(allocator, runtime.cfg);
+    defer allocator.free(compact_line);
+    defer allocator.free(inspection);
+    return @as(?[]u8, try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ inspection, compact_line }));
 }
 
 /// commands-33: render the currently effective auto-compact threshold using
@@ -8990,6 +9020,26 @@ const RewindTestHarness = struct {
         self.allocator.free(self.sessions_dir);
         self.allocator.free(self.registry_path);
         self.allocator.destroy(self);
+    }
+
+    /// commands-29: point the runtime at the scripted mock provider (same
+    /// pattern as core/hooks_runtime_wire_test.zig's Harness.useMockProvider)
+    /// so a test can drive the real turn loop -- including the
+    /// read_only_tools gate -- without any network. `intent_reprompt_enabled`
+    /// is disabled so a plain no-tool-call answer ends the loop cleanly.
+    fn useMockProvider(self: *RewindTestHarness) !void {
+        self.allocator.free(self.runtime.active_provider);
+        self.runtime.active_provider = try self.allocator.dupe(u8, "mock");
+        self.allocator.free(self.runtime.active_model);
+        self.runtime.active_model = try self.allocator.dupe(u8, "mock-agent");
+        self.cfg.intent_reprompt_enabled = false;
+    }
+
+    fn historyContains(self: *RewindTestHarness, needle: []const u8) bool {
+        for (self.runtime.history.view()) |turn| {
+            if (std.mem.indexOf(u8, turn.content, needle) != null) return true;
+        }
+        return false;
     }
 };
 
@@ -10126,6 +10176,42 @@ test "commands-33: /autocompact with a non-numeric, non-auto argument returns us
     try testing.expect(std.mem.indexOf(u8, out.?, "usage: /autocompact") != null);
 }
 
+// commands-33 (verifier follow-up): the acceptance test asks that a new
+// /autocompact threshold be "visible reported by /context/features" --
+// externally verifiable without re-invoking /autocompact itself. /features
+// is a zcode-only command intentionally removed for parity (see the NOTE at
+// its dispatch site), so /context is the one real, reachable surface; prove
+// it reflects the session override.
+test "commands-33: /context surfaces the session /autocompact override" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+    defer env_mod.clearOverrides();
+
+    // Baseline: /context reports a threshold but no session override yet.
+    const context_before = try replCommandCallback(runtime, allocator, "/context");
+    try testing.expect(context_before != null);
+    defer allocator.free(context_before.?);
+    try testing.expect(std.mem.indexOf(u8, context_before.?, "auto-compact threshold:") != null);
+    try testing.expect(std.mem.indexOf(u8, context_before.?, "[session/env window override active]") == null);
+
+    // Set a session override via /autocompact (no restart).
+    const set_out = try replCommandCallback(runtime, allocator, "/autocompact 50000");
+    try testing.expect(set_out != null);
+    allocator.free(set_out.?);
+
+    // /context now reflects it -- verifiable without re-invoking /autocompact.
+    const context_after = try replCommandCallback(runtime, allocator, "/context");
+    try testing.expect(context_after != null);
+    defer allocator.free(context_after.?);
+    try testing.expect(std.mem.indexOf(u8, context_after.?, "[session/env window override active]") != null);
+}
+
 // ============================================================================
 // commands-18: /scroll-speed.
 // ============================================================================
@@ -10399,6 +10485,50 @@ test "commands-29: /debug <issue> enables logging and investigates with a read-o
     try testing.expect(out != null);
     defer allocator.free(out.?);
     try testing.expectEqualStrings("1", env_mod.getenv("ZCODE_DEBUG_SESSION").?);
+}
+
+// commands-29 (verifier follow-up): prove the read-only-tools restriction is
+// REAL enforcement, not just advisory prompt text. Drives /debug through the
+// actual turn loop with a scripted mock provider that tries to call the
+// mutating "Write" tool -- if /debug still ran in .execution mode this call
+// would succeed; because it now dispatches via
+// handlePromptWithModeAndReporter(..., .review), agent_runtime's
+// `read_only_tools = effective_mode != .execution` gate rejects it (both by
+// never offering Write's schema, and, defense-in-depth, by refusing the call
+// outright with "mutation tools are not allowed" if the model tries anyway).
+test "commands-29: /debug <issue> genuinely blocks a mutating tool call, not just advisory text" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    try h.useMockProvider();
+    const runtime = &h.runtime;
+    defer env_mod.clearOverrides();
+
+    // Script the mock model to try a mutating tool call first, then give a
+    // final answer with no further tool calls once it is rejected.
+    try env_mod.setOverride(
+        "ZCODE_MOCK_RESPONSES",
+        \\["{\"assistant\":\"I'll just fix it directly.\",\"tool_calls\":[{\"name\":\"Write\",\"args\":{\"path\":\"x.txt\",\"content\":\"patched\"}}]}","{\"assistant\":\"Investigation complete; here is what I found (read-only).\",\"tool_calls\":[]}"]
+    );
+
+    const out = try replCommandCallback(runtime, allocator, "/debug why does the parser crash");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+
+    // The mutation attempt must have been rejected by the read-only gate --
+    // proof the model was never actually allowed to write a file, not merely
+    // asked nicely not to.
+    try testing.expect(h.historyContains("mutation tools are not allowed"));
+
+    // Stronger, real-world proof: the Write tool call must never have
+    // actually executed -- the target file was never created on disk.
+    const written_path = try std.fs.path.join(allocator, &.{ h.cwd, "x.txt" });
+    defer allocator.free(written_path);
+    try testing.expect(!rewindTestFileExists(written_path));
 }
 
 test "commands-28: /claude-api dispatches an inline prompt scoped to platform.claude.com" {
