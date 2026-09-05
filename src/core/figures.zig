@@ -114,6 +114,19 @@ pub const WARNING: []const u8 = "\xe2\x9a\xa0";
 /// centers better in the typical terminal font.
 pub const RECORD: []const u8 = "\xe2\x8f\xba";
 
+/// ⎿ U+23BF SQUARE FOOT -- the reference's flat tool-result connector.
+/// Rendered as "  ⎿  <dim result>" beneath a "⏺ Tool(args)" call line
+/// (repl-ux-02); zcode's card renderer used a bordered rail instead.
+pub const CONNECTOR: []const u8 = "\xe2\x8e\xbf";
+
+/// Tool-call bullet glyph, OS-aware to match the reference exactly
+/// (cc_strings.txt: `Ar=P()==="macos"?"⏺":"●"`): RECORD (⏺) renders
+/// with better vertical centering in macOS's default terminal fonts;
+/// BLACK_CIRCLE (●) is the portable fallback used everywhere else.
+pub fn toolCallGlyph() []const u8 {
+    return if (@import("builtin").os.tag == .macos) RECORD else BLACK_CIRCLE;
+}
+
 /// ⚑ U+2691 BLACK FLAG -- issue flag banner. Claude Code uses
 /// this in the ultrareview status widget to mark a task that a
 /// reviewer flagged for attention.

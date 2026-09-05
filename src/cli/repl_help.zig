@@ -104,7 +104,9 @@ const modes_and_plans = [_]HelpEntry{
     .{ .usage = "/mode [name]", .desc = "Show or set mode (execution|planning|brainstorm|review)" },
     .{ .usage = "/density [full|clean]", .desc = "Show or set fullscreen UI density" },
     .{ .usage = "/brief", .desc = "Toggle brief mode for the fullscreen transcript" },
+    .{ .usage = "/focus", .desc = "Toggle focus view: just the recent exchange, not the full scrollback" },
     .{ .usage = "/vim", .desc = "Toggle vim editing for the fullscreen prompt" },
+    .{ .usage = "/tui [default|fullscreen]", .desc = "Show or report the terminal UI renderer" },
     .{ .usage = "/plan <action>", .desc = "Plan actions: approve | discuss | cancel" },
     .{ .usage = "/approve-plan", .desc = "Alias for /plan approve" },
     .{ .usage = "/yolo", .desc = "Open the auto-mode dialog (fullscreen) or toggle YOLO inline" },
@@ -400,14 +402,34 @@ pub fn writeKeysScreen(writer: anytype, use_color: bool) !void {
 /// command names stay default weight, and descriptions dim to secondary.
 /// When false, output is pure ASCII/UTF-8 with no escape sequences so it
 /// composes safely into the scrollable transcript or into pipes.
+/// repl-ux-06: zcode's own rendering of the reference's General tab body
+/// ("Claude understands your codebase, makes edits with your permission,
+/// and executes commands -- right from your terminal.", cc_strings.txt,
+/// immediately followed by a bold "Shortcuts" heading) -- reworded to say
+/// zcode instead of pasting the Anthropic-authored sentence verbatim.
+const HELP_INTRO = "zcode understands your codebase, makes edits with your permission, and executes commands -- right from your terminal.";
+
+/// repl-ux-06: mirrors the reference's closing "For more help:" + docs
+/// link row (cc_strings.txt: "For more help:" -> Link to
+/// https://code.claude.com/docs/en/overview) with zcode's own project
+/// home, since zcode has no hosted docs site of its own yet.
+const HELP_DOCS_URL = "https://github.com/Softorize/zcode";
+
 pub fn writeHelpScreen(writer: anytype, use_color: bool) !void {
     try writeHelpHeader(writer, use_color, "zcode commands", "grouped by topic");
+    if (use_color) {
+        try writer.print("  {s}{s}{s}\n", .{ ANSI_DIM, HELP_INTRO, ANSI_RESET });
+    } else {
+        try writer.print("  {s}\n", .{HELP_INTRO});
+    }
     try writeHelpGroups(writer, GROUPS[0..], use_color);
 
     if (use_color) {
-        try writer.print("\n  {s}Any other input runs an agent turn.{s}\n\n", .{ ANSI_DIM, ANSI_RESET });
+        try writer.print("\n  {s}Any other input runs an agent turn.{s}\n", .{ ANSI_DIM, ANSI_RESET });
+        try writer.print("  {s}For more help: {s}{s}\n\n", .{ ANSI_DIM, HELP_DOCS_URL, ANSI_RESET });
     } else {
-        try writer.writeAll("\n  Any other input runs an agent turn.\n\n");
+        try writer.writeAll("\n  Any other input runs an agent turn.\n");
+        try writer.print("  For more help: {s}\n\n", .{HELP_DOCS_URL});
     }
 }
 
@@ -604,6 +626,17 @@ pub fn buildKeysPlaintext(allocator: std.mem.Allocator) ![]u8 {
 }
 
 const testing = std.testing;
+
+test "help plaintext opens with the app description and closes with a docs link" {
+    const plaintext = try buildPlaintext(testing.allocator);
+    defer testing.allocator.free(plaintext);
+
+    try testing.expect(std.mem.indexOf(u8, plaintext, "understands your codebase, makes edits with your permission") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "For more help:") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "https://github.com/Softorize/zcode") != null);
+    // The description names zcode, never Claude Code / Anthropic.
+    try testing.expect(std.mem.indexOf(u8, plaintext, "Claude") == null);
+}
 
 test "help groups cover core commands" {
     const plaintext = try buildPlaintext(testing.allocator);

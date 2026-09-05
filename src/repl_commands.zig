@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const repl = @import("cli/repl.zig");
+const repl_render_mod = @import("cli/repl_render.zig");
 const agents_mod = @import("core/agents.zig");
 const commands_mod = @import("core/commands.zig");
 const config_mod = @import("core/config.zig");
@@ -963,7 +964,16 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try handleColorPalette(allocator, runtime.store, runtime.session_id, arg));
     }
 
+    // repl-ux-07: bare /status is now the human-readable sectioned panel
+    // (renderStatusSectionedText), mirroring the reference's Settings
+    // dialog on its "Status" tab (named property groups, Title-Case
+    // "Label: value" rows) instead of a raw snake_case key=value dump.
+    // The old dump is kept verbatim behind `/status raw` for scripting.
     if (std.mem.eql(u8, command, "/status")) {
+        return @as(?[]u8, try renderStatusSectionedText(allocator, runtime));
+    }
+
+    if (std.mem.eql(u8, command, "/status raw")) {
         const metrics = runtime.statusMetrics();
         var out = std_io.StringBuilder.init(allocator);
         errdefer out.deinit();
@@ -4463,6 +4473,10 @@ fn renderSessionsOverlayData(allocator: std.mem.Allocator, runtime: *AgentRuntim
         // cleanup loop frees them uniformly.
         branch: []const u8,
         first_prompt: []const u8,
+        // sessions-storage-05: message count, matching the reference
+        // picker's always-present "age · branch · N messages" second line
+        // (edualc format.ts:203-231 formatLogMetadata).
+        message_count: usize,
     };
     const Payload = struct {
         initial_selection: usize,
@@ -4504,6 +4518,7 @@ fn renderSessionsOverlayData(allocator: std.mem.Allocator, runtime: *AgentRuntim
         const fp_opt = runtime.store.readFirstPrompt(entry.id) catch null;
         const fp_owned = fp_opt orelse try allocator.dupe(u8, "");
         errdefer allocator.free(fp_owned);
+        const message_count = if (runtime.store.countTurns(entry.id)) |counts| counts.total else |_| 0;
         items[idx] = .{
             .id = entry.id,
             .label = title,
@@ -4511,6 +4526,7 @@ fn renderSessionsOverlayData(allocator: std.mem.Allocator, runtime: *AgentRuntim
             .is_current = std.mem.eql(u8, entry.id, runtime.session_id),
             .branch = branch_owned,
             .first_prompt = fp_owned,
+            .message_count = message_count,
         };
         if (items[idx].is_current) current_index = idx;
     }
@@ -7535,9 +7551,14 @@ fn handleConfigCommand(allocator: std.mem.Allocator, runtime: *AgentRuntime, com
     const args_raw = if (command.len > "/config".len) command["/config".len..] else "";
     const args = std.mem.trim(u8, args_raw, " \t");
 
-    // /config -- show all
+    // /config -- show all. repl-ux-07: prefix with the same "zcode
+    // <name>" title row /status now opens with (renderStatusSectionedText)
+    // so the two commands visibly share one panel heading style, mirroring
+    // the reference's single Settings dialog on two different default tabs.
     if (args.len == 0) {
-        return @as(?[]u8, try runtime.cfg.renderAll(allocator));
+        const raw = try runtime.cfg.renderAll(allocator);
+        defer allocator.free(raw);
+        return @as(?[]u8, try std.fmt.allocPrint(allocator, "\nzcode config\n\n{s}", .{raw}));
     }
 
     // /config set <key> <value>
@@ -7624,6 +7645,90 @@ fn handlePromptInspectCommand(allocator: std.mem.Allocator, runtime: *AgentRunti
         .summary = summary,
         .include_prompt_packets = include_prompt_packets and !summary,
     }));
+}
+
+/// repl-ux-07: render `/status` as a sectioned, Title-Case panel via the
+/// shared `repl_render.renderStatusPanel` surface, instead of the raw
+/// snake_case `key={value}` dump (still available verbatim via
+/// `/status raw` for scripting). Groups mirror the reference's named
+/// Settings property builders (Version, Model, Safety, Provider,
+/// Preprocessor, UI, Session) without claiming to be Claude Code.
+fn renderStatusSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const boolStr = struct {
+        fn f(v: bool) []const u8 {
+            return if (v) "true" else "false";
+        }
+    }.f;
+    const numStr = struct {
+        fn f(a: std.mem.Allocator, v: anytype) []const u8 {
+            return std.fmt.allocPrint(a, "{d}", .{v}) catch "?";
+        }
+    }.f;
+
+    const metrics = runtime.statusMetrics();
+    const pre_settings = runtime.resolvedPreprocessorSettings();
+
+    const version_fields = [_]repl_render_mod.StatusField{
+        .{ .label = "Version", .value = build_options.app_version },
+    };
+    const model_fields = [_]repl_render_mod.StatusField{
+        .{ .label = "Provider", .value = runtime.active_provider },
+        .{ .label = "Model", .value = runtime.active_model },
+        .{ .label = "Active Agent", .value = runtime.activeAgentName() orelse "<none>" },
+        .{ .label = "Default Provider", .value = runtime.cfg.default_provider },
+        .{ .label = "Default Model", .value = runtime.cfg.default_model },
+        .{ .label = "Fallback Provider", .value = agent_runtime.displayValueOr(runtime.cfg.fallback_provider, "<none>") },
+        .{ .label = "Fallback Model", .value = agent_runtime.displayValueOr(runtime.cfg.fallback_model, "<none>") },
+    };
+    const safety_fields = [_]repl_render_mod.StatusField{
+        .{ .label = "Approval Mode", .value = runtime.cfg.approval_mode },
+        .{ .label = "Sandbox", .value = runtime.cfg.sandbox },
+        .{ .label = "Strict", .value = boolStr(runtime.strict) },
+        .{ .label = "Yolo Mode", .value = boolStr(runtime.yolo_mode) },
+    };
+    const provider_fields = [_]repl_render_mod.StatusField{
+        .{ .label = "Base URL", .value = agent_runtime.displayValueOr(runtime.cfg.provider_base_url, "<env/default>") },
+        .{ .label = "API Key Configured", .value = boolStr(runtime.cfg.provider_api_key.len > 0) },
+        .{ .label = "Timeout (ms)", .value = numStr(arena, runtime.cfg.provider_timeout_ms) },
+        .{ .label = "Retry Count", .value = numStr(arena, runtime.cfg.provider_retry_count) },
+    };
+    const preprocessor_fields = [_]repl_render_mod.StatusField{
+        .{ .label = "Enabled", .value = boolStr(runtime.preprocessor_enabled) },
+        .{ .label = "Provider", .value = agent_runtime.displayValueOr(pre_settings.provider, "<none>") },
+        .{ .label = "Model", .value = agent_runtime.displayValueOr(pre_settings.model, "<none>") },
+    };
+    const ui_fields = [_]repl_render_mod.StatusField{
+        .{ .label = "Fullscreen", .value = boolStr(runtime.cfg.ui_fullscreen) },
+        .{ .label = "Theme", .value = runtime.cfg.ui_theme },
+        .{ .label = "Color", .value = boolStr(runtime.cfg.ui_color_enabled) },
+        .{ .label = "Vim Mode", .value = boolStr(runtime.cfg.ui_vim_mode) },
+        .{ .label = "Brief Mode", .value = boolStr(runtime.cfg.ui_brief_mode) },
+    };
+    const session_fields = [_]repl_render_mod.StatusField{
+        .{ .label = "Last Prompt Tokens", .value = numStr(arena, metrics.last_prompt_tokens) },
+        .{ .label = "Total Input Tokens", .value = numStr(arena, metrics.total_input_tokens) },
+        .{ .label = "Total Output Tokens", .value = numStr(arena, metrics.total_output_tokens) },
+    };
+
+    const sections = [_]repl_render_mod.StatusSection{
+        .{ .title = "Version", .fields = version_fields[0..] },
+        .{ .title = "Model", .fields = model_fields[0..] },
+        .{ .title = "Safety", .fields = safety_fields[0..] },
+        .{ .title = "Provider", .fields = provider_fields[0..] },
+        .{ .title = "Preprocessor", .fields = preprocessor_fields[0..] },
+        .{ .title = "UI", .fields = ui_fields[0..] },
+        .{ .title = "Session", .fields = session_fields[0..] },
+    };
+
+    var out = std_io.StringBuilder.init(allocator);
+    errdefer out.deinit();
+    try repl_render_mod.renderStatusPanel(out.writer(), "zcode status", sections[0..], runtime.cfg.ui_color_enabled);
+    try out.writer().writeAll("(full machine-readable dump: /status raw)\n");
+    return out.toOwnedSlice();
 }
 
 fn handleContextCommand(allocator: std.mem.Allocator, runtime: *AgentRuntime) !?[]u8 {
@@ -8489,6 +8594,95 @@ test "/rewind conversation-only leaves the working tree untouched" {
     const final = try std.Io.Dir.cwd().readFileAlloc(@import("zcode_runtime").io, sentinel, allocator, .limited(1024));
     defer allocator.free(final);
     try testing.expectEqualStrings("keep me\n", final);
+}
+
+test "__sessions_overlay_data includes message_count for the session switcher (sessions-storage-05)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    try runtime.history.append(runtime.session_id, .user, "first prompt");
+    try runtime.history.append(runtime.session_id, .assistant, "first answer");
+    try runtime.store.appendTurn(runtime.session_id, .user, "first prompt", "turn-1");
+    try runtime.store.appendTurn(runtime.session_id, .assistant, "first answer", "turn-2");
+
+    const out = try replCommandCallback(runtime, allocator, "__sessions_overlay_data");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "\"message_count\"") != null);
+}
+
+test "/status renders a sectioned Title-Case panel, not a snake_case dump" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/status");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+
+    try testing.expect(std.mem.indexOf(u8, out.?, "Version") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "Provider:") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "/status raw") != null);
+    // No leftover snake_case dump keys on the human-readable path.
+    try testing.expect(std.mem.indexOf(u8, out.?, "provider=") == null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "ui_status_show_workspace=") == null);
+}
+
+test "/status raw preserves the original snake_case key=value dump for scripting" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/status raw");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "provider=") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "ui_status_show_workspace=") != null);
+}
+
+test "bare /config shares the /status panel heading style" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const status_out = try replCommandCallback(runtime, allocator, "/status");
+    try testing.expect(status_out != null);
+    defer allocator.free(status_out.?);
+    const config_out = try replCommandCallback(runtime, allocator, "/config");
+    try testing.expect(config_out != null);
+    defer allocator.free(config_out.?);
+
+    try testing.expect(std.mem.indexOf(u8, status_out.?, "zcode status") != null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "zcode config") != null);
 }
 
 test "bare /btw returns the usage string and leaves history untouched" {
