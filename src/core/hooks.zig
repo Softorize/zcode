@@ -97,36 +97,77 @@ pub const HookContext = struct {
     // payload as `task_id`/`task_subject`; the matcher tests against the subject.
     task_id: []const u8 = "",
     task_subject: []const u8 = "",
+    // hooks-permissions-10: Notification's required, separate category field
+    // (distinct from `message`, the free-text body). See hook_io.LifecycleFields'
+    // doc comment.
+    notification_type: []const u8 = "",
+    // hooks-permissions-09: the reference's always-present base fields (`Se`
+    // schema: session_id/transcript_path/permission_mode/agent_id/prompt_id on
+    // EVERY hook call). Populated by the two owned emission-point files
+    // (agent_runtime.zig / agent_tools.zig); every other caller (including
+    // every pre-existing test) leaves these at their zero value, which
+    // `hook_io.writeBaseFields` treats as "omit the field" so no existing
+    // payload shape changes.
+    session_id: []const u8 = "",
+    transcript_path: []const u8 = "",
+    permission_mode: []const u8 = "",
+    agent_id: []const u8 = "",
+    prompt_id: []const u8 = "",
+    // hooks-permissions-09: per-event tool extensions. `tool_use_id` is
+    // documented on every tool-shaped event (pre/post/post-failure/
+    // permission-request/permission-denied); `duration_ms` on
+    // post-tool-use/post-tool-use-failure only (the caller simply never sets
+    // it for other events).
+    tool_use_id: []const u8 = "",
+    duration_ms: ?u64 = null,
 };
 
-/// True for the 3 tool events that have an on-disk `.sh` file form and a
-/// `tool_name`/`tool_args` payload. Everything else is a non-tool lifecycle
-/// event that dispatches purely via settings.json and matches on a single
+/// True for the tool-shaped events: the 3 original events with an on-disk
+/// `.sh` file form and a `tool_name`/`tool_args` payload, plus (hooks-
+/// permissions-01) `PermissionRequest`/`PermissionDenied`, which the
+/// reference documents as matching on "Tool name" exactly like PreToolUse/
+/// PostToolUse (bundled hooks doc table) even though they have no on-disk
+/// file form of their own. Everything else is a non-tool lifecycle event
+/// that dispatches purely via settings.json and matches on a single
 /// discriminating field instead of a tool name.
 fn isToolEvent(event: HookEvent) bool {
     return switch (event) {
-        .pre_tool_use, .post_tool_use, .post_tool_use_failure => true,
+        .pre_tool_use, .post_tool_use, .post_tool_use_failure, .permission_request, .permission_denied => true,
         else => false,
     };
 }
 
 /// The single field value a non-tool event's `matcher` is tested against
 /// (`hook_matcher.matchesField`). SessionStart matches its `source`,
-/// UserPromptSubmit its `prompt`, Notification its `message`, PreCompact its
-/// `trigger`, SessionEnd its `reason`. Events without a meaningful
-/// discriminator return "" (which `matchesField` treats as "match unless the
-/// matcher is a concrete value").
+/// UserPromptSubmit its `prompt`, Notification its `notification_type`
+/// (hooks-permissions-10 -- the reference's documented matcher target, not
+/// the free-text `message`), PreCompact its `trigger`, SessionEnd its
+/// `reason`. Events without a meaningful discriminator return "" (which
+/// `matchesField` treats as "match unless the matcher is a concrete value").
 fn matchFieldFor(ctx: HookContext) []const u8 {
     return switch (ctx.event) {
         .session_start => ctx.source,
         .user_prompt_submit => ctx.prompt,
-        .notification => ctx.message,
+        .notification => ctx.notification_type,
         .pre_compact => ctx.trigger,
         .session_end => ctx.reason,
         // TaskCreated / TaskCompleted match against the task subject so a hook
         // can scope itself with a matcher (swarm-tasks-15).
         .task_created, .task_completed => ctx.task_subject,
         else => "",
+    };
+}
+
+/// hooks-permissions-09: assemble `ctx`'s always-present base fields into the
+/// shape both builders share. Shared by the tool and lifecycle branches below
+/// so the two payload shapes stay in sync.
+fn baseFieldsFor(ctx: HookContext) hook_io.HookBaseFields {
+    return .{
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .permission_mode = ctx.permission_mode,
+        .agent_id = ctx.agent_id,
+        .prompt_id = ctx.prompt_id,
     };
 }
 
@@ -138,12 +179,30 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
     if (isToolEvent(ctx.event)) {
         // PostToolUse / PostToolUseFailure carry the tool's response on stdin so
         // hooks can inspect it (reference: hooks.ts:3465 `tool_response`). PreToolUse
-        // has no response yet, so pass null (no `tool_response` field emitted).
+        // (and PermissionRequest/PermissionDenied, which fire before/without a
+        // tool result) have no response yet, so pass null.
         const response: ?[]const u8 = switch (ctx.event) {
             .post_tool_use, .post_tool_use_failure => ctx.tool_output,
             else => null,
         };
-        return hook_io.buildToolEventPayloadFull(allocator, name, ctx.tool_name, ctx.tool_args, ctx.cwd, response, ctx.tool_success);
+        // hooks-permissions-09: duration_ms is documented only for
+        // PostToolUse/PostToolUseFailure ("Tool execution time in
+        // milliseconds"); every other tool-shaped event never sets it.
+        const duration_ms: ?u64 = switch (ctx.event) {
+            .post_tool_use, .post_tool_use_failure => ctx.duration_ms,
+            else => null,
+        };
+        return hook_io.buildToolEventPayloadFull(
+            allocator,
+            name,
+            ctx.tool_name,
+            ctx.tool_args,
+            ctx.cwd,
+            response,
+            ctx.tool_success,
+            baseFieldsFor(ctx),
+            .{ .tool_use_id = ctx.tool_use_id, .reason = ctx.reason, .duration_ms = duration_ms },
+        );
     }
     var fields: hook_io.LifecycleFields = .{};
     switch (ctx.event) {
@@ -152,6 +211,7 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
         .notification => {
             fields.message = nonEmptyOrNull(ctx.message);
             fields.title = nonEmptyOrNull(ctx.title);
+            fields.notification_type = nonEmptyOrNull(ctx.notification_type);
         },
         .pre_compact => fields.trigger = nonEmptyOrNull(ctx.trigger),
         .session_end => fields.reason = nonEmptyOrNull(ctx.reason),
@@ -161,7 +221,7 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
         },
         else => {},
     }
-    return hook_io.buildLifecycleEventPayload(allocator, name, ctx.cwd, fields);
+    return hook_io.buildLifecycleEventPayload(allocator, name, ctx.cwd, fields, baseFieldsFor(ctx));
 }
 
 fn nonEmptyOrNull(s: []const u8) ?[]const u8 {

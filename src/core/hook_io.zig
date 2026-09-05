@@ -50,11 +50,50 @@ pub const Result = struct {
     }
 };
 
+/// hooks-permissions-09: base fields the reference's shared `Se` zod schema
+/// puts on EVERY hook invocation, tool or lifecycle alike -- `session_id`,
+/// `transcript_path`, `permission_mode`, `agent_id`, `prompt_id` (the
+/// reference also carries `agent_type`/`effort`, not modeled here: zcode has
+/// no reference-shaped agent-type/effort-tag to surface at the hook layer
+/// yet). An empty string means "the caller had nothing to report" and the
+/// field is omitted entirely, not emitted as `""`, so a hook script's
+/// `.session_id // empty` idiom sees an absent key rather than a blank one.
+pub const HookBaseFields = struct {
+    session_id: []const u8 = "",
+    transcript_path: []const u8 = "",
+    permission_mode: []const u8 = "",
+    agent_id: []const u8 = "",
+    prompt_id: []const u8 = "",
+};
+
+fn writeBaseFields(w: anytype, base: HookBaseFields) !void {
+    if (base.session_id.len > 0) try w.print(",\"session_id\":{f}", .{std.json.fmt(base.session_id, .{})});
+    if (base.transcript_path.len > 0) try w.print(",\"transcript_path\":{f}", .{std.json.fmt(base.transcript_path, .{})});
+    if (base.prompt_id.len > 0) try w.print(",\"prompt_id\":{f}", .{std.json.fmt(base.prompt_id, .{})});
+    if (base.permission_mode.len > 0) try w.print(",\"permission_mode\":{f}", .{std.json.fmt(base.permission_mode, .{})});
+    if (base.agent_id.len > 0) try w.print(",\"agent_id\":{f}", .{std.json.fmt(base.agent_id, .{})});
+}
+
+/// hooks-permissions-09: per-event extensions layered on top of the tool-event
+/// base shape. `tool_use_id` is documented on PreToolUse/PostToolUse/
+/// PostToolUseFailure/PermissionRequest/PermissionDenied; `duration_ms` on
+/// PostToolUse/PostToolUseFailure ("Tool execution time in milliseconds");
+/// `reason` on PermissionDenied (and doubles, harmlessly, for any other tool
+/// event a caller chooses to attach one to -- extra JSON keys are inert to a
+/// hook that does not look for them).
+pub const ToolEventExtra = struct {
+    tool_use_id: []const u8 = "",
+    reason: []const u8 = "",
+    duration_ms: ?u64 = null,
+};
+
 /// Build the stdin JSON for a tool event. `tool_input_raw` is embedded as a JSON
 /// value when it is itself valid JSON, otherwise as a JSON string.
 ///
-/// Backward-compatible 5-arg form: emits only `tool_input` (no `tool_response`).
-/// Use `buildToolEventPayloadFull` to also embed the PostToolUse response.
+/// Backward-compatible 5-arg form: emits only `tool_input` (no `tool_response`,
+/// no base/extra fields).
+/// Use `buildToolEventPayloadFull` to also embed the PostToolUse response and
+/// the reference's base/per-event fields.
 pub fn buildToolEventPayload(
     allocator: std.mem.Allocator,
     event_name: []const u8,
@@ -62,7 +101,7 @@ pub fn buildToolEventPayload(
     tool_input_raw: []const u8,
     cwd: []const u8,
 ) ![]u8 {
-    return buildToolEventPayloadFull(allocator, event_name, tool_name, tool_input_raw, cwd, null, true);
+    return buildToolEventPayloadFull(allocator, event_name, tool_name, tool_input_raw, cwd, null, true, .{}, .{});
 }
 
 /// Build the stdin JSON for a tool event, optionally embedding the tool response.
@@ -73,6 +112,13 @@ pub fn buildToolEventPayload(
 /// `"is_interrupt"`/`"is_timeout"` flags are emitted (`success == false` implies
 /// the call failed; interrupt/timeout are not separately tracked here so both
 /// default to false).
+///
+/// `base` (hooks-permissions-09) carries the reference's always-present
+/// session_id/transcript_path/permission_mode/agent_id/prompt_id fields; `extra`
+/// carries the tool-event-specific tool_use_id/reason/duration_ms. Both are
+/// emitted only when non-empty/non-null so a caller with nothing to report
+/// (e.g. a test building a bare payload) produces the same JSON shape as before
+/// this field set was added.
 pub fn buildToolEventPayloadFull(
     allocator: std.mem.Allocator,
     event_name: []const u8,
@@ -81,6 +127,8 @@ pub fn buildToolEventPayloadFull(
     cwd: []const u8,
     tool_response: ?[]const u8,
     success: bool,
+    base: HookBaseFields,
+    extra: ToolEventExtra,
 ) ![]u8 {
     var builder = sb.StringBuilder.init(allocator);
     defer builder.deinit();
@@ -117,6 +165,11 @@ pub fn buildToolEventPayloadFull(
     }
     _ = success;
 
+    try writeBaseFields(w, base);
+    if (extra.tool_use_id.len > 0) try w.print(",\"tool_use_id\":{f}", .{std.json.fmt(extra.tool_use_id, .{})});
+    if (extra.reason.len > 0) try w.print(",\"reason\":{f}", .{std.json.fmt(extra.reason, .{})});
+    if (extra.duration_ms) |d| try w.print(",\"duration_ms\":{d}", .{d});
+
     try w.writeAll("}");
     return allocator.dupe(u8, builder.items());
 }
@@ -135,17 +188,31 @@ pub const LifecycleFields = struct {
     // the task it is gating (swarm-tasks-15). Emitted as `task_id`/`task_subject`.
     task_id: ?[]const u8 = null,
     task_subject: ?[]const u8 = null,
+    // hooks-permissions-10: Notification's required, separate category field
+    // (reference `xoe` schema: `{hook_event_name:"Notification", message,
+    // title?, notification_type}`). Distinct from the free-text `message` --
+    // this is what a `"matcher":"idle"`-style Notification hook actually
+    // matches against.
+    notification_type: ?[]const u8 = null,
 };
 
 /// Build the stdin JSON for a non-tool lifecycle event (SessionStart,
 /// UserPromptSubmit, Stop, SessionEnd, PreCompact, Notification, ...). Always
-/// includes `hook_event_name` and `cwd`; emits only the `fields` that are set.
-/// String values are JSON-escaped via `std.json.fmt`, matching the tool builder.
+/// includes `hook_event_name` and `cwd`; emits only the `fields` that are set,
+/// plus the reference's always-present `base` fields (hooks-permissions-09;
+/// see `HookBaseFields`), also emitted only when non-empty. String values are
+/// JSON-escaped via `std.json.fmt`, matching the tool builder.
+///
+/// Backward-compatible 4-arg call sites (every pre-existing caller/test) keep
+/// compiling unchanged by passing `.{}` for `base` -- see the 4-arg forwarding
+/// note is unnecessary here since Zig requires the argument explicitly; test
+/// call sites were updated alongside this signature change.
 pub fn buildLifecycleEventPayload(
     allocator: std.mem.Allocator,
     event_name: []const u8,
     cwd: []const u8,
     fields: LifecycleFields,
+    base: HookBaseFields,
 ) ![]u8 {
     var builder = sb.StringBuilder.init(allocator);
     defer builder.deinit();
@@ -163,6 +230,8 @@ pub fn buildLifecycleEventPayload(
     if (fields.reason) |v| try w.print(",\"reason\":{f}", .{std.json.fmt(v, .{})});
     if (fields.task_id) |v| try w.print(",\"task_id\":{f}", .{std.json.fmt(v, .{})});
     if (fields.task_subject) |v| try w.print(",\"task_subject\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.notification_type) |v| try w.print(",\"notification_type\":{f}", .{std.json.fmt(v, .{})});
+    try writeBaseFields(w, base);
     try w.writeAll("}");
     return allocator.dupe(u8, builder.items());
 }
@@ -344,6 +413,8 @@ test "buildToolEventPayloadFull PostToolUse embeds json tool_response as object"
         "/repo",
         "{\"success\":true,\"bytes\":42}",
         true,
+        .{},
+        .{},
     );
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
@@ -365,6 +436,8 @@ test "buildToolEventPayloadFull PostToolUse embeds plain-string tool_response as
         "/repo",
         "drwxr-xr-x  total 0",
         true,
+        .{},
+        .{},
     );
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
@@ -381,6 +454,8 @@ test "buildToolEventPayloadFull PostToolUseFailure embeds error and interrupt fl
         "/repo",
         "command failed",
         false,
+        .{},
+        .{},
     );
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
@@ -401,6 +476,8 @@ test "buildToolEventPayloadFull PreToolUse with null response omits tool_respons
         "/repo",
         null,
         true,
+        .{},
+        .{},
     );
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
@@ -420,7 +497,7 @@ test "buildToolEventPayload 5-arg form still omits tool_response" {
 }
 
 test "buildLifecycleEventPayload SessionStart includes source not tool_name" {
-    const p = try buildLifecycleEventPayload(testing.allocator, "SessionStart", "/repo", .{ .source = "startup" });
+    const p = try buildLifecycleEventPayload(testing.allocator, "SessionStart", "/repo", .{ .source = "startup" }, .{});
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
     defer parsed.deinit();
@@ -432,8 +509,78 @@ test "buildLifecycleEventPayload SessionStart includes source not tool_name" {
     try testing.expect(parsed.value.object.get("prompt") == null);
 }
 
+test "hooks-permissions-09: buildToolEventPayloadFull emits base fields and tool_use_id/duration_ms when set" {
+    const p = try buildToolEventPayloadFull(
+        testing.allocator,
+        "PostToolUse",
+        "Bash",
+        "{\"command\":\"ls\"}",
+        "/repo",
+        "ok",
+        true,
+        .{ .session_id = "sess-1", .transcript_path = "/repo/.zcode/sessions/sess-1.jsonl", .permission_mode = "acceptEdits", .agent_id = "agent-2", .prompt_id = "prompt-3" },
+        .{ .tool_use_id = "tu-1", .duration_ms = 42 },
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("sess-1", parsed.value.object.get("session_id").?.string);
+    try testing.expectEqualStrings("/repo/.zcode/sessions/sess-1.jsonl", parsed.value.object.get("transcript_path").?.string);
+    try testing.expectEqualStrings("acceptEdits", parsed.value.object.get("permission_mode").?.string);
+    try testing.expectEqualStrings("agent-2", parsed.value.object.get("agent_id").?.string);
+    try testing.expectEqualStrings("prompt-3", parsed.value.object.get("prompt_id").?.string);
+    try testing.expectEqualStrings("tu-1", parsed.value.object.get("tool_use_id").?.string);
+    try testing.expectEqual(@as(i64, 42), parsed.value.object.get("duration_ms").?.integer);
+}
+
+test "hooks-permissions-09: empty base/extra fields are omitted, not emitted blank" {
+    const p = try buildToolEventPayloadFull(testing.allocator, "PreToolUse", "Bash", "ls", "/repo", null, true, .{}, .{});
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("session_id") == null);
+    try testing.expect(parsed.value.object.get("transcript_path") == null);
+    try testing.expect(parsed.value.object.get("permission_mode") == null);
+    try testing.expect(parsed.value.object.get("agent_id") == null);
+    try testing.expect(parsed.value.object.get("prompt_id") == null);
+    try testing.expect(parsed.value.object.get("tool_use_id") == null);
+    try testing.expect(parsed.value.object.get("reason") == null);
+    try testing.expect(parsed.value.object.get("duration_ms") == null);
+}
+
+test "hooks-permissions-09: buildLifecycleEventPayload emits base fields alongside lifecycle fields" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "UserPromptSubmit",
+        "/repo",
+        .{ .prompt = "do the thing" },
+        .{ .session_id = "sess-9", .permission_mode = "plan" },
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("do the thing", parsed.value.object.get("prompt").?.string);
+    try testing.expectEqualStrings("sess-9", parsed.value.object.get("session_id").?.string);
+    try testing.expectEqualStrings("plan", parsed.value.object.get("permission_mode").?.string);
+}
+
+test "hooks-permissions-10: buildLifecycleEventPayload emits notification_type" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "Notification",
+        "/repo",
+        .{ .message = "idle for a while", .notification_type = "idle" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("idle for a while", parsed.value.object.get("message").?.string);
+    try testing.expectEqualStrings("idle", parsed.value.object.get("notification_type").?.string);
+}
+
 test "buildLifecycleEventPayload UserPromptSubmit emits prompt only" {
-    const p = try buildLifecycleEventPayload(testing.allocator, "UserPromptSubmit", "/repo", .{ .prompt = "do the thing" });
+    const p = try buildLifecycleEventPayload(testing.allocator, "UserPromptSubmit", "/repo", .{ .prompt = "do the thing" }, .{});
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
     defer parsed.deinit();

@@ -366,6 +366,36 @@ const McpInstructionDelta = struct {
     removed_count: usize = 0,
 };
 
+/// config-layout-missed-148: the CLI-flag-vs-settings.json precedence for
+/// `AgentRuntime.permission_mode_override`'s initial value, factored out as a
+/// pure function (no IO) so the precedence itself is unit-testable without a
+/// full `AgentRuntime` (whose settings.json reads are unconditionally skipped
+/// under the test binary -- see the `is_test` guard at the one call site).
+///
+/// `cfg_approval_mode` is `cfg.approval_mode` (`Config.approval_mode`): it
+/// only ever holds a reference mode spelling (acceptEdits/plan/
+/// bypassPermissions/dontAsk/auto/default) when the user passed
+/// `--approval-mode`/`--permission-mode` with a reference value (see
+/// `core/config_parse.applyCliOverrides` -- CLI-absent leaves it at
+/// `Config.init`'s "tiered-auto" default, one of zcode's own legacy names).
+/// So "does cfg_approval_mode name a reference mode" doubles, without extra
+/// plumbing, as "did the user explicitly ask for one via the CLI" -- an
+/// explicit CLI flag always wins over `from_settings`. `from_settings` is the
+/// pre-resolved `permission_rules.resolveDefaultMode` result (null when no
+/// settings.json source sets `permissions.defaultMode`, or under test).
+///
+/// Known, accepted approximation: a user who explicitly types a LEGACY name
+/// (e.g. `--approval-mode manual`) is indistinguishable here from one who
+/// never passed the flag at all, so a configured `defaultMode` still wins in
+/// that specific case. Getting that exactly right needs a dedicated "was this
+/// explicit" bit threaded through `Config`, out of scope for this fix.
+fn resolveInitialPermissionMode(cfg_approval_mode: []const u8, from_settings: ?permission_decision_mod.Mode) ?permission_decision_mod.Mode {
+    if (permission_decision_mod.isReferenceModeName(cfg_approval_mode)) {
+        return permission_decision_mod.modeFromString(cfg_approval_mode);
+    }
+    return from_settings;
+}
+
 fn resolvePermissionRulesPath(allocator: std.mem.Allocator) ![]u8 {
     if (@import("builtin").is_test) return allocator.dupe(u8, "");
     var path_set = try paths_mod.resolve(allocator);
@@ -987,14 +1017,22 @@ pub const AgentRuntime = struct {
             .approval_handler = null,
             .ask_user_ctx = null,
             .ask_user_fn = null,
-            // Seed the live permission mode from cfg.approval_mode only when the
-            // config carries a Claude Code reference mode name. Legacy modes
-            // (tiered-auto/manual/strict) leave this null so the gate keeps
-            // using cfg.approval_mode byte-for-byte (no regression).
-            .permission_mode_override = if (permission_decision_mod.isReferenceModeName(cfg.approval_mode))
-                permission_decision_mod.modeFromString(cfg.approval_mode)
-            else
-                null,
+            // Seed the live permission mode: an explicit reference-mode CLI
+            // flag wins; otherwise config-layout-missed-148's
+            // `.claude/settings.json` `permissions.defaultMode`; otherwise
+            // null (the gate keeps using cfg.approval_mode's legacy
+            // tiered-auto/manual/strict engine byte-for-byte -- no
+            // regression). See `resolveInitialPermissionMode`'s doc comment
+            // for why this precedence is correct without threading an extra
+            // "was this explicit" bit through Config, and why it is distinct
+            // from (and never reads) `cfg.default_mode`, the unrelated
+            // AutoMode-dialog TOML key. The settings.json read itself is
+            // behind the is_test guard like every other disk read in this
+            // constructor so unit tests stay hermetic.
+            .permission_mode_override = resolveInitialPermissionMode(
+                cfg.approval_mode,
+                if (!@import("builtin").is_test) permission_rules_mod.resolveDefaultMode(allocator, cwd, null) else null,
+            ),
             .requested_mode = null,
             .pending_plan_markdown = null,
             .session_approved_tools = std.StringHashMap(void).init(allocator),
@@ -4084,6 +4122,18 @@ pub const AgentRuntime = struct {
         return "default";
     }
 
+    /// hooks-permissions-09: the effective `permission_mode` string threaded
+    /// onto every hook's stdin payload (reference `Se` base schema). Mirrors
+    /// `agent_tools.effectiveApprovalMode`'s precedence (a live reference-mode
+    /// override wins, else the persisted config mode byte-for-byte, which may
+    /// be a zcode legacy name like "tiered-auto") -- kept as a small, separate
+    /// helper here (rather than exported from agent_tools.zig) since lifecycle
+    /// hooks fire from this file, not through a ToolExecContext.
+    fn effectiveLivePermissionModeString(self: *const AgentRuntime) []const u8 {
+        if (self.permission_mode_override) |mode| return permission_decision_mod.modeToString(mode);
+        return self.cfg.approval_mode;
+    }
+
     fn mergeFileFocus(self: *AgentRuntime, new_paths: []const []const u8) !void {
         var merged = std.array_list.Managed([]const u8).init(self.allocator);
         // Track whether ownership has been transferred into the snapshot.
@@ -5068,6 +5118,7 @@ pub const AgentRuntime = struct {
             .web_fetch_ctx = self.buildWebFetchContext(),
             .auto_mem_dir = self.auto_mem_dir_restriction,
             .session_mem_file = self.session_mem_file_restriction,
+            .session_id = self.session_id,
         };
     }
 
@@ -5411,6 +5462,15 @@ pub const AgentRuntime = struct {
             .cwd = self.cwd,
             .message = message,
             .title = title,
+            // hooks-permissions-10: this is the only fireNotificationHook call
+            // site today, and it fires exactly when a long turn has just
+            // finished and the assistant is waiting on the user again -- the
+            // reference's "idle" notification_type category. A settings.json
+            // Notification hook's matcher now tests against this, not the
+            // free-text message (see hooks.matchFieldFor).
+            .notification_type = "idle",
+            .session_id = self.session_id,
+            .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
     }
@@ -7000,6 +7060,30 @@ test "skills-11: inline skill registers its frontmatter hooks on invocation" {
     try testing.expectEqual(hook_event_mod.Event.pre_tool_use, registered[0].event);
     try testing.expectEqualStrings("Bash(*)", registered[0].matcher);
     try testing.expectEqualStrings("echo SKILL_HOOK_SENTINEL", registered[0].body);
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode -- explicit CLI reference mode wins over settings.json" {
+    // cfg.approval_mode == "plan" only happens when the user explicitly typed
+    // --approval-mode/--permission-mode plan; a configured settings.json
+    // defaultMode of acceptEdits must NOT override it.
+    const result = resolveInitialPermissionMode("plan", permission_decision_mod.Mode.acceptEdits);
+    try testing.expectEqual(permission_decision_mod.Mode.plan, result.?);
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode falls back to settings.json when approval_mode is a legacy name" {
+    // cfg.approval_mode == "tiered-auto" (zcode's built-in default, or an
+    // explicit legacy-mode CLI flag) means no reference-mode CLI flag was
+    // given -- settings.json's defaultMode applies.
+    const result = resolveInitialPermissionMode("tiered-auto", permission_decision_mod.Mode.bypassPermissions);
+    try testing.expectEqual(permission_decision_mod.Mode.bypassPermissions, result.?);
+
+    const manual_result = resolveInitialPermissionMode("manual", permission_decision_mod.Mode.dontAsk);
+    try testing.expectEqual(permission_decision_mod.Mode.dontAsk, manual_result.?);
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode is null when neither source sets it" {
+    try testing.expect(resolveInitialPermissionMode("tiered-auto", null) == null);
+    try testing.expect(resolveInitialPermissionMode("strict", null) == null);
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
