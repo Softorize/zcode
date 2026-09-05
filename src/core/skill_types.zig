@@ -341,7 +341,7 @@ fn parseContext(v: ?[]const u8) SkillContext {
 /// slice aliases into `fm`; the caller dupes it. Only the JSON-object form is
 /// supported (a constrained format in place of a YAML sub-parser); a non-`{`
 /// value degrades to "" rather than faulting.
-fn jsonObjectFrom(fm: []const u8, key: []const u8) []const u8 {
+pub fn jsonObjectFrom(fm: []const u8, key: []const u8) []const u8 {
     const v = frontmatter.getValue(fm, key) orelse return "";
     const t = std.mem.trim(u8, v, " \t\r");
     if (t.len == 0 or t[0] != '{') return "";

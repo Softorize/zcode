@@ -142,6 +142,22 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]CommandSpec {
     defer allocator.free(workspace_root);
     try appendCommandsFromRoot(allocator, &out, workspace_root, .workspace);
 
+    // config-layout-02: also read Claude Code's command locations so a repo
+    // or machine already set up for Claude Code works with zcode unchanged.
+    // These are appended AFTER the zcode-native roots above: `findByName`
+    // does a first-match scan over `list()`'s order, so a same-named
+    // zcode-native command (already in `out`) is found first and wins,
+    // matching the repo convention that the zcode-native location wins on a
+    // name conflict.
+    const claude_project_root = try std.fs.path.join(allocator, &.{ cwd, ".claude", "commands" });
+    defer allocator.free(claude_project_root);
+    try appendCommandsFromRoot(allocator, &out, claude_project_root, .workspace);
+
+    if (paths.claudeHomePathAlloc(allocator, "commands")) |claude_user_root| {
+        defer allocator.free(claude_user_root);
+        try appendCommandsFromRoot(allocator, &out, claude_user_root, .user);
+    } else |_| {}
+
     return out.toOwnedSlice();
 }
 
@@ -582,6 +598,66 @@ test "list parses command frontmatter into CommandSpec fields" {
     // Frontmatter must NOT leak into the stored prompt body.
     try testing.expect(std.mem.indexOf(u8, spec.prompt, "argument-hint") == null);
     try testing.expect(std.mem.indexOf(u8, spec.prompt, "Review $url in $mode") != null);
+}
+
+// config-layout-02: commands.zig now also reads Claude Code's command
+// locations (.claude/commands project-scope, ~/.claude/commands user-scope)
+// so a repo/machine already configured for Claude Code keeps working.
+test "list finds a project .claude/commands/ entry with no .zcode counterpart" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(rt.io, ".claude/commands");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/commands/review.md",
+        .data = "---\ndescription: Claude Code review command\n---\nReview this.\n",
+    });
+
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(cwd);
+
+    const commands = try list(allocator, cwd);
+    defer freeList(allocator, commands);
+
+    const spec = findInList(commands, "review") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(CommandScope.workspace, spec.scope);
+    try testing.expectEqualStrings("Claude Code review command", spec.description);
+}
+
+test "list finds a user ~/.claude/commands/ entry with no .zcode counterpart" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude/commands");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/commands/note.md",
+        .data = "---\ndescription: user-scope note command\n---\nJot something down.\n",
+    });
+
+    // cwd is a SEPARATE tmp dir with no .zcode/commands and no
+    // .claude/commands of its own, so `note` can only be found via the
+    // ~/.claude/commands user-scope fallback.
+    var cwd_tmp = testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(allocator, &cwd_tmp);
+    defer allocator.free(cwd);
+
+    const commands = try list(allocator, cwd);
+    defer freeList(allocator, commands);
+
+    const spec = findInList(commands, "note") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(CommandScope.user, spec.scope);
+    try testing.expectEqualStrings("user-scope note command", spec.description);
 }
 
 test "renderRun binds named arguments from frontmatter" {

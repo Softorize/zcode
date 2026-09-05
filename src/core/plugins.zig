@@ -186,6 +186,16 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]PluginSpec {
     defer allocator.free(workspace_root);
     try appendPluginsFromRoot(allocator, &out, workspace_root, .workspace, cwd, trust_status.trusted);
 
+    // config-layout-07: also read `~/.claude/plugins`, so plugins already
+    // installed for Claude Code (each a directory carrying its own
+    // `plugin.json`) are discovered by zcode too. Appended last, after both
+    // zcode-native roots, so consumers that pick the first same-named match
+    // out of this list keep favoring a zcode-native install on conflict.
+    if (paths.claudeHomePathAlloc(allocator, "plugins")) |claude_root| {
+        defer allocator.free(claude_root);
+        try appendPluginsFromRoot(allocator, &out, claude_root, .user, cwd, true);
+    } else |_| {}
+
     // Load-time dependency safety net (plugins-05): demote any enabled plugin
     // whose declared dependencies are not all enabled, iterating to a fixed
     // point. This is session-local - it clears `enabled` in the returned list
@@ -869,6 +879,43 @@ test "parse manifest fields" {
     try testing.expectEqualStrings("1.2.3", plugins[0].version);
     try testing.expectEqual(@as(usize, 2), plugins[0].events.len);
     try testing.expectEqual(@as(usize, 1), plugins[0].commands.len);
+}
+
+// config-layout-07: `~/.claude/plugins` (each plugin dir carrying its own
+// plugin.json) is discovered alongside the zcode-native plugin roots.
+test "list finds a ~/.claude/plugins entry with no ~/.zcode/plugins counterpart" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude/plugins/formatter");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/plugins/formatter/plugin.json",
+        .data = "{\"name\":\"formatter\",\"version\":\"1.0.0\"}",
+    });
+
+    var cwd_tmp = testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(allocator, &cwd_tmp);
+    defer allocator.free(cwd);
+
+    const plugins = try list(allocator, cwd);
+    defer freeList(allocator, plugins);
+
+    var found: ?PluginSpec = null;
+    for (plugins) |p| {
+        if (std.mem.eql(u8, p.name, "formatter")) found = p;
+    }
+    const formatter = found orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(PluginScope.user, formatter.scope);
 }
 
 test "Task 10: plugin manifest mcpServers -> namespaced ServerConfigs with plugin_source" {

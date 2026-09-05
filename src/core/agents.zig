@@ -6,6 +6,8 @@ const paths = @import("paths.zig");
 const helpers = @import("../tools/helpers.zig");
 const parse_helpers_mod = @import("parse_helpers.zig");
 const mcp_config = @import("mcp_config.zig");
+const frontmatter = @import("frontmatter.zig");
+const skill_types = @import("skill_types.zig");
 
 pub const AgentScope = enum {
     builtin,
@@ -64,6 +66,15 @@ pub const AgentSpec = struct {
     /// recursive value tree (swarm-tasks-12). Empty when absent; the hook
     /// registration parses this at spawn.
     hooks_json: []u8,
+    /// Declared display color (config-layout-04), one of `agent_color.
+    /// AGENT_COLORS`. Empty when absent. Parsed from a Markdown+frontmatter
+    /// agent's `color:` key (Claude Code subagent files carry this); JSON
+    /// agent definitions may also set it. Purely descriptive today (zcode's
+    /// prompt-bar renderer does not yet apply a per-agent accent, matching
+    /// the honest divergence already documented in `agent_color.zig`) -- it
+    /// is stored and surfaced so `agents show` round-trips what the file
+    /// declared.
+    color: []u8,
 
     pub fn deinit(self: *AgentSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -82,6 +93,7 @@ pub const AgentSpec = struct {
         allocator.free(self.permission_mode);
         allocator.free(self.memory);
         allocator.free(self.hooks_json);
+        allocator.free(self.color);
     }
 };
 
@@ -127,6 +139,8 @@ pub fn clone(allocator: std.mem.Allocator, spec: *const AgentSpec) !AgentSpec {
     errdefer allocator.free(memory);
     const hooks_json = try allocator.dupe(u8, spec.hooks_json);
     errdefer allocator.free(hooks_json);
+    const color = try allocator.dupe(u8, spec.color);
+    errdefer allocator.free(color);
 
     return .{
         .name = name,
@@ -145,6 +159,7 @@ pub fn clone(allocator: std.mem.Allocator, spec: *const AgentSpec) !AgentSpec {
         .max_turns = spec.max_turns,
         .memory = memory,
         .hooks_json = hooks_json,
+        .color = color,
     };
 }
 
@@ -193,6 +208,22 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]AgentSpec {
     errdefer freeList(allocator, out.items);
 
     try appendBuiltinAgents(allocator, &out);
+
+    // config-layout-03: also read Claude Code's agent locations (project
+    // `.claude/agents`, user `~/.claude/agents`) so a repo/machine already
+    // configured for Claude Code works with zcode unchanged. `appendFromDir`
+    // upserts by name (last write wins, see `upsert`), so these run BEFORE
+    // the zcode-native roots below: a same-named `.zcode`/`~/.zcode` agent
+    // overwrites its `.claude` counterpart, matching the repo convention
+    // that the zcode-native location wins on a name conflict.
+    const claude_project_dir = try std.fs.path.join(allocator, &.{ cwd, ".claude", "agents" });
+    defer allocator.free(claude_project_dir);
+    try appendFromDir(allocator, &out, claude_project_dir, .workspace);
+
+    if (paths.claudeHomePathAlloc(allocator, "agents")) |claude_user_dir| {
+        defer allocator.free(claude_user_dir);
+        try appendFromDir(allocator, &out, claude_user_dir, .user);
+    } else |_| {}
 
     const user_dir = try userAgentsDir(allocator);
     defer allocator.free(user_dir);
@@ -281,6 +312,9 @@ pub fn renderDetail(allocator: std.mem.Allocator, cwd: []const u8, raw_name: []c
     try out.writer().print("mode={s}\n", .{modeName(agent.mode)});
     try out.writer().print("model={s}\n", .{if (agent.model.len > 0) agent.model else "<inherit>"});
     try out.writer().print("source={s}\n", .{agent.source_path});
+    if (agent.color.len > 0) {
+        try out.writer().print("color={s}\n", .{agent.color});
+    }
     if (agent.tools.len == 0 or allowsAllTools(&agent)) {
         try out.writer().print("tools={s}\n", .{if (allowsAllTools(&agent)) "all" else "<inherit>"});
     } else {
@@ -344,13 +378,25 @@ fn appendFromDir(
     var it = dir.iterate();
     while (try it.next(rt.io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
         const path = try std.fs.path.join(allocator, &.{ root, entry.name });
         defer allocator.free(path);
 
-        const agent = try loadFile(allocator, path, scope);
-        try upsert(out, allocator, agent);
+        if (std.mem.endsWith(u8, entry.name, ".json")) {
+            const agent = try loadFile(allocator, path, scope);
+            try upsert(out, allocator, agent);
+            continue;
+        }
+        // config-layout-04: Claude Code subagents are Markdown files with
+        // YAML frontmatter, not JSON. Accept `.md` alongside the existing
+        // zcode-native `.json` format. Unlike the strict JSON branch above,
+        // a malformed/thin `.md` file degrades gracefully (frontmatter.zig's
+        // parser never errors) rather than aborting the whole listing.
+        if (std.mem.endsWith(u8, entry.name, ".md")) {
+            const agent = try loadMarkdownFile(allocator, path, entry.name, scope);
+            try upsert(out, allocator, agent);
+            continue;
+        }
     }
 }
 
@@ -427,6 +473,7 @@ fn appendCliAgents(allocator: std.mem.Allocator, out: *std.array_list.Managed(Ag
             .max_turns = null,
             .memory = allocator.dupe(u8, "") catch continue,
             .hooks_json = allocator.dupe(u8, "") catch continue,
+            .color = allocator.dupe(u8, "") catch continue,
         };
         upsert(out, allocator, spec) catch continue;
     }
@@ -542,6 +589,7 @@ fn buildBuiltinAgent(allocator: std.mem.Allocator, template: BuiltinAgentTemplat
         .max_turns = null,
         .memory = try allocator.dupe(u8, ""),
         .hooks_json = try allocator.dupe(u8, ""),
+        .color = try allocator.dupe(u8, ""),
     };
 }
 
@@ -612,7 +660,78 @@ fn loadFile(allocator: std.mem.Allocator, path: []const u8, scope: AgentScope) !
         .max_turns = parseMaxTurns(obj.get("maxTurns")),
         .memory = try allocator.dupe(u8, getString(obj, "memory") orelse ""),
         .hooks_json = try parseHooksJson(allocator, obj.get("hooks")),
+        .color = try allocator.dupe(u8, getString(obj, "color") orelse ""),
     };
+}
+
+/// Load a Markdown+YAML-frontmatter subagent definition (config-layout-04).
+/// Claude Code subagents are authored this way: a `---`-fenced frontmatter
+/// block (`name`, `description`, `tools`, `model`, `color`, `permissionMode`,
+/// `hooks`, `disallowedTools`) followed by the system-prompt body -- the same
+/// convention `commands.zig` and `skill_types.zig` already parse via
+/// `frontmatter.zig`. Reused here rather than a bespoke YAML reader.
+///
+/// Unlike the strict JSON loader above (`loadFile`, which rejects a
+/// definition missing `name`/`system_prompt`), this stays lenient: a missing
+/// `name:` falls back to the file's stem and a missing/empty body yields an
+/// empty (but present) system prompt. Markdown agent files are user-authored
+/// prose edited directly per the reference's own `/agents` guidance ("edit
+/// the files directly"), not machine-generated JSON, so one thin file should
+/// not abort the whole agents list.
+fn loadMarkdownFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    file_name: []const u8,
+    scope: AgentScope,
+) !AgentSpec {
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(256 * 1024));
+    defer allocator.free(data);
+    const clean = parse_helpers_mod.stripBom(data);
+
+    const stem = if (std.mem.lastIndexOfScalar(u8, file_name, '.')) |idx| file_name[0..idx] else file_name;
+
+    const block = frontmatter.extract(clean);
+    const fm = if (block) |b| b.body else "";
+    const body = if (block) |b| b.rest else clean;
+
+    const fm_name = frontmatter.getValue(fm, "name");
+    const eff_name = if (fm_name) |n| (if (n.len > 0) n else stem) else stem;
+
+    return .{
+        .name = try allocator.dupe(u8, eff_name),
+        .description = try allocator.dupe(u8, frontmatter.getValue(fm, "description") orelse ""),
+        .system_prompt = try allocator.dupe(u8, body),
+        .model = try allocator.dupe(u8, frontmatter.getValue(fm, "model") orelse ""),
+        .mode = .inherit,
+        .tools = try skill_types.parseCommaList(allocator, frontmatter.getValue(fm, "tools") orelse ""),
+        .scope = scope,
+        .source_path = try allocator.dupe(u8, path),
+        .mcp_servers = &.{},
+        .disallowed_tools = try skill_types.parseCommaList(allocator, getEitherFm(fm, "disallowedTools", "disallowed-tools") orelse ""),
+        .skills = try skill_types.parseCommaList(allocator, frontmatter.getValue(fm, "skills") orelse ""),
+        .effort = try allocator.dupe(u8, frontmatter.getValue(fm, "effort") orelse ""),
+        .permission_mode = try allocator.dupe(u8, getEitherFm(fm, "permissionMode", "permission-mode") orelse ""),
+        .max_turns = parseMaxTurnsStr(getEitherFm(fm, "maxTurns", "max-turns")),
+        .memory = try allocator.dupe(u8, frontmatter.getValue(fm, "memory") orelse ""),
+        .hooks_json = try allocator.dupe(u8, skill_types.jsonObjectFrom(fm, "hooks")),
+        .color = try allocator.dupe(u8, frontmatter.getValue(fm, "color") orelse ""),
+    };
+}
+
+/// Frontmatter lookup trying two spellings of the same key (camelCase and
+/// kebab-case), mirroring the same convenience `skill_types.zig` provides
+/// privately as `getEither`.
+fn getEitherFm(fm: []const u8, key_a: []const u8, key_b: []const u8) ?[]const u8 {
+    return frontmatter.getValue(fm, key_a) orelse frontmatter.getValue(fm, key_b);
+}
+
+/// String-valued `maxTurns`/`max-turns` frontmatter parse (the JSON loader's
+/// `parseMaxTurns` takes a `std.json.Value`; frontmatter values are always
+/// raw strings). Non-numeric or non-positive yields null (inherit).
+fn parseMaxTurnsStr(value: ?[]const u8) ?usize {
+    const v = value orelse return null;
+    const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch return null;
+    return if (n > 0) n else null;
 }
 
 /// Parse the `effort` field, which the reference accepts as either a string
@@ -847,6 +966,120 @@ test "loadFile parses agent json" {
     try testing.expectEqual(@as(usize, 3), agent.tools.len);
 }
 
+// config-layout-04: Markdown+YAML-frontmatter subagent definitions (Claude
+// Code's native format) load into a fully populated AgentSpec.
+test "loadMarkdownFile parses a Claude Code style Markdown+frontmatter agent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "reviewer.md",
+        .data =
+        \\---
+        \\name: reviewer
+        \\description: Reviews diffs
+        \\tools: Read, Grep
+        \\color: blue
+        \\---
+        \\You review code.
+        ,
+    });
+
+    const path = try @import("test_helpers.zig").tmpDirPath(testing.allocator, &tmp, "reviewer.md");
+    defer testing.allocator.free(path);
+
+    var agent = try loadMarkdownFile(testing.allocator, path, "reviewer.md", .workspace);
+    defer agent.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("reviewer", agent.name);
+    try testing.expectEqualStrings("Reviews diffs", agent.description);
+    try testing.expectEqualStrings("blue", agent.color);
+    try testing.expectEqual(@as(usize, 2), agent.tools.len);
+    try testing.expectEqualStrings("Read", agent.tools[0]);
+    try testing.expectEqualStrings("Grep", agent.tools[1]);
+    try testing.expect(std.mem.indexOf(u8, agent.system_prompt, "You review code.") != null);
+}
+
+test "loadMarkdownFile falls back to the file stem when frontmatter has no name" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "helper.md",
+        .data = "---\ndescription: nameless\n---\nBody.\n",
+    });
+
+    const path = try @import("test_helpers.zig").tmpDirPath(testing.allocator, &tmp, "helper.md");
+    defer testing.allocator.free(path);
+
+    var agent = try loadMarkdownFile(testing.allocator, path, "helper.md", .workspace);
+    defer agent.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("helper", agent.name);
+}
+
+// config-layout-03: `.claude/agents` (project) and `~/.claude/agents` (user)
+// are read alongside the zcode-native roots.
+test "list finds a project .claude/agents/*.md entry with no .zcode counterpart" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(rt.io, ".claude/agents");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/agents/reviewer.md",
+        .data = "---\nname: reviewer\ndescription: Reviews diffs\ntools: Read, Grep\ncolor: blue\n---\nYou review code.\n",
+    });
+
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const agents = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, agents);
+
+    var found: ?AgentSpec = null;
+    for (agents) |a| {
+        if (std.mem.eql(u8, a.name, "reviewer")) found = a;
+    }
+    const reviewer = found orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(AgentScope.workspace, reviewer.scope);
+    try testing.expectEqualStrings("blue", reviewer.color);
+    try testing.expectEqual(@as(usize, 2), reviewer.tools.len);
+}
+
+test "list finds a user ~/.claude/agents entry with no .zcode counterpart" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude/agents");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/agents/note-taker.md",
+        .data = "---\nname: note-taker\ndescription: Takes notes\n---\nTake notes.\n",
+    });
+
+    var cwd_tmp = testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &cwd_tmp);
+    defer testing.allocator.free(cwd);
+
+    const agents = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, agents);
+
+    var found: ?AgentSpec = null;
+    for (agents) |a| {
+        if (std.mem.eql(u8, a.name, "note-taker")) found = a;
+    }
+    const note_taker = found orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(AgentScope.user, note_taker.scope);
+}
+
 test "Task 10: agent definition mcpServers surfaces ServerConfigs" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1030,6 +1263,7 @@ test "allowsTool honors explicit allow list" {
         .max_turns = null,
         .memory = try testing.allocator.dupe(u8, ""),
         .hooks_json = try testing.allocator.dupe(u8, ""),
+        .color = try testing.allocator.dupe(u8, ""),
     };
     defer agent.deinit(testing.allocator);
 

@@ -237,6 +237,22 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]OutputStyle {
     // last-writer-wins upsert below.
     try appendPluginStyles(allocator, &out, cwd);
 
+    // config-layout-09: also read Claude Code's output-style locations
+    // (project `.claude/output-styles`, user `~/.claude/output-styles`) so a
+    // repo/machine already configured for Claude Code works with zcode
+    // unchanged. Appended BEFORE the zcode-native roots below: `appendFromDir`
+    // upserts by name (last write wins), so a same-named zcode-native style
+    // overwrites its `.claude` counterpart, matching the repo convention
+    // that the zcode-native location wins on a name conflict.
+    const claude_project_root = try std.fs.path.join(allocator, &.{ cwd, ".claude", "output-styles" });
+    defer allocator.free(claude_project_root);
+    try appendFromDir(allocator, &out, claude_project_root, .workspace);
+
+    if (paths.claudeHomePathAlloc(allocator, "output-styles")) |claude_user_root| {
+        defer allocator.free(claude_user_root);
+        try appendFromDir(allocator, &out, claude_user_root, .user);
+    } else |_| {}
+
     var resolved_paths = try paths.resolve(allocator);
     defer resolved_paths.deinit(allocator);
     const user_root = try std.fs.path.join(allocator, &.{ resolved_paths.zcode_home, "output-styles" });

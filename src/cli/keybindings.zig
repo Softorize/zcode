@@ -104,7 +104,15 @@ pub fn loadKeybindings(allocator: std.mem.Allocator) Keybindings {
     const path = keybindingsPath(allocator) catch return .{};
     defer allocator.free(path);
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(64 * 1024)) catch return .{};
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(64 * 1024)) catch blk: {
+        // config-layout-10: no ~/.zcode/keybindings.json -- fall back to
+        // Claude Code's location so a machine already configured for Claude
+        // Code keeps its custom bindings after switching to zcode. The
+        // zcode-native file above still wins whenever both exist.
+        const claude_path = paths.claudeHomePathAlloc(allocator, "keybindings.json") catch return .{};
+        defer allocator.free(claude_path);
+        break :blk std.Io.Dir.cwd().readFileAlloc(rt.io, claude_path, allocator, .limited(64 * 1024)) catch return .{};
+    };
     defer allocator.free(bytes);
 
     const kb = parseKeybindings(allocator, bytes);
@@ -1929,6 +1937,61 @@ test "default chat runtime bindings expose session switcher and density toggle c
     const density_match = kb.resolveChord(&contexts, "tab", "tab");
     try testing.expect(density_match.result == .match);
     try testing.expectEqual(@as(?BindingAction, .chat_density_toggle), density_match.action);
+}
+
+// config-layout-10: ~/.claude/keybindings.json is read when zcode's own
+// ~/.zcode/keybindings.json does not exist.
+test "loadKeybindings falls back to ~/.claude/keybindings.json when ~/.zcode has none" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+
+    const env_mod = @import("../core/env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/keybindings.json",
+        .data = "{\"submit\":[\"ctrl+enter\"]}",
+    });
+
+    var kb = loadKeybindings(testing.allocator);
+    defer kb.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), kb.submit.len);
+    try testing.expectEqualStrings("ctrl+enter", kb.submit[0]);
+}
+
+test "loadKeybindings prefers ~/.zcode/keybindings.json when both exist" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+
+    const env_mod = @import("../core/env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/keybindings.json",
+        .data = "{\"submit\":[\"ctrl+enter\"]}",
+    });
+    try tmp.dir.createDirPath(rt.io, ".zcode");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/keybindings.json",
+        .data = "{\"submit\":[\"ctrl+j\"]}",
+    });
+
+    var kb = loadKeybindings(testing.allocator);
+    defer kb.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), kb.submit.len);
+    try testing.expectEqualStrings("ctrl+j", kb.submit[0]);
 }
 
 test "parseKeybindings overrides specific actions" {

@@ -1645,8 +1645,19 @@ test "hooks-permissions-missed-148: resolveDefaultMode reads permissions.default
 test "config-layout-13: readAdditionalDirectoriesFromSettings unions across sources" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    // A separate tmp dir for HOME, distinct from `cwd` below: config-layout-01
+    // made the `.user` source also read `~/.claude/settings.json`, so if HOME
+    // and cwd were the same directory (as they used to be safely reused in
+    // this test) the project-scope `.claude/settings.json` written below
+    // would ALSO be picked up as the user-scope file, double-counting its
+    // entries in the union. Keeping them distinct isolates this test to the
+    // project/local sources it actually means to exercise.
+    var home_tmp = testing.tmpDir(.{});
+    defer home_tmp.cleanup();
     const test_helpers = @import("test_helpers.zig");
-    const home = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    const cwd = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+    const home = try test_helpers.tmpDirCwd(testing.allocator, &home_tmp);
     defer testing.allocator.free(home);
 
     var override = try TestHomeOverride.install(home);
@@ -1662,7 +1673,7 @@ test "config-layout-13: readAdditionalDirectoriesFromSettings unions across sour
         .data = "{\"permissions\":{\"additionalDirectories\":[\"/local/only\"]}}",
     });
 
-    const dirs = try readAdditionalDirectoriesFromSettings(testing.allocator, home, null);
+    const dirs = try readAdditionalDirectoriesFromSettings(testing.allocator, cwd, null);
     defer {
         for (dirs) |d| testing.allocator.free(d);
         testing.allocator.free(dirs);

@@ -7,6 +7,8 @@ const paths = @import("paths.zig");
 const config_mod = @import("config.zig");
 const file_integrity = @import("file_integrity.zig");
 const managed_security = @import("managed_security.zig");
+const settings_sources = @import("settings_sources.zig");
+const model_alias = @import("model_alias.zig");
 
 const Config = config_mod.Config;
 const LoadedConfig = config_mod.LoadedConfig;
@@ -20,6 +22,15 @@ pub fn load(allocator: std.mem.Allocator, cwd: []const u8, opts: *const cli.CliO
 
     const ws_cfg_path = try paths.workspaceConfigPath(allocator, cwd);
     errdefer allocator.free(ws_cfg_path);
+
+    // config-layout-09/14/15/17: bridge settings.json's JSON keys (model,
+    // outputStyle, env, theme, cleanupPeriodDays) into Config BEFORE the TOML
+    // layers below, so an explicit zcode-native TOML key (default_model,
+    // output_style, [env], ui_theme, session_retention_days) always wins on
+    // conflict -- matching the repo convention that zcode-native config wins
+    // -- and so CLI flags (applied further below by applyCliOverrides) keep
+    // having the final word.
+    try applySettingsJsonBridge(allocator, &cfg, cwd);
 
     // settings-05: `--setting-sources user,project,local` gates the three
     // non-forced layers. When the flag is absent (opts.setting_sources ==
@@ -102,6 +113,71 @@ pub fn load(allocator: std.mem.Allocator, cwd: []const u8, opts: *const cli.CliO
         .workspace_config_found = workspace_found,
         .managed_dangerous = managed_dangerous,
     };
+}
+
+/// config-layout-09/14/15/17: bridge settings.json's top-level `model`,
+/// `outputStyle`, `env`, `theme`, and `cleanupPeriodDays` keys into `Config`.
+/// zcode keeps its TOML config.toml as the primary source of truth for
+/// zcode-native keys; this reads the parallel settings.json layer
+/// (`.claude/settings.json` et al, via `settings_sources.zig`, which itself
+/// already covers the `~/.claude/settings.json` user-scope fallback --
+/// config-layout-01) so those same settings work unchanged with zcode.
+///
+/// Walks `settings_sources.sourceOrder()` (user, project, local, flag,
+/// policy) so a later/more-specific scope's value overrides an earlier one
+/// on a shared key, mirroring `mergedScalarBool`'s precedence. Called BEFORE
+/// the TOML config layers in `load()`, so an explicit TOML key for the same
+/// setting -- zcode-native config -- always wins on conflict.
+fn applySettingsJsonBridge(allocator: std.mem.Allocator, cfg: *Config, cwd: []const u8) !void {
+    for (settings_sources.sourceOrder()) |source| {
+        var parsed = (settings_sources.readSource(allocator, cwd, source, null) catch null) orelse continue;
+        defer parsed.deinit();
+
+        // config-layout-15: top-level "model" (a bare alias like "opus"/
+        // "sonnet"/"haiku"/"best"/"opusplan", or a full model ID).
+        if (settings_sources.getString(parsed.value, "model")) |raw_model| {
+            if (model_alias.resolve(allocator, raw_model)) |resolved| {
+                defer resolved.deinit(allocator);
+                try cfg.setOwnedString(allocator, &cfg.default_model, resolved.model);
+            } else |_| {}
+        }
+
+        // config-layout-09: top-level "outputStyle".
+        if (settings_sources.getString(parsed.value, "outputStyle")) |style| {
+            try cfg.setOwnedString(allocator, &cfg.output_style, style);
+        }
+
+        // config-layout-17: "theme" as a JSON alias for the TOML `ui_theme`
+        // key (format validated later, same as a TOML-sourced value).
+        if (settings_sources.getString(parsed.value, "theme")) |theme| {
+            try cfg.setOwnedString(allocator, &cfg.ui_theme, theme);
+        }
+
+        // config-layout-17: "cleanupPeriodDays" as a JSON alias for the TOML
+        // `session_retention_days` key. Same 10-year cap as the TOML parser
+        // (config_parse.applyKeyValue) applies, so a hostile/typo'd value
+        // cannot make later cutoff arithmetic misbehave.
+        if (settings_sources.getInt(parsed.value, "cleanupPeriodDays")) |days| {
+            if (days >= 0) cfg.session_retention_days = @min(@as(u32, @intCast(@min(days, std.math.maxInt(u32)))), 3650);
+        }
+
+        // config-layout-14: top-level "env" object, applied through the same
+        // validation/expansion/precedence pipeline as a TOML `[env]` table.
+        if (settings_sources.getObject(parsed.value, "env")) |env_val| {
+            var it = env_val.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .string) continue;
+                try applySettingsEnvLine(
+                    allocator,
+                    cfg,
+                    entry.key_ptr.*,
+                    entry.value_ptr.string,
+                    null,
+                    source == .policy,
+                );
+            }
+        }
+    }
 }
 
 fn applyTelemetryEnvOverride(cfg: *Config) void {
@@ -2476,4 +2552,140 @@ test "settings-05: restricting to user skips workspace, keeps managed" {
     try testing.expect(!loaded.workspace_config_found);
     // Managed layer still forced on.
     try testing.expectEqualStrings("read-only", loaded.config.api_profile);
+}
+
+// config-layout-09/14/15/17: settings.json's JSON keys bridge into Config
+// alongside the TOML config.toml stack. These tests use the in-process
+// env-override map (env.setOverride), which `paths.resolve()` consults
+// before falling back to the real environment (core/env.zig:getenv), so no
+// real process env mutation/restore is needed.
+test "config-layout-15: .claude/settings.json model bridges into default_model with no --model flag" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"model\":\"opus\"}",
+    });
+
+    var opts: cli.CliOptions = .{};
+    var loaded = try load(allocator, root, &opts);
+    defer loaded.deinit(allocator);
+
+    try testing.expectEqualStrings("claude-opus-4-6", loaded.config.default_model);
+}
+
+test "config-layout-15: an explicit --model flag still wins over settings.json's model key" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"model\":\"opus\"}",
+    });
+
+    var opts: cli.CliOptions = .{ .model = "claude-haiku-4-5" };
+    var loaded = try load(allocator, root, &opts);
+    defer loaded.deinit(allocator);
+
+    try testing.expectEqualStrings("claude-haiku-4-5", loaded.config.default_model);
+}
+
+test "config-layout-14: .claude/settings.json env object bridges into settings_env" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"env\":{\"MY_API_KEY\":\"value\"}}",
+    });
+
+    var opts: cli.CliOptions = .{};
+    var loaded = try load(allocator, root, &opts);
+    defer loaded.deinit(allocator);
+
+    try testing.expectEqualStrings("value", loaded.config.getSettingsEnv("MY_API_KEY").?);
+}
+
+test "config-layout-09: .claude/settings.json outputStyle bridges into output_style" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"outputStyle\":\"investigative\"}",
+    });
+
+    var opts: cli.CliOptions = .{};
+    var loaded = try load(allocator, root, &opts);
+    defer loaded.deinit(allocator);
+
+    try testing.expectEqualStrings("investigative", loaded.config.output_style);
+}
+
+test "config-layout-17: .claude/settings.json theme and cleanupPeriodDays bridge into ui_theme/session_retention_days" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"theme\":\"dark\",\"cleanupPeriodDays\":7}",
+    });
+
+    var opts: cli.CliOptions = .{};
+    var loaded = try load(allocator, root, &opts);
+    defer loaded.deinit(allocator);
+
+    try testing.expectEqualStrings("dark", loaded.config.ui_theme);
+    try testing.expectEqual(@as(u32, 7), loaded.config.session_retention_days);
 }

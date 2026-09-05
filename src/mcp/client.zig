@@ -712,10 +712,30 @@ pub const Client = struct {
         }
         errdefer user_result.deinit(self.allocator);
 
+        // config-layout-12: `~/.claude.json`'s top-level `mcpServers` is the
+        // reference's user-scope MCP registry, separate from zcode's own
+        // `{zcode_home}/mcp/servers.json` legacy registry above. Appended
+        // so the legacy registry (zcode-native) wins a same-name conflict
+        // within the user scope (concatServerConfigs keeps `b`'s entries
+        // last; mergeScopes's within-scope merge keeps the last occurrence
+        // of a given name).
+        var claude_json_user = try mcp_config.loadClaudeDotJsonUserScope(self.allocator, true);
+        errdefer claude_json_user.deinit(self.allocator);
+        user_result.servers = try mcp_config.concatServerConfigs(self.allocator, claude_json_user.servers, user_result.servers);
+        claude_json_user.servers = &.{};
+        user_result.errors = try concatValidationErrors(self.allocator, &.{ user_result.errors, claude_json_user.errors });
+        claude_json_user.errors = &.{};
+        claude_json_user.deinit(self.allocator);
+
         // project scope: `.mcp.json` parent traversal, closest-wins, with
         // `${VAR}` expansion against the live environment.
         var project_result = try mcp_config.loadProjectScope(self.allocator, cwd, true);
         errdefer project_result.deinit(self.allocator);
+
+        // config-layout-12: `~/.claude.json`'s `projects["<cwd>"].mcpServers`
+        // is the reference's local (per-project) MCP scope.
+        var claude_json_local = try mcp_config.loadClaudeDotJsonLocalScope(self.allocator, cwd, true);
+        errdefer claude_json_local.deinit(self.allocator);
 
         // enterprise scope: exclusive control when the managed file exists.
         const enterprise_exclusive = mcp_config.enterpriseFileExists(self.allocator);
@@ -748,17 +768,19 @@ pub const Client = struct {
         // Combine every scope's collected errors into one owned slice that
         // `mergeScopes` takes over.
         const combined_errors = try concatValidationErrors(self.allocator, &.{
-            ent_result.errors, user_result.errors, project_result.errors,
+            ent_result.errors, user_result.errors, project_result.errors, claude_json_local.errors,
         });
         ent_result.errors = &.{};
         user_result.errors = &.{};
         project_result.errors = &.{};
+        claude_json_local.errors = &.{};
 
         var merged = try mcp_config.mergeScopes(self.allocator, .{
             .enterprise = ent_result.servers,
             .plugin = plugin_servers,
             .user = user_result.servers,
             .project = project_result.servers,
+            .local = claude_json_local.servers,
             .enterprise_exclusive = enterprise_exclusive,
             .errors = combined_errors,
             // Drop plugin servers whose command/url signature duplicates a
@@ -778,6 +800,7 @@ pub const Client = struct {
         ent_result.servers = &.{};
         user_result.servers = &.{};
         project_result.servers = &.{};
+        claude_json_local.servers = &.{};
         plugin_servers = &.{};
         defer {
             // Free the validation errors but keep the merged servers (installed

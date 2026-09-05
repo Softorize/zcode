@@ -61,7 +61,23 @@ fn settingsPath(allocator: std.mem.Allocator, cwd: []const u8, scope: Scope) ![]
 ///   - null when the file is absent, malformed, or the key is not present.
 const ScopeState = struct { enabled: bool };
 
+/// config-layout-08: consult BOTH zcode's own private `plugin_settings.json`
+/// AND a genuine Claude Code `settings.json`'s `enabledPlugins` block, so a
+/// machine/repo already configured for Claude Code works with zcode
+/// unchanged. The private file is checked first (it wins on a conflict --
+/// zcode-specific config wins per repo convention); the settings.json
+/// bridge is the fallback when the private file has no opinion.
 fn readScopeState(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    plugin_id: []const u8,
+    scope: Scope,
+) !?ScopeState {
+    if (try readScopeStatePrivateFile(allocator, cwd, plugin_id, scope)) |st| return st;
+    return readScopeStateFromSettingsJson(allocator, cwd, plugin_id, scope);
+}
+
+fn readScopeStatePrivateFile(
     allocator: std.mem.Allocator,
     cwd: []const u8,
     plugin_id: []const u8,
@@ -95,6 +111,40 @@ fn readScopeState(
         .array => .{ .enabled = true },
         else => null,
     };
+}
+
+/// config-layout-08: fall back to a genuine settings.json's top-level
+/// `enabledPlugins` object when zcode's private `plugin_settings.json` has
+/// no opinion. Workspace scope checks `.claude/settings.local.json` first
+/// (more specific, gitignored), then `.claude/settings.json`. User scope
+/// checks the merged user source (`settings_sources.Source.user`, which
+/// itself already reads BOTH `~/.claude/settings.json` and zcode's own
+/// `~/.zcode/settings.json` -- see config-layout-01).
+fn readScopeStateFromSettingsJson(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    plugin_id: []const u8,
+    scope: Scope,
+) !?ScopeState {
+    const settings_sources = @import("settings_sources.zig");
+    const sources: []const settings_sources.Source = switch (scope) {
+        .workspace => &.{ .local, .project },
+        .user => &.{.user},
+    };
+
+    for (sources) |source| {
+        var parsed = (settings_sources.readSource(allocator, cwd, source, null) catch null) orelse continue;
+        defer parsed.deinit();
+
+        const enabled_val = settings_sources.getObject(parsed.value, enabled_plugins_key) orelse continue;
+        const entry = enabled_val.object.get(plugin_id) orelse continue;
+        return switch (entry) {
+            .bool => |b| .{ .enabled = b },
+            .array => .{ .enabled = true },
+            else => continue,
+        };
+    }
+    return null;
 }
 
 /// Resolve the effective enabled state for a plugin id, consulting the
@@ -338,6 +388,54 @@ test "workspace false overrides user true" {
     // trust_default true, but workspace false wins.
     const eff = try effectiveEnabled(allocator, cwd, "demo@local", .user, true);
     try testing.expect(!eff);
+}
+
+// config-layout-08: a genuine `.claude/settings.json` `enabledPlugins` block
+// is honored when zcode's private plugin_settings.json says nothing.
+test "effectiveEnabled bridges .claude/settings.json enabledPlugins when plugin_settings.json is silent" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try test_helpers.tmpDirCwd(allocator, &tmp);
+    defer allocator.free(cwd);
+    const restore = try pinHome(allocator, cwd);
+    defer restore.deinit(allocator);
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"enabledPlugins\":{\"formatter@builtin\":true}}",
+    });
+
+    // No .zcode/plugin_settings.json at all: trust_default(false) would
+    // normally disable the plugin, but the settings.json bridge wins.
+    try testing.expect(try effectiveEnabled(allocator, cwd, "formatter@builtin", .workspace, false));
+
+    // A plugin id absent from BOTH the private file and settings.json still
+    // falls back to trust_default.
+    try testing.expect(!(try effectiveEnabled(allocator, cwd, "other@builtin", .workspace, false)));
+}
+
+test "effectiveEnabled's private plugin_settings.json wins over a conflicting settings.json entry" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try test_helpers.tmpDirCwd(allocator, &tmp);
+    defer allocator.free(cwd);
+    const restore = try pinHome(allocator, cwd);
+    defer restore.deinit(allocator);
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"enabledPlugins\":{\"formatter@builtin\":true}}",
+    });
+
+    // zcode's own private file explicitly disables the same id -- it wins.
+    try setEnabled(allocator, cwd, .workspace, "formatter@builtin", false);
+    try testing.expect(!(try effectiveEnabled(allocator, cwd, "formatter@builtin", .workspace, true)));
 }
 
 test "untoggled plugin honors trust_default" {
