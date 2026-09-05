@@ -133,6 +133,28 @@ pub const Config = struct {
     /// Gap (minutes) since the last assistant turn before the time-based
     /// microcompaction fires. 60 matches the server's 1h cache TTL.
     time_based_mc_gap_minutes: usize = 60,
+    /// config-layout-17: settings.json `alwaysThinkingEnabled` -- forces
+    /// extended thinking on for every turn regardless of the model's default
+    /// reasoning-effort heuristic (reference: "reserved reasoning budget
+    /// on"). Round-trippable via `/config` and the settings.json bridge
+    /// (`applySettingsJsonBridge`); not yet threaded into the request-
+    /// building pipeline that would actually force thinking on for a live
+    /// turn (a separate, larger wiring through prompt_engine.zig/
+    /// agent_history.zig).
+    always_thinking_enabled: bool = false,
+    /// config-layout-17: settings.json `autoCompactWindow` -- an explicit
+    /// token-count auto-compaction target ("auto", or a raw/shorthand count
+    /// like "500k" / 200000), overriding the percentage-based default
+    /// threshold. 0 means "auto" (unset; the existing percent-based default
+    /// in `types.BudgetPlan.CompactionThresholds` applies). Round-trippable;
+    /// not yet threaded into the live compaction-trigger math (a separate,
+    /// larger wiring across agent_history.zig/compaction.zig).
+    auto_compact_window: u32 = 0,
+    /// config-layout-17: settings.json `includeCoAuthoredBy` (default true).
+    /// Gates the `Co-Authored-By: zcode <noreply@zcode.dev>` trailer
+    /// instruction the `/commit` slash command's prompt template tells the
+    /// model to append (repl_commands.zig).
+    include_co_authored_by: bool = true,
     max_tool_rounds: usize,
     /// Phase 22 (agent-loop-deep-11): per-turn USD budget ceiling. 0 (the
     /// default) disables the cap. When > 0, an agentic turn stops once its

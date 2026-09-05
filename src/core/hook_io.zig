@@ -194,6 +194,49 @@ pub const LifecycleFields = struct {
     // this is what a `"matcher":"idle"`-style Notification hook actually
     // matches against.
     notification_type: ?[]const u8 = null,
+    // hooks-permissions-03: the remaining lifecycle events' discriminating
+    // fields, verified against the reference's zod schemas (cc_strings.txt
+    // offsets ~13291777-13292436). `source` is shared with SessionStart's
+    // field of the same JSON name (ConfigChange's `source` enum --
+    // user_settings/project_settings/local_settings/policy_settings/skills --
+    // is a different value space, but the same wire key). `file_path` is
+    // shared by ConfigChange (optional), InstructionsLoaded, and FileChanged.
+    file_path: ?[]const u8 = null,
+    // InstructionsLoaded: `memory_type` (User/Project/Local/Managed),
+    // `load_reason` (session_start/nested_traversal/path_glob_match/include/
+    // compact).
+    memory_type: ?[]const u8 = null,
+    load_reason: ?[]const u8 = null,
+    // CwdChanged: `old_cwd`/`new_cwd`.
+    old_cwd: ?[]const u8 = null,
+    new_cwd: ?[]const u8 = null,
+    // FileChanged: `event` (change/add/unlink). Named `change_event` on the
+    // Zig side since `event` collides with nothing but reads oddly as a bare
+    // field name next to the struct's own semantics; emitted under the
+    // reference's literal `"event"` JSON key.
+    change_event: ?[]const u8 = null,
+    // TeammateIdle: `teammate_name` (required), `team_name` (reference marks
+    // `@deprecated` but still documents it; zcode has a single implicit team
+    // per session so this is carried for wire-compat only).
+    teammate_name: ?[]const u8 = null,
+    team_name: ?[]const u8 = null,
+    // WorktreeCreate: `name` (the worktree's logical name, not its path --
+    // emitted under the reference's literal `"name"` JSON key, so the Zig
+    // field is `worktree_name` to avoid shadowing anything struct-wide).
+    worktree_name: ?[]const u8 = null,
+    // WorktreeRemove: `worktree_path`.
+    worktree_path: ?[]const u8 = null,
+    // hooks-permissions-02 (corrected semantics): StopFailure fires INSTEAD
+    // OF Stop when the model/API call itself errored ending the turn
+    // (reference bundle: "Fires instead of Stop when an API error (rate
+    // limit, auth failure, etc.) ended the turn"), not when a Stop hook's own
+    // execution fails as originally guessed -- see agent_runtime.zig's
+    // `fireStopFailureHook` doc comment for the full correction. `error` is
+    // required; `error_details`/`last_assistant_message` are optional.
+    // `error` needs `@""`-escaping: it is a Zig keyword as a bare identifier.
+    @"error": ?[]const u8 = null,
+    error_details: ?[]const u8 = null,
+    last_assistant_message: ?[]const u8 = null,
 };
 
 /// Build the stdin JSON for a non-tool lifecycle event (SessionStart,
@@ -231,6 +274,22 @@ pub fn buildLifecycleEventPayload(
     if (fields.task_id) |v| try w.print(",\"task_id\":{f}", .{std.json.fmt(v, .{})});
     if (fields.task_subject) |v| try w.print(",\"task_subject\":{f}", .{std.json.fmt(v, .{})});
     if (fields.notification_type) |v| try w.print(",\"notification_type\":{f}", .{std.json.fmt(v, .{})});
+    // hooks-permissions-03 / hooks-permissions-02 (corrected): the remaining
+    // lifecycle events' fields (see `LifecycleFields`'s doc comment for the
+    // reference schema each maps to).
+    if (fields.file_path) |v| try w.print(",\"file_path\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.memory_type) |v| try w.print(",\"memory_type\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.load_reason) |v| try w.print(",\"load_reason\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.old_cwd) |v| try w.print(",\"old_cwd\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.new_cwd) |v| try w.print(",\"new_cwd\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.change_event) |v| try w.print(",\"event\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.teammate_name) |v| try w.print(",\"teammate_name\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.team_name) |v| try w.print(",\"team_name\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.worktree_name) |v| try w.print(",\"name\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.worktree_path) |v| try w.print(",\"worktree_path\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.@"error") |v| try w.print(",\"error\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.error_details) |v| try w.print(",\"error_details\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.last_assistant_message) |v| try w.print(",\"last_assistant_message\":{f}", .{std.json.fmt(v, .{})});
     try writeBaseFields(w, base);
     try w.writeAll("}");
     return allocator.dupe(u8, builder.items());
@@ -739,6 +798,113 @@ test "detectAsyncFirstLine returns asyncTimeout for an async sentinel" {
     try testing.expectEqual(@as(?u64, 0), detectAsyncFirstLine("{\"async\":true}"));
     // Leading/trailing whitespace is tolerated.
     try testing.expectEqual(@as(?u64, 250), detectAsyncFirstLine("  {\"async\":true,\"asyncTimeout\":250}  \n"));
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits CwdChanged old_cwd/new_cwd" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "CwdChanged",
+        "/repo/sub",
+        .{ .old_cwd = "/repo" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo", parsed.value.object.get("old_cwd").?.string);
+    // The "new" cwd is the event's own top-level `cwd`, not a duplicated field.
+    try testing.expectEqualStrings("/repo/sub", parsed.value.object.get("cwd").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits FileChanged file_path and event kind" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "FileChanged",
+        "/repo",
+        .{ .file_path = "/repo/a.zig", .change_event = "add" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo/a.zig", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("add", parsed.value.object.get("event").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits InstructionsLoaded fields" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "InstructionsLoaded",
+        "/repo",
+        .{ .file_path = "/repo/ZCODE.md", .memory_type = "Project", .load_reason = "session_start" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo/ZCODE.md", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("Project", parsed.value.object.get("memory_type").?.string);
+    try testing.expectEqualStrings("session_start", parsed.value.object.get("load_reason").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits TeammateIdle teammate_name/team_name" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "TeammateIdle",
+        "/repo",
+        .{ .teammate_name = "worker", .team_name = "alpha" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("worker", parsed.value.object.get("teammate_name").?.string);
+    try testing.expectEqualStrings("alpha", parsed.value.object.get("team_name").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits WorktreeCreate name and WorktreeRemove worktree_path" {
+    const create = try buildLifecycleEventPayload(testing.allocator, "WorktreeCreate", "/repo", .{ .worktree_name = "feature-x" }, .{});
+    defer testing.allocator.free(create);
+    var parsed_create = try std.json.parseFromSlice(std.json.Value, testing.allocator, create, .{});
+    defer parsed_create.deinit();
+    try testing.expectEqualStrings("feature-x", parsed_create.value.object.get("name").?.string);
+
+    const remove = try buildLifecycleEventPayload(testing.allocator, "WorktreeRemove", "/repo", .{ .worktree_path = "/repo/../feature-x" }, .{});
+    defer testing.allocator.free(remove);
+    var parsed_remove = try std.json.parseFromSlice(std.json.Value, testing.allocator, remove, .{});
+    defer parsed_remove.deinit();
+    try testing.expectEqualStrings("/repo/../feature-x", parsed_remove.value.object.get("worktree_path").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits ConfigChange source and optional file_path" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "ConfigChange",
+        "/repo",
+        .{ .source = "skills" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("skills", parsed.value.object.get("source").?.string);
+    try testing.expect(parsed.value.object.get("file_path") == null);
+}
+
+test "hooks-permissions-02 (corrected): buildLifecycleEventPayload emits StopFailure error fields" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "StopFailure",
+        "/repo",
+        .{ .@"error" = "RateLimited", .error_details = "Rate limited by the API provider.", .last_assistant_message = "Here is the plan..." },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("RateLimited", parsed.value.object.get("error").?.string);
+    try testing.expectEqualStrings("Rate limited by the API provider.", parsed.value.object.get("error_details").?.string);
+    try testing.expectEqualStrings("Here is the plan...", parsed.value.object.get("last_assistant_message").?.string);
 }
 
 test "detectAsyncFirstLine returns null for a non-async line" {

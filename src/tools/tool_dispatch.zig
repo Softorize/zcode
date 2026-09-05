@@ -26,6 +26,7 @@ const tool_search_score = @import("tool_search_score.zig");
 const test_runner = @import("test_runner.zig");
 const args = @import("arg_parse.zig");
 const http_common = @import("../providers/common.zig");
+const hooks_mod = @import("../core/hooks.zig");
 
 const getArg = args.getArg;
 const parseUsize = args.parseUsize;
@@ -1140,10 +1141,35 @@ fn handleEnterWorktree(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req
     };
     defer allocator.free(result.stderr);
     if (result.term == .exited and result.term.exited == 0) {
+        // hooks-permissions-03: fire WorktreeCreate for the model-facing
+        // EnterWorktree tool (reference schema: `{name: string}`). Best-
+        // effort/fire-and-forget, like every other observability-only event
+        // in this file's dispatch layer.
+        fireWorktreeCreateHook(allocator, req.cwd, name_arg orelse std.fs.path.basename(path));
         return result.stdout;
     }
     defer allocator.free(result.stdout);
     return std.fmt.allocPrint(allocator, "worktree failed: {s}", .{std.mem.trim(u8, result.stderr, " \t\r\n")});
+}
+
+/// hooks-permissions-03: see `handleEnterWorktree`'s call site.
+fn fireWorktreeCreateHook(allocator: std.mem.Allocator, cwd: []const u8, name: []const u8) void {
+    var result = hooks_mod.runEvent(allocator, .{
+        .event = .worktree_create,
+        .cwd = cwd,
+        .worktree_name = name,
+    }) catch return;
+    result.deinit(allocator);
+}
+
+/// hooks-permissions-03: see `handleExitWorktree`'s call site.
+fn fireWorktreeRemoveHook(allocator: std.mem.Allocator, cwd: []const u8, worktree_path: []const u8) void {
+    var result = hooks_mod.runEvent(allocator, .{
+        .event = .worktree_remove,
+        .cwd = cwd,
+        .worktree_path = worktree_path,
+    }) catch return;
+    result.deinit(allocator);
 }
 
 fn handleExitWorktree(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
@@ -1167,6 +1193,7 @@ fn handleExitWorktree(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req:
     defer allocator.free(result.stderr);
     if (result.term == .exited and result.term.exited == 0) {
         defer allocator.free(result.stdout);
+        fireWorktreeRemoveHook(allocator, req.cwd, path);
         return std.fmt.allocPrint(allocator, "worktree removed: {s}", .{path});
     }
     defer allocator.free(result.stdout);
@@ -2654,6 +2681,105 @@ test "tools-missed-71: EnterWorktree derives ../<name> path and <name> branch; E
     const removed = try dispatch(testing.allocator, null, .{ .name = "ExitWorktree", .args = "\"path\":\"../feature-x\",\"action\":\"remove\"", .cwd = repo });
     defer testing.allocator.free(removed);
     try testing.expect(std.mem.indexOf(u8, removed, "worktree removed") != null);
+}
+
+test "hooks-permissions-03: EnterWorktree fires WorktreeCreate, ExitWorktree fires WorktreeRemove" {
+    const env_mod = @import("../core/env.zig");
+    const paths_mod = @import("../core/paths.zig");
+    const extern_setenv = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(parent);
+
+    // hooks-permissions-03: HOME-override to `parent` so a `settings.json`
+    // written under `parent/.zcode` resolves as the trusted USER scope
+    // (mirrors hooks.zig's/hooks_runtime_wire_test.zig's own HomeOverride --
+    // a project/local-scope hook would additionally need a trust prompt,
+    // which this dispatch-layer call site has no `ask_user_fn` for).
+    const prev_home = if (env_mod.getOwned(testing.allocator, "HOME")) |v| v else |_| null;
+    defer if (prev_home) |h| testing.allocator.free(h);
+    const prev_xdg = if (env_mod.getOwned(testing.allocator, "XDG_CONFIG_HOME")) |v| v else |_| null;
+    defer if (prev_xdg) |x| testing.allocator.free(x);
+    {
+        const home_z = try testing.allocator.dupeZ(u8, parent);
+        defer testing.allocator.free(home_z);
+        _ = extern_setenv.setenv("HOME", home_z, 1);
+        _ = extern_setenv.unsetenv("XDG_CONFIG_HOME");
+    }
+    defer {
+        if (prev_home) |h| {
+            const z = testing.allocator.dupeZ(u8, h) catch unreachable;
+            defer testing.allocator.free(z);
+            _ = extern_setenv.setenv("HOME", z, 1);
+        } else _ = extern_setenv.unsetenv("HOME");
+        if (prev_xdg) |x| {
+            const z = testing.allocator.dupeZ(u8, x) catch unreachable;
+            defer testing.allocator.free(z);
+            _ = extern_setenv.setenv("XDG_CONFIG_HOME", z, 1);
+        } else _ = extern_setenv.unsetenv("XDG_CONFIG_HOME");
+    }
+    const zcode_home = try std.fs.path.join(testing.allocator, &.{ parent, ".zcode" });
+    defer testing.allocator.free(zcode_home);
+    try paths_mod.ensureDir(zcode_home);
+
+    const repo = try std.fmt.allocPrint(testing.allocator, "{s}/repo2", .{parent});
+    defer testing.allocator.free(repo);
+    try std.Io.Dir.cwd().createDirPath(rt.io, repo);
+
+    const git_available = blk: {
+        const r = std.process.run(testing.allocator, rt.io, .{ .argv = &.{ "git", "init", "-q" }, .cwd = .{ .path = repo } }) catch break :blk false;
+        defer testing.allocator.free(r.stdout);
+        defer testing.allocator.free(r.stderr);
+        break :blk r.term == .exited and r.term.exited == 0;
+    };
+    if (!git_available) return error.SkipZigTest;
+    {
+        const r = try std.process.run(testing.allocator, rt.io, .{ .argv = &.{ "git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "init" }, .cwd = .{ .path = repo } });
+        testing.allocator.free(r.stdout);
+        testing.allocator.free(r.stderr);
+    }
+
+    const create_sentinel = try std.fs.path.join(testing.allocator, &.{ parent, "wt_create.json" });
+    defer testing.allocator.free(create_sentinel);
+    const remove_sentinel = try std.fs.path.join(testing.allocator, &.{ parent, "wt_remove.json" });
+    defer testing.allocator.free(remove_sentinel);
+    const settings = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"hooks\":{{\"WorktreeCreate\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"WorktreeRemove\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ create_sentinel, remove_sentinel },
+    );
+    defer testing.allocator.free(settings);
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const out = try dispatch(testing.allocator, null, .{ .name = "EnterWorktree", .args = "\"name\":\"feature-y\"", .cwd = repo });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "worktree failed") == null);
+
+    const create_data = std.Io.Dir.cwd().readFileAlloc(rt.io, create_sentinel, testing.allocator, .limited(4096)) catch |err| {
+        std.debug.print("WorktreeCreate hook did not fire: {any}\n", .{err});
+        return error.WorktreeCreateHookDidNotRun;
+    };
+    defer testing.allocator.free(create_data);
+    var create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, create_data, .{});
+    defer create_parsed.deinit();
+    try testing.expectEqualStrings("feature-y", create_parsed.value.object.get("name").?.string);
+
+    const removed = try dispatch(testing.allocator, null, .{ .name = "ExitWorktree", .args = "\"path\":\"../feature-y\",\"action\":\"remove\"", .cwd = repo });
+    defer testing.allocator.free(removed);
+    try testing.expect(std.mem.indexOf(u8, removed, "worktree removed") != null);
+
+    const remove_data = std.Io.Dir.cwd().readFileAlloc(rt.io, remove_sentinel, testing.allocator, .limited(4096)) catch |err| {
+        std.debug.print("WorktreeRemove hook did not fire: {any}\n", .{err});
+        return error.WorktreeRemoveHookDidNotRun;
+    };
+    defer testing.allocator.free(remove_data);
+    var remove_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, remove_data, .{});
+    defer remove_parsed.deinit();
+    try testing.expectEqualStrings("../feature-y", remove_parsed.value.object.get("worktree_path").?.string);
 }
 
 test "tools-13: ReadMcpResourceDirTool lists only direct children of a directory URI" {

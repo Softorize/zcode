@@ -748,6 +748,9 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
             return @as(?[]u8, try std.fmt.allocPrint(allocator, "reload-skills: failed to rescan skills ({s})", .{@errorName(err)}));
         };
         defer skills_mod.freeList(allocator, skills);
+        // hooks-permissions-03: ConfigChange fires with the reference's
+        // "skills" source enum value on a skill directory rescan.
+        runtime.fireConfigChangeHook("skills", null);
         return @as(?[]u8, try std.fmt.allocPrint(
             allocator,
             "skills reloaded: {d} skill(s) now visible. (zcode rescans skills from disk on every call, so anything added or changed mid-session was already picked up.)",
@@ -953,6 +956,11 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
 
         const old_cwd = runtime.shell_cwd;
         runtime.shell_cwd = abs;
+        // hooks-permissions-03: fire CwdChanged for the /cd command itself
+        // (agent_runtime.updateShellCwd covers the other real trigger, a
+        // Bash `cd`). Fired before freeing old_cwd since it is passed by
+        // reference into the (synchronous) hook call.
+        runtime.fireCwdChangedHook(old_cwd, runtime.shell_cwd);
         allocator.free(old_cwd);
 
         return @as(?[]u8, try std.fmt.allocPrint(
@@ -2840,45 +2848,7 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         if (std.mem.trim(u8, status, " \t\r\n").len == 0) {
             return @as(?[]u8, try allocator.dupe(u8, "nothing to commit (working tree clean)"));
         }
-        var prompt_buf = std_io.StringBuilder.init(allocator);
-        defer prompt_buf.deinit();
-        const w = prompt_buf.writer();
-        try w.writeAll(
-            \\Review the current git changes and create a single commit.
-            \\
-            \\1. First, gather context by running these commands:
-            \\   - git status
-            \\   - git diff HEAD (to see staged and unstaged changes)
-            \\   - git log --oneline -10 (to match the repo's commit message style)
-            \\
-            \\2. Git safety rules:
-            \\   - NEVER update git config
-            \\   - NEVER skip hooks (no --no-verify or --no-gpg-sign)
-            \\   - ALWAYS create NEW commits, never use git commit --amend
-            \\   - Do NOT commit files that likely contain secrets (.env, credentials, etc.)
-            \\   - Never use interactive flags (-i) as they are not supported
-            \\   - If there are no changes, do not create an empty commit
-            \\
-            \\3. Analyze all changes and draft a commit message:
-            \\   - Look at recent commits to follow the repo's commit message style
-            \\   - Summarize the nature of the changes (new feature, enhancement, bug fix, refactoring, etc.)
-            \\   - Draft a concise (1-2 sentences) commit message focusing on "why" not "what"
-            \\   - "add" = wholly new feature, "update" = enhancement, "fix" = bug fix
-            \\
-            \\4. Stage relevant files with git add (prefer specific files over git add -A)
-            \\   and commit using HEREDOC syntax:
-            \\   git commit -m "$(cat <<'EOF'
-            \\   Your commit message here.
-            \\
-            \\   Co-Authored-By: zcode <noreply@zcode.dev>
-            \\   EOF
-            \\   )"
-            \\
-        );
-        if (extra.len > 0) {
-            try w.print("\nAdditional context from the user: {s}\n", .{extra});
-        }
-        const prompt = try prompt_buf.toOwnedSlice();
+        const prompt = try buildCommitPrompt(allocator, runtime.cfg, extra);
         defer allocator.free(prompt);
         return @as(?[]u8, try runtime.handlePrompt(prompt));
     }
@@ -7984,6 +7954,62 @@ fn contextWindowForModel(provider: []const u8, model: []const u8) usize {
     return 200_000;
 }
 
+/// config-layout-17: build the `/commit` prompt. Extracted to a pure,
+/// directly-testable helper so `includeCoAuthoredBy`'s effect on the
+/// instructed trailer can be asserted without driving a model call.
+/// `cfg.include_co_authored_by` (default true) gates the "Co-Authored-By:
+/// zcode <noreply@zcode.dev>" trailer instruction -- `false` tells the model
+/// to leave it out entirely, mirroring the reference's `includeCoAuthoredBy
+/// === false -> attribution = {commit: "", pr: ""}` (kJo() in the bundle).
+fn buildCommitPrompt(allocator: std.mem.Allocator, cfg: *const config_mod.Config, extra: []const u8) ![]u8 {
+    var prompt_buf = std_io.StringBuilder.init(allocator);
+    defer prompt_buf.deinit();
+    const w = prompt_buf.writer();
+    try w.writeAll(
+        \\Review the current git changes and create a single commit.
+        \\
+        \\1. First, gather context by running these commands:
+        \\   - git status
+        \\   - git diff HEAD (to see staged and unstaged changes)
+        \\   - git log --oneline -10 (to match the repo's commit message style)
+        \\
+        \\2. Git safety rules:
+        \\   - NEVER update git config
+        \\   - NEVER skip hooks (no --no-verify or --no-gpg-sign)
+        \\   - ALWAYS create NEW commits, never use git commit --amend
+        \\   - Do NOT commit files that likely contain secrets (.env, credentials, etc.)
+        \\   - Never use interactive flags (-i) as they are not supported
+        \\   - If there are no changes, do not create an empty commit
+        \\
+        \\3. Analyze all changes and draft a commit message:
+        \\   - Look at recent commits to follow the repo's commit message style
+        \\   - Summarize the nature of the changes (new feature, enhancement, bug fix, refactoring, etc.)
+        \\   - Draft a concise (1-2 sentences) commit message focusing on "why" not "what"
+        \\   - "add" = wholly new feature, "update" = enhancement, "fix" = bug fix
+        \\
+        \\4. Stage relevant files with git add (prefer specific files over git add -A)
+        \\   and commit using HEREDOC syntax:
+        \\   git commit -m "$(cat <<'EOF'
+        \\   Your commit message here.
+        \\
+    );
+    if (cfg.include_co_authored_by) {
+        try w.writeAll(
+            \\   Co-Authored-By: zcode <noreply@zcode.dev>
+            \\
+        );
+    }
+    try w.writeAll(
+        \\   EOF
+        \\   )"
+        \\
+    );
+    if (extra.len > 0) {
+        try w.print("\nAdditional context from the user: {s}\n", .{extra});
+    }
+    return prompt_buf.toOwnedSlice();
+}
+
 fn qualityModelForProvider(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "anthropic")) return "claude-opus-4-6";
     if (std.mem.eql(u8, provider, "openai")) return "gpt-4.1";
@@ -8038,6 +8064,11 @@ fn handleConfigCommand(allocator: std.mem.Allocator, runtime: *AgentRuntime, com
                 .{ ht.head, @errorName(err) },
             )),
         };
+        // hooks-permissions-03: ConfigChange fires on a live `/config set`
+        // (reference source enum "user_settings" -- the closest fit for a
+        // session-scoped user-initiated override; this write never touches
+        // settings.json, so `file_path` is omitted).
+        runtime.fireConfigChangeHook("user_settings", null);
         return @as(?[]u8, try std.fmt.allocPrint(
             allocator,
             "{s} = {s}\n(session-only; add to ~/.zcode/config.toml to persist)",
@@ -9547,6 +9578,138 @@ test "commands-02: /cd is no longer blocked and changes shell_cwd" {
     defer allocator.free(out.?);
     try testing.expect(std.mem.indexOf(u8, out.?, "cwd ->") != null);
     try testing.expectEqualStrings(target, runtime.shell_cwd);
+}
+
+/// hooks-permissions-03: minimal HOME override so a `settings.json` written
+/// under `root/.zcode` resolves as the trusted USER scope (mirrors the same
+/// trick `core/hooks.zig`'s and `core/hooks_runtime_wire_test.zig`'s own
+/// `HomeOverride` use) -- a project/local-scope hook would additionally need
+/// a trust prompt this REPL-command test path does not drive.
+const ConfigChangeHomeOverride = struct {
+    prev_home: ?[]u8,
+    prev_xdg: ?[]u8,
+    allocator: std.mem.Allocator,
+
+    fn install(allocator: std.mem.Allocator, home: []const u8) !ConfigChangeHomeOverride {
+        const prev_home = if (env_mod.getOwned(allocator, "HOME")) |v| v else |_| null;
+        const prev_xdg = if (env_mod.getOwned(allocator, "XDG_CONFIG_HOME")) |v| v else |_| null;
+        const home_z = try allocator.dupeZ(u8, home);
+        defer allocator.free(home_z);
+        _ = setenv("HOME", home_z, 1);
+        _ = unsetenv("XDG_CONFIG_HOME");
+        const zcode_home = try std.fs.path.join(allocator, &.{ home, ".zcode" });
+        defer allocator.free(zcode_home);
+        try @import("core/paths.zig").ensureDir(zcode_home);
+        return .{ .prev_home = prev_home, .prev_xdg = prev_xdg, .allocator = allocator };
+    }
+
+    fn deinit(self: *ConfigChangeHomeOverride) void {
+        if (self.prev_home) |h| {
+            const z = self.allocator.dupeZ(u8, h) catch return;
+            defer self.allocator.free(z);
+            _ = setenv("HOME", z, 1);
+            self.allocator.free(h);
+        } else _ = unsetenv("HOME");
+        if (self.prev_xdg) |x| {
+            const z = self.allocator.dupeZ(u8, x) catch return;
+            defer self.allocator.free(z);
+            _ = setenv("XDG_CONFIG_HOME", z, 1);
+            self.allocator.free(x);
+        } else _ = unsetenv("XDG_CONFIG_HOME");
+    }
+};
+
+test "hooks-permissions-03: /config set fires ConfigChange with source=user_settings" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var home_ov = try ConfigChangeHomeOverride.install(allocator, root);
+    defer home_ov.deinit();
+
+    const sentinel = try std.fs.path.join(allocator, &.{ root, "config_change.json" });
+    defer allocator.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        allocator,
+        "{{\"hooks\":{{\"ConfigChange\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer allocator.free(settings);
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    const out = try replCommandCallback(runtime, allocator, "/config set ui_theme dark");
+    try testing.expect(out != null);
+    allocator.free(out.?);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, allocator, .limited(4096));
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ConfigChange", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("user_settings", parsed.value.object.get("source").?.string);
+}
+
+test "hooks-permissions-03: /reload-skills fires ConfigChange with source=skills" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var home_ov = try ConfigChangeHomeOverride.install(allocator, root);
+    defer home_ov.deinit();
+
+    const sentinel = try std.fs.path.join(allocator, &.{ root, "config_change_skills.json" });
+    defer allocator.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        allocator,
+        "{{\"hooks\":{{\"ConfigChange\":[{{\"matcher\":\"skills\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer allocator.free(settings);
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    const out = try replCommandCallback(runtime, allocator, "/reload-skills");
+    try testing.expect(out != null);
+    allocator.free(out.?);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, allocator, .limited(4096));
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ConfigChange", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("skills", parsed.value.object.get("source").?.string);
+}
+
+test "config-layout-17: buildCommitPrompt includes the Co-Authored-By trailer only when include_co_authored_by is true" {
+    const allocator = testing.allocator;
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+
+    const with_trailer = try buildCommitPrompt(allocator, &cfg, "");
+    defer allocator.free(with_trailer);
+    try testing.expect(std.mem.indexOf(u8, with_trailer, "Co-Authored-By: zcode <noreply@zcode.dev>") != null);
+
+    cfg.include_co_authored_by = false;
+    const without_trailer = try buildCommitPrompt(allocator, &cfg, "");
+    defer allocator.free(without_trailer);
+    try testing.expect(std.mem.indexOf(u8, without_trailer, "Co-Authored-By") == null);
+    // The rest of the template is unaffected.
+    try testing.expect(std.mem.indexOf(u8, without_trailer, "git commit -m") != null);
 }
 
 test "commands-03: /security-review and /security_review both reach the surviving handler" {
