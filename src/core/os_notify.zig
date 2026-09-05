@@ -38,6 +38,10 @@ pub fn available() bool {
 /// output, swallows all errors. On platforms without a backend
 /// (`available() == false`) this returns immediately.
 pub fn notify(allocator: std.mem.Allocator, title: []const u8, body: []const u8) void {
+    // Never fire a real desktop notification from a test binary. Tests that
+    // exercise callers (plugin autoupdate, KAIROS briefs) would otherwise pop an
+    // OS notification on the developer's desktop every `zig build test` run.
+    if (builtin.is_test) return;
     switch (builtin.os.tag) {
         .macos => notifyMacos(allocator, title, body),
         .linux => notifyLinux(allocator, title, body),
@@ -143,4 +147,11 @@ test "escapeAppleScript escapes both quote and backslash together" {
     const got = try escapeAppleScript(testing.allocator, "\\\"");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("\\\\\\\"", got);
+}
+
+test "notify is a no-op inside a test binary (no desktop notification is spawned)" {
+    // builtin.is_test is comptime-true here, so this must return before
+    // reaching the osascript/notify-send spawn path. If the guard were missing
+    // this would pop a real notification on the developer's desktop.
+    notify(testing.allocator, "zcode test", "this must never reach the desktop");
 }

@@ -2,8 +2,8 @@
 """Score zcode similarity vs Claude Code reference."""
 import os, re, glob, sys
 
-CC = "/Users/example/Downloads/claude-code-main"
-ZC = "/Users/example/Projects/zig-code"
+CC = os.environ.get("ZCODE_CC_REF", os.path.expanduser("~/projects/experiments/edualc"))
+ZC = os.environ.get("ZCODE_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # --- 1. Tool coverage ---
 cc_tools = set()

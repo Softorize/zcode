@@ -4,6 +4,8 @@ All notable changes to `zcode` should be documented in this file.
 
 ## Unreleased
 
+- Fix `zig build test` popping a real macOS/Linux desktop notification: `core/os_notify.notify` is now a no-op inside test binaries (the plugin auto-update test exercised the live `osascript` path and showed a "zcode plugins: Updated plugins: demo" notification on every run).
+- `tools/similarity/score-*.py` now resolve the reference and repo roots from `ZCODE_CC_REF` / `ZCODE_ROOT` (defaults: `~/projects/experiments/edualc` and the repo containing the script) instead of hardcoded example paths.
 - Add supply-chain dependency-pin CI gate (`scripts/ci/check_dependency_pin.sh` + `scripts/ci/allowed_dependencies.txt`) that fails builds if `build.zig.zon` grows any dependency not explicitly approved in the allowlist.
 - Keyless-sign the release SBOM with cosign (Sigstore OIDC) and publish `sbom.cdx.json.sig` and `sbom.cdx.json.pem` alongside the SBOM for enterprise supply-chain verification.
 - Cosign-sign every release binary (Linux x86_64/aarch64, macOS x86_64/aarch64) and publish `.sig` + `.pem` artifacts next to each binary. Windows is not built (the codebase uses POSIX-only APIs); the `install.ps1` shim was removed to stop advertising an unsupported platform.

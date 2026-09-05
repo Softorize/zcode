@@ -7,8 +7,8 @@ parity, not aspiration.
 """
 import os, re, glob
 
-CC = "/Users/example/Downloads/claude-code-main"
-ZC = "/Users/example/Projects/zig-code"
+CC = os.environ.get("ZCODE_CC_REF", os.path.expanduser("~/projects/experiments/edualc"))
+ZC = os.environ.get("ZCODE_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 cc_tools = set(d[:-4] for d in os.listdir(f"{CC}/src/tools") if d.endswith("Tool"))
 
