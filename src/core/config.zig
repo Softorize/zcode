@@ -64,6 +64,15 @@ pub const Config = struct {
     ui_density: []u8,
     ui_leader_key: []u8,
     ui_show_top_bar: bool,
+    /// r3-chrome-01: restores zcode's pre-2.1.261-parity bordered welcome
+    /// card ("terminal workbench" + "Quick reference") instead of the
+    /// condensed glyph header. Default false.
+    ui_legacy_banner: bool,
+    /// r3-chrome-03/04: restores zcode's pre-2.1.261-parity composer
+    /// border labels and two-row "actions"/"ready" footer instead of the
+    /// reference's plain rules + single "? for shortcuts" line. Default
+    /// false.
+    ui_legacy_footer: bool,
     ui_show_shortcuts_panel: bool,
     ui_prompt_label: []u8,
     ui_transcript_max_lines: usize,
@@ -419,7 +428,12 @@ pub const Config = struct {
             .ui_idle_return_never_ask = false,
             .ui_density = try allocator.dupe(u8, "full"),
             .ui_leader_key = try allocator.dupe(u8, "ctrl+x"),
-            .ui_show_top_bar = true,
+            // r3-chrome-02: the reference has no persistent top status
+            // bar; false matches the 2.1.261 default look. Existing zcode
+            // users who prefer the old bar can set ui_show_top_bar = true.
+            .ui_show_top_bar = false,
+            .ui_legacy_banner = false,
+            .ui_legacy_footer = false,
             .ui_show_shortcuts_panel = true,
             .ui_prompt_label = try allocator.dupe(u8, ">"),
             .ui_transcript_max_lines = 20_000,

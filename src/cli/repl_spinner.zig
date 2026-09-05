@@ -659,6 +659,9 @@ fn spinnerMain(done: *std.atomic.Value(bool), state: *SpinnerState, fixed_input_
         const tool_count = state.tool_use_count;
         const queued_count = state.prompt_queue_count;
         const has_queued = state.queued_input_len > 0;
+        // r3-chrome-05: live output-token count for the reference's
+        // "\xe2\x86\x91 <tokens> tokens" spinner segment.
+        const live_tokens = state.stream_token_count;
 
         // Rebind `latest` to a stuck-indicator when appropriate.
         if (is_default_label and tool_count == 0 and elapsed_ms >= 5_000 and scroll_delta == 0) {
@@ -698,7 +701,7 @@ fn spinnerMain(done: *std.atomic.Value(bool), state: *SpinnerState, fixed_input_
 
         var line_buf: [1536]u8 = undefined;
         const line = if (fixed_input_border)
-            buildFixedSpinnerFrame(&line_buf, frame, latest, frame_idx, elapsed_ms, bottom_margin_rows, tool_count, queued_count) catch return
+            buildFixedSpinnerFrame(&line_buf, frame, latest, frame_idx, elapsed_ms, bottom_margin_rows, tool_count, queued_count, started_ns, live_tokens) catch return
         else blk: {
             if (tool_count > 0 and queued_count > 0) {
                 break :blk std.fmt.bufPrint(&line_buf, "\r{s} {s} \x1b[2m{d} tools | {d} queued | {d}.{d}s\x1b[0m\x1b[K", .{ frame, latest, tool_count, queued_count, elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch return;
@@ -711,6 +714,16 @@ fn spinnerMain(done: *std.atomic.Value(bool), state: *SpinnerState, fixed_input_
                 // single-line carriage-return repaint model stays intact (a
                 // separate persistent tip row would fight the \r overwrite).
                 break :blk std.fmt.bufPrint(&line_buf, "\r{s} {s} \x1b[2m{d}.{d}s | tip: {s}\x1b[0m\x1b[K", .{ frame, latest, elapsed_ms / 1000, (elapsed_ms % 1000) / 100, tip_snap }) catch return;
+            } else if (is_default_label and !is_stalled and scroll_delta == 0) {
+                // r3-chrome-05: the reference's idle-turn spinner line --
+                // "<Verb>\xe2\x80\xa6 (Ns \xc2\xb7 \xe2\x86\x91 N tokens \xc2\xb7
+                // esc to interrupt)" -- replaces the bare "N.Ns" timer once
+                // there is no more specific tool/queue/tip/stalled status to
+                // show. `started_ns` seeds the verb so it stays stable for
+                // the whole turn (getSpinnerVerb's contract).
+                var spin_buf: [128]u8 = undefined;
+                const spin_text = formatSpinnerLine(&spin_buf, getSpinnerVerb(started_ns), elapsed_ms / 1000, live_tokens);
+                break :blk std.fmt.bufPrint(&line_buf, "\r{s} \x1b[2m{s}\x1b[0m\x1b[K", .{ frame, spin_text }) catch return;
             } else {
                 break :blk std.fmt.bufPrint(&line_buf, "\r{s} {s} \x1b[2m{d}.{d}s\x1b[0m\x1b[K", .{ frame, latest, elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch return;
             }
@@ -1051,15 +1064,17 @@ fn buildFixedSpinnerFrame(
     bottom_margin_rows: usize,
     tool_count: usize,
     queued_count: usize,
+    verb_seed: i128,
+    tokens: usize,
 ) ![]const u8 {
     const cols = terminalCols();
     const thinking_row = thinkingRow(bottom_margin_rows);
     var status_buf: [768]u8 = undefined;
-    const status = buildThinkingStatusLine(&status_buf, cols, frame, frame_idx, elapsed_ms, latest, tool_count, queued_count);
+    const status = buildThinkingStatusLine(&status_buf, cols, frame, frame_idx, elapsed_ms, latest, tool_count, queued_count, verb_seed, tokens);
     return std.fmt.bufPrint(out, "\x1b7\x1b[{d};1H\x1b[2K{s}\x1b8", .{ thinking_row, status });
 }
 
-fn buildThinkingStatusLine(out: []u8, cols: usize, frame: []const u8, frame_idx: usize, elapsed_ms: u64, latest: []const u8, tool_count: usize, queued_count: usize) []const u8 {
+fn buildThinkingStatusLine(out: []u8, cols: usize, frame: []const u8, frame_idx: usize, elapsed_ms: u64, latest: []const u8, tool_count: usize, queued_count: usize, verb_seed: i128, tokens: usize) []const u8 {
     var pulse_buf: [64]u8 = undefined;
     const pulse = buildActivityPulse(&pulse_buf, frame_idx);
     const secs = elapsed_ms / 1000;
@@ -1103,6 +1118,16 @@ fn buildThinkingStatusLine(out: []u8, cols: usize, frame: []const u8, frame_idx:
         }
         if (queued_count > 0) {
             break :blk std.fmt.bufPrint(&line_buf, "\x1b[2m{s}\x1b[0m {s} {s} \x1b[2m| {d} queued | {d}.{d}s\x1b[0m", .{ frame, pulse, truncated_label, queued_count, secs, tenths }) catch "thinking";
+        }
+        if (is_default and !stalled) {
+            // r3-chrome-05: the reference's idle-turn line -- a colourful
+            // verb (getSpinnerVerb, seeded off the turn's start so it stays
+            // stable while this composer's spinner ticks) plus elapsed
+            // time, live token count, and the "esc to interrupt" reminder --
+            // replaces the plain "thinking  N.Ns" default.
+            var spin_buf: [128]u8 = undefined;
+            const spin_text = formatSpinnerLine(&spin_buf, getSpinnerVerb(verb_seed), secs, tokens);
+            break :blk std.fmt.bufPrint(&line_buf, "\x1b[2m{s}\x1b[0m {s} \x1b[2m{s}\x1b[0m", .{ frame, pulse, spin_text }) catch "thinking";
         }
         break :blk std.fmt.bufPrint(&line_buf, "\x1b[2m{s}\x1b[0m {s} {s}  \x1b[2m{d}.{d}s\x1b[0m", .{ frame, pulse, truncated_label, secs, tenths }) catch "thinking";
     };
@@ -1326,6 +1351,20 @@ pub fn getSpinnerVerb(seed: i128) []const u8 {
     h *%= 0xc4ceb9fe1a85ec53;
     h ^= h >> 33;
     return SPINNER_VERBS[h % SPINNER_VERBS.len];
+}
+
+/// r3-chrome-05: the reference's idle-turn spinner line -- cc_strings.txt's
+/// SPINNER_VERBS array feeding a line shaped like "<Verb>\xe2\x80\xa6 (<N>s
+/// \xc2\xb7 \xe2\x86\x91 <tokens> tokens \xc2\xb7 esc to interrupt)". Pure
+/// and independently testable so the exact wording (ellipsis, up-arrow,
+/// middot separators) is pinned down apart from the spinner thread's
+/// locking/timing concerns. `tokens == 0` omits the token segment entirely
+/// (nothing streamed yet) rather than printing "\xe2\x86\x91 0 tokens".
+pub fn formatSpinnerLine(out: []u8, verb: []const u8, elapsed_secs: u64, tokens: usize) []const u8 {
+    if (tokens > 0) {
+        return std.fmt.bufPrint(out, "{s}\xe2\x80\xa6 ({d}s \xc2\xb7 \xe2\x86\x91 {d} tokens \xc2\xb7 esc to interrupt)", .{ verb, elapsed_secs, tokens }) catch verb;
+    }
+    return std.fmt.bufPrint(out, "{s}\xe2\x80\xa6 ({d}s \xc2\xb7 esc to interrupt)", .{ verb, elapsed_secs }) catch verb;
 }
 
 pub fn deriveThinkingTopicTitle(summary: []const u8, out: *[96]u8) []const u8 {
@@ -1982,6 +2021,49 @@ test "SPINNER_VERBS contains colourful fallbacks" {
     try testing.expect(has_thinking);
     try testing.expect(has_actioning);
     try testing.expect(has_perambulating);
+}
+
+test "formatSpinnerLine matches the reference shape with a live token count" {
+    var buf: [128]u8 = undefined;
+    const line = formatSpinnerLine(&buf, "Cogitating", 12, 340);
+    try testing.expectEqualStrings("Cogitating\xe2\x80\xa6 (12s \xc2\xb7 \xe2\x86\x91 340 tokens \xc2\xb7 esc to interrupt)", line);
+}
+
+test "formatSpinnerLine omits the token segment when nothing has streamed yet" {
+    var buf: [128]u8 = undefined;
+    const line = formatSpinnerLine(&buf, "Accomplishing", 3, 0);
+    try testing.expectEqualStrings("Accomplishing\xe2\x80\xa6 (3s \xc2\xb7 esc to interrupt)", line);
+    try testing.expect(std.mem.indexOf(u8, line, "tokens") == null);
+}
+
+test "formatSpinnerLine always ends with esc to interrupt" {
+    var buf: [128]u8 = undefined;
+    inline for (.{ 0, 1, 500 }) |tokens| {
+        const line = formatSpinnerLine(&buf, "Clauding", 42, tokens);
+        try testing.expect(std.mem.endsWith(u8, line, "esc to interrupt)"));
+    }
+}
+
+test "buildThinkingStatusLine shows a colourful verb line with esc-to-interrupt on an idle default turn" {
+    var out: [768]u8 = undefined;
+    const line = buildThinkingStatusLine(&out, 200, "\xe2\x97\x8f", 0, 4_000, "", 0, 0, 12345, 87);
+    try testing.expect(std.mem.indexOf(u8, line, "esc to interrupt") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "\xe2\x86\x91 87 tokens") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "thinking") == null);
+}
+
+test "buildThinkingStatusLine keeps the stalled message instead of a verb once past the 5s stall threshold" {
+    var out: [768]u8 = undefined;
+    const line = buildThinkingStatusLine(&out, 200, "\xe2\x97\x8f", 0, 6_000, "", 0, 0, 12345, 0);
+    try testing.expect(std.mem.indexOf(u8, line, "waiting for model response") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "esc to interrupt") == null);
+}
+
+test "buildThinkingStatusLine keeps the tool-count segment for a structured progress label" {
+    var out: [768]u8 = undefined;
+    const line = buildThinkingStatusLine(&out, 200, "\xe2\x97\x8f", 0, 2_000, "running tool: Read", 2, 0, 12345, 0);
+    try testing.expect(std.mem.indexOf(u8, line, "2 tools") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "esc to interrupt") == null);
 }
 
 test "getSpinnerVerb is deterministic per seed and varies between seeds" {
