@@ -75,22 +75,31 @@ pub const SessionKind = enum {
 };
 
 /// Live activity state of a session. `idle` is the default at registration.
+/// `stopped` (cli-flags-27) marks a background session that was SIGTERM'd
+/// via `zcode kill`/`stop` WITHOUT deleting its registry entry, matching the
+/// reference's stop|kill semantics ("its conversation is kept: `claude
+/// attach <id>` opens it again"). A stopped entry's pid is no longer live;
+/// `list()`'s dead-pid sweep intentionally skips reaping it (see the sweep
+/// loop below) so `zcode attach`/`zcode ps` can still see it.
 pub const SessionStatus = enum {
     idle,
     busy,
     waiting,
+    stopped,
 
     pub fn toString(self: SessionStatus) []const u8 {
         return switch (self) {
             .idle => "idle",
             .busy => "busy",
             .waiting => "waiting",
+            .stopped => "stopped",
         };
     }
 
     pub fn fromString(s: []const u8) SessionStatus {
         if (std.mem.eql(u8, s, "busy")) return .busy;
         if (std.mem.eql(u8, s, "waiting")) return .waiting;
+        if (std.mem.eql(u8, s, "stopped")) return .stopped;
         return .idle;
     }
 
@@ -302,6 +311,31 @@ fn updateImpl(allocator: std.mem.Allocator, patch: Patch) !void {
     try writeEntry(allocator, dir, merged);
 }
 
+/// cli-flags-27: patch the `status` of an ARBITRARY (not necessarily
+/// current-process) pid's registry entry in place, leaving every other
+/// field untouched. Used by `zcode kill`/`stop <id>` to mark a session
+/// `.stopped` after SIGTERM'ing it, without deleting the file the way `rm`
+/// does -- so the conversation stays discoverable by `attach`/`ps`. A
+/// missing entry is a silent no-op (mirrors `update`'s fire-and-forget
+/// contract); returns true when an entry was found and rewritten.
+pub fn setStatusForPid(allocator: std.mem.Allocator, pid: i32, status: SessionStatus) bool {
+    return setStatusForPidImpl(allocator, pid, status) catch false;
+}
+
+fn setStatusForPidImpl(allocator: std.mem.Allocator, pid: i32, status: SessionStatus) !bool {
+    const dir = try registryDir(allocator);
+    defer allocator.free(dir);
+    const path = try pidFilePath(allocator, dir, pid);
+    defer allocator.free(path);
+
+    var entry = (try readFile(allocator, path)) orelse return false;
+    defer entry.deinit(allocator);
+    entry.status = status;
+    entry.updated_ts = clock.nowSeconds();
+    try writeEntry(allocator, dir, entry);
+    return true;
+}
+
 /// Delete the current process's registry file. A second call is a no-op
 /// (ENOENT is swallowed). Call from a `defer` at the top of `main`.
 pub fn unregister(allocator: std.mem.Allocator) void {
@@ -360,7 +394,11 @@ pub fn list(allocator: std.mem.Allocator) ![]Entry {
 
         const entry = (readFile(allocator, path) catch null) orelse continue;
         const alive = isPidRunning(entry.pid);
-        if (!alive) {
+        // cli-flags-27: a `.stopped` entry's pid is EXPECTED to be dead (it
+        // was deliberately SIGTERM'd by `kill`/`stop`, which keeps the
+        // registry file instead of deleting it so `attach`/`ps` can still
+        // find it) -- never sweep it as stale.
+        if (!alive and entry.status != .stopped) {
             // Stale: a session that crashed without unregistering. Sweep it
             // (never our own pid - that file is owned by this process). Skip
             // the sweep on WSL.
@@ -611,6 +649,105 @@ test "update patches status/waiting_for and advances updated_ts" {
     try testing.expectEqual(SessionStatus.busy, after.status);
     try testing.expectEqualStrings("tool", after.waiting_for.?);
     try testing.expect(after.updated_ts >= before_ts);
+}
+
+test "setStatusForPid rewrites an arbitrary pid's status without touching other fields" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    setRegistryRoot(root_z);
+    defer clearRegistryRoot();
+
+    try register(alloc, .{ .kind = .bg, .cwd = "/work", .name = "victim", .session_id = "sess-1" });
+    defer unregister(alloc);
+
+    const changed = setStatusForPid(alloc, currentPid(), .stopped);
+    try testing.expect(changed);
+
+    const after = (try read(alloc, currentPid())).?;
+    defer after.deinit(alloc);
+    try testing.expectEqual(SessionStatus.stopped, after.status);
+    try testing.expectEqualStrings("victim", after.name.?);
+    try testing.expectEqualStrings("sess-1", after.session_id.?);
+}
+
+test "setStatusForPid on an unregistered pid is a no-op returning false" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    setRegistryRoot(root_z);
+    defer clearRegistryRoot();
+
+    try testing.expect(!setStatusForPid(alloc, 999999, .stopped));
+}
+
+test "list() keeps a dead .stopped entry but sweeps a dead .idle one (cli-flags-27)" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    setRegistryRoot(root_z);
+    defer clearRegistryRoot();
+
+    // Two short-lived children we can register then let die, one marked
+    // .stopped (kill/stop's contract) and one left .idle (a crash).
+    var stopped_child = std.process.spawn(rt.io, .{
+        .argv = &.{ "true" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest;
+    const stopped_pid: i32 = @intCast(stopped_child.id orelse return error.SkipZigTest);
+
+    var idle_child = std.process.spawn(rt.io, .{
+        .argv = &.{ "true" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest;
+    const idle_pid: i32 = @intCast(idle_child.id orelse return error.SkipZigTest);
+
+    const dir = try registryDir(alloc);
+    defer alloc.free(dir);
+    try paths.ensureDir(dir);
+    try writeEntry(alloc, dir, .{ .pid = stopped_pid, .cwd = "/x", .started_ts = 1, .updated_ts = 1, .kind = .bg, .status = .stopped });
+    try writeEntry(alloc, dir, .{ .pid = idle_pid, .cwd = "/x", .started_ts = 1, .updated_ts = 1, .kind = .bg, .status = .idle });
+
+    // Let both processes actually exit and reap them so isPidRunning sees
+    // them as dead (a zombie can still answer kill(pid, 0) on some
+    // platforms).
+    _ = stopped_child.wait(rt.io) catch {};
+    _ = idle_child.wait(rt.io) catch {};
+
+    const entries = try list(alloc);
+    defer freeEntries(alloc, entries);
+
+    var saw_stopped = false;
+    for (entries) |e| {
+        if (e.pid == stopped_pid) saw_stopped = true;
+        try testing.expect(e.pid != idle_pid);
+    }
+    try testing.expect(saw_stopped);
+
+    // The idle entry's file was actually deleted by the sweep.
+    const idle_path = try pidFilePath(alloc, dir, idle_pid);
+    defer alloc.free(idle_path);
+    std.Io.Dir.cwd().access(rt.io, idle_path, .{}) catch |err| {
+        try testing.expectEqual(error.FileNotFound, err);
+        return;
+    };
+    try testing.expect(false); // idle entry should have been swept
 }
 
 test "unregister removes the file and a second call is a no-op" {
