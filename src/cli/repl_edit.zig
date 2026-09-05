@@ -533,7 +533,7 @@ pub fn canonicalToolDisplayName(tool_name: []const u8) []const u8 {
         .{ &.{ "WebSearch", "web_search" }, "Search" },
         .{ &.{ "Task", "task" }, "Task" },
         .{ &.{ "TaskRun", "task_run" }, "TaskRun" },
-        .{ &.{ "TaskPoll", "task_poll", "TaskGet", "task_get" }, "TaskGet" },
+        .{ &.{ "task_poll", "TaskGet", "task_get" }, "TaskGet" },
         .{ &.{ "GitDiff", "git_diff" }, "GitDiff" },
         .{ &.{"git_status"}, "GitStatus" },
     };
@@ -1162,7 +1162,6 @@ fn startsWithAnyIgnoreCase(text: []const u8, needles: []const []const u8) bool {
     }
     return false;
 }
-
 
 // repl-ux-02: Claude Code renders every tool call as a flat bullet line
 // ("⏺ Tool(args)", cc_strings.txt: `Ar=P()==="macos"?"⏺":"●"`) followed

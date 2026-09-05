@@ -787,7 +787,7 @@ pub const AgentRuntime = struct {
     /// runtime is a background agent bound to a task, the round loop checks
     /// `summary_cadence.shouldSummarize` at each round boundary and, when it
     /// fires, writes a cheap progress summary into the bound task's record so
-    /// TaskPoll/TaskOutput surface it to the parent. `bg_summary_task_id` and
+    /// TaskGet/TaskOutput surface it to the parent. `bg_summary_task_id` and
     /// `bg_summary_cwd` are borrowed (owned by the spawning BackgroundCtx and
     /// live as long as the run); both null on the main agent so the hook is a
     /// no-op there. `bg_summary_last_round` and `bg_summary_started_at` track
@@ -2866,7 +2866,7 @@ pub const AgentRuntime = struct {
                         emitProgressFmt(reporter, "polling background task progress ({d}/{d})", .{ auto_continuations, max_auto_continuations });
                         try self.appendHistoryTurn(
                             .system,
-                            "A background task was started in the previous round. Do not stop after launching it. Continue autonomously: call TaskPoll or TaskOutput now to inspect the task state before claiming completion. If the task is still running, keep polling until it completes or report the concrete blocker.",
+                            "A background task was started in the previous round. Do not stop after launching it. Continue autonomously: call TaskGet or TaskOutput now to inspect the task state before claiming completion. If the task is still running, keep polling until it completes or report the concrete blocker.",
                         );
                         continue;
                     }
@@ -2887,7 +2887,7 @@ pub const AgentRuntime = struct {
                         emitProgressFmt(reporter, "requesting verification before completion ({d}/2)", .{verification_reprompt_attempts});
                         try self.appendHistoryTurn(
                             .system,
-                            "Verification is still required before completion. Run an appropriate verification tool now, such as RunTests, GitDiff, git_status, TaskPoll, TaskOutput, or a read-only shell status/build/test command. If verification is impossible, return a concrete blocker explaining exactly why it could not be run.",
+                            "Verification is still required before completion. Run an appropriate verification tool now, such as RunTests, GitDiff, git_status, TaskGet, TaskOutput, or a read-only shell status/build/test command. If verification is impossible, return a concrete blocker explaining exactly why it could not be run.",
                         );
                         continue;
                     }
@@ -5045,7 +5045,7 @@ pub const AgentRuntime = struct {
     /// enough rounds/time have elapsed since the last summary; when it fires,
     /// writes a cheap progress line (round count + the latest activity preview
     /// drawn from this agent's own history) into the bound task record's
-    /// `summary` so TaskPoll/TaskOutput surface it to the parent.
+    /// `summary` so TaskGet/TaskOutput surface it to the parent.
     ///
     /// Best-effort and cheap by design: it does NOT fork an LLM turn (which
     /// would cost an API call and could block the agent's real work); the
@@ -6517,7 +6517,7 @@ pub const AgentRuntime = struct {
 
         return std.fmt.allocPrint(
             self.allocator,
-            "Agent spawned in background.\nbackground_agent_id={s}\nUse `/tasks`, TaskPoll, or TaskOutput to inspect it.",
+            "Agent spawned in background.\nbackground_agent_id={s}\nUse `/tasks`, TaskGet, or TaskOutput to inspect it.",
             .{task_id_for_return},
         );
     }

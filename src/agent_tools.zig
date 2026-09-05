@@ -116,25 +116,25 @@ pub fn effectiveMode(active_agent: ?@import("core/agents.zig").AgentSpec, curren
 // Also reflected as is_read_only=true on ToolSchema for metadata.
 
 pub const read_only_tool_names = [_][]const u8{
-    "file_read",          "Read",              "read",
-    "Glob",               "glob",              "Grep",
-    "grep",               "GitDiff",           "git_diff",
-    "GitLog",             "git_log",           "git_status",
-    "WebFetch",           "web_fetch",         "WebSearch",
-    "web_search",         "JsonQuery",         "json_query",
-    "AskUserQuestion",    "ask_user_question", "HttpRequest",
-    "http_request",       "TaskGet",           "task_get",
-    "TaskPoll",           "task_poll",         "TaskOutput",
-    "task_output",        "TodoRead",          "todo_read",
-    "TodoWrite",          "todo_write",        "ListDir",
-    "list_dir",           "Stat",              "stat",
-    "Sleep",              "sleep",             "mcp_servers_list",
-    "McpServersList",     "mcp_tools_list",    "McpToolsList",
-    "mcp_resources_list", "mcp_resource_read", "mcp_resource_templates_list",
-    "mcp_prompts_list",   "mcp_prompt_get",    "mcp_notifications",
-    "mcp_complete",       "EnterPlanMode",     "ExitPlanMode",
-    "enter_plan_mode",    "exit_plan_mode",    "Skill",
-    "skill",              "Command",           "command",
+    "file_read",         "Read",                        "read",
+    "Glob",              "glob",                        "Grep",
+    "grep",              "GitDiff",                     "git_diff",
+    "GitLog",            "git_log",                     "git_status",
+    "WebFetch",          "web_fetch",                   "WebSearch",
+    "web_search",        "JsonQuery",                   "json_query",
+    "AskUserQuestion",   "ask_user_question",           "HttpRequest",
+    "http_request",      "TaskGet",                     "task_get",
+    "task_poll",         "TaskOutput",                  "task_output",
+    "TodoRead",          "todo_read",                   "TodoWrite",
+    "todo_write",        "ListDir",                     "list_dir",
+    "Stat",              "stat",                        "Sleep",
+    "sleep",             "mcp_servers_list",            "McpServersList",
+    "mcp_tools_list",    "McpToolsList",                "mcp_resources_list",
+    "mcp_resource_read", "mcp_resource_templates_list", "mcp_prompts_list",
+    "mcp_prompt_get",    "mcp_notifications",           "mcp_complete",
+    "EnterPlanMode",     "ExitPlanMode",                "enter_plan_mode",
+    "exit_plan_mode",    "Skill",                       "skill",
+    "Command",           "command",
 };
 
 pub fn isReadOnlyTool(name: []const u8) bool {
@@ -149,21 +149,20 @@ pub fn isReadOnlyTool(name: []const u8) bool {
 /// these tools is not making user-visible progress.
 pub fn isInspectionOnlyTool(name: []const u8) bool {
     return matchesToolName(name, &.{
-        "file_read",          "Read",              "read",
-        "Glob",               "glob",              "Grep",
-        "grep",               "GitDiff",           "git_diff",
-        "GitLog",             "git_log",           "git_status",
-        "WebFetch",           "web_fetch",         "WebSearch",
-        "web_search",         "JsonQuery",         "json_query",
-        "HttpRequest",        "http_request",      "TaskGet",
-        "task_get",           "TaskPoll",          "task_poll",
-        "TaskOutput",         "task_output",       "TodoRead",
-        "todo_read",          "ListDir",           "list_dir",
-        "Stat",               "stat",              "mcp_servers_list",
-        "McpServersList",     "mcp_tools_list",    "McpToolsList",
-        "mcp_resources_list", "mcp_resource_read", "mcp_resource_templates_list",
-        "mcp_prompts_list",   "mcp_prompt_get",    "mcp_notifications",
-        "mcp_complete",
+        "file_read",         "Read",                        "read",
+        "Glob",              "glob",                        "Grep",
+        "grep",              "GitDiff",                     "git_diff",
+        "GitLog",            "git_log",                     "git_status",
+        "WebFetch",          "web_fetch",                   "WebSearch",
+        "web_search",        "JsonQuery",                   "json_query",
+        "HttpRequest",       "http_request",                "TaskGet",
+        "task_get",          "task_poll",                   "TaskOutput",
+        "task_output",       "TodoRead",                    "todo_read",
+        "ListDir",           "list_dir",                    "Stat",
+        "stat",              "mcp_servers_list",            "McpServersList",
+        "mcp_tools_list",    "McpToolsList",                "mcp_resources_list",
+        "mcp_resource_read", "mcp_resource_templates_list", "mcp_prompts_list",
+        "mcp_prompt_get",    "mcp_notifications",           "mcp_complete",
     });
 }
 
@@ -2456,7 +2455,7 @@ pub fn summarizeToolCallForProgress(out: []u8, name: []const u8, args: []const u
     if (matchesToolName(name, &.{ "TodoWrite", "todo_write" })) {
         return "update todo checklist";
     }
-    if (matchesToolName(name, &.{ "TaskPoll", "task_poll", "TaskGet", "task_get" })) {
+    if (matchesToolName(name, &.{ "task_poll", "TaskGet", "task_get" })) {
         if (id) |task_id| return std.fmt.bufPrint(out, "task {s}", .{task_id}) catch "task status";
         return "task status";
     }
@@ -3070,11 +3069,11 @@ pub fn isStrictViolationTrace(trace: ToolTrace) bool {
 }
 
 pub fn isBackgroundTaskFollowupTool(name: []const u8) bool {
-    return matchesToolName(name, &.{ "TaskPoll", "task_poll", "TaskGet", "task_get", "TaskOutput", "task_output" });
+    return matchesToolName(name, &.{ "task_poll", "TaskGet", "task_get", "TaskOutput", "task_output" });
 }
 
 pub fn isVerificationTool(name: []const u8, args: []const u8) bool {
-    if (matchesToolName(name, &.{ "RunTests", "run_tests", "GitDiff", "git_diff", "git_status", "TaskPoll", "task_poll", "TaskOutput", "task_output", "TaskGet", "task_get" })) {
+    if (matchesToolName(name, &.{ "RunTests", "run_tests", "GitDiff", "git_diff", "git_status", "task_poll", "TaskOutput", "task_output", "TaskGet", "task_get" })) {
         return true;
     }
     if (matchesToolName(name, &.{ "shell", "Bash", "bash" })) {
@@ -4780,7 +4779,7 @@ test "concrete action tool classification recognizes edit write and execution to
     try testing.expect(isConcreteActionTool("Write", "path=README.md,content=hi"));
     try testing.expect(isConcreteActionTool("GitApply", "patch=diff"));
     try testing.expect(isConcreteActionTool("Bash", "command=\"zig build test\""));
-    try testing.expect(!isConcreteActionTool("TaskPoll", "id=task-1"));
+    try testing.expect(!isConcreteActionTool("TaskGet", "id=task-1"));
     try testing.expect(!isConcreteActionTool("TaskOutput", "id=task-1"));
     try testing.expect(!isConcreteActionTool("Read", "path=src/main.zig"));
     try testing.expect(!isConcreteActionTool("Grep", "pattern=foo"));

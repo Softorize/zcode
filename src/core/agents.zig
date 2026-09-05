@@ -581,7 +581,7 @@ const builtin_agent_templates = [_]BuiltinAgentTemplate{
         \\Do not make unrelated code changes.
         ,
         .mode = .execution,
-        .tools = &.{ "RunTests", "GitDiff", "git_status", "Read", "Grep", "Glob", "Bash", "shell", "TaskPoll", "TaskOutput", "TodoRead", "TodoWrite" },
+        .tools = &.{ "RunTests", "GitDiff", "git_status", "Read", "Grep", "Glob", "Bash", "shell", "TaskGet", "TaskOutput", "TodoRead", "TodoWrite" },
     },
     .{
         .name = "reviewer",

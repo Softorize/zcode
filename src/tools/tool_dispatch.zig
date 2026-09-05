@@ -136,13 +136,15 @@ const dispatch_table = [_]DispatchEntry{
     .{ .names = &.{ "NotebookEdit", "notebook_edit" }, .handler = handleNotebookEdit },
     .{ .names = &.{ "Task", "task" }, .handler = handleTask },
     .{ .names = &.{ "TaskCreate", "task_create" }, .handler = handleTaskCreate },
-    .{ .names = &.{ "TaskGet", "task_get" }, .handler = handleTaskGet },
+    // "task_poll" is a legacy dispatch-only alias (never advertised): its
+    // old separate handler was byte-identical to taskGet, so it now routes
+    // straight to TaskGet instead of a separate name/handler.
+    .{ .names = &.{ "TaskGet", "task_get", "task_poll" }, .handler = handleTaskGet },
     .{ .names = &.{ "TaskUpdate", "task_update" }, .handler = handleTaskUpdate },
     .{ .names = &.{ "TaskList", "task_list" }, .handler = handleTaskList },
     .{ .names = &.{ "TaskStop", "task_stop" }, .handler = handleTaskStop },
     .{ .names = &.{ "TaskOutput", "task_output" }, .handler = handleTaskOutput },
     .{ .names = &.{ "TaskRun", "task_run" }, .handler = handleTaskRun },
-    .{ .names = &.{ "TaskPoll", "task_poll" }, .handler = handleTaskPoll },
     .{ .names = &.{ "TaskClaim", "task_claim" }, .handler = handleTaskClaim },
     .{ .names = &.{ "EnterPlanMode", "enter_plan_mode" }, .handler = handleEnterPlanMode },
     .{ .names = &.{ "ExitPlanMode", "exit_plan_mode" }, .handler = handleExitPlanMode },
@@ -710,10 +712,6 @@ fn handleTaskOutput(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: T
 
 fn handleTaskRun(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
     return taskRun(allocator, req);
-}
-
-fn handleTaskPoll(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
-    return taskPoll(allocator, req);
 }
 
 fn handleTaskClaim(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {

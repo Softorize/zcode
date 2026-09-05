@@ -30,9 +30,11 @@ const env = @import("env.zig");
 pub const PROMPT_TIMEOUT_MS: u64 = 30_000;
 pub const AGENT_TIMEOUT_MS: u64 = 60_000;
 
-/// System prompt for prompt hooks, verbatim from execPromptHook.ts:65-69.
+/// System prompt for prompt hooks, adapted from execPromptHook.ts:65-69 --
+/// reworded to zcode's own identity (never claim to be Claude Code /
+/// Anthropic's product) while keeping the same verification contract.
 const PROMPT_SYSTEM =
-    \\You are evaluating a hook in Claude Code.
+    \\You are evaluating a hook in zcode.
     \\
     \\Your response must be a JSON object matching one of the following schemas:
     \\1. If the condition is met, return: {"ok": true}
@@ -41,9 +43,10 @@ const PROMPT_SYSTEM =
 
 /// System prompt for agent hooks, condensed from execAgentHook.ts. The reference
 /// runs a multi-turn agentic verifier; our first-parity single-shot variant asks
-/// for the same `{ok, reason}` result directly.
+/// for the same `{ok, reason}` result directly. Reworded to zcode's own
+/// identity (never claim to be Claude Code / Anthropic's product).
 const AGENT_SYSTEM =
-    \\You are verifying a stop condition in Claude Code. Your task is to verify that the agent completed the given plan.
+    \\You are verifying a stop condition in zcode. Your task is to verify that the agent completed the given plan.
     \\
     \\Return your result as a JSON object with:
     \\- ok: true if the condition is met
@@ -420,4 +423,14 @@ test "resolveModel: def.model wins over env and default" {
     const m = try resolveModel(alloc, def);
     defer alloc.free(m);
     try testing.expectEqualStrings("claude-opus-4", m);
+}
+
+test "hook verifier system prompts never claim to be Claude Code" {
+    // identity-leak: these prompts are sent verbatim to the LLM when
+    // evaluating a `prompt`/`agent` hook, so they must identify the harness
+    // as zcode, never as Claude Code or Anthropic's product.
+    try testing.expect(std.mem.indexOf(u8, PROMPT_SYSTEM, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, AGENT_SYSTEM, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, PROMPT_SYSTEM, "in zcode") != null);
+    try testing.expect(std.mem.indexOf(u8, AGENT_SYSTEM, "in zcode") != null);
 }
