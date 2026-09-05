@@ -1,0 +1,23 @@
+{
+  "scenario_name": "ux-spinner-basic",
+  "scenario_class": "UX",
+  "description": "A single-turn prompt against the mock provider that triggers a tool call (git_status), so the run passes through the full spinner lifecycle: capturing the request, gathering context, calling the model, an interactive tool-approval prompt, running the tool, and the post-turn memory-extraction spinner phases, before returning to an idle prompt and exiting via /exit. Covers: spinner render frames (glyph + verb + elapsed time), spinner stop on completion, and (as of r3-mock-01) submitting a slash command from the fullscreen composer.",
+  "seed": {
+    "cwd": "scenarios/ux-spinner-basic/fixture",
+    "env_denylist": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+    "env_fixed": { "TZ": "UTC", "LC_ALL": "C" },
+    "terminal_size": { "cols": 110, "rows": 36 },
+    "provider": "mock",
+    "model": "mock-agent"
+  },
+  "inputs": [
+    { "type": "command", "value": "hello" },
+    { "type": "keystroke", "value": "Enter" },
+    { "type": "wait_ms", "value": 1200 },
+    { "type": "keystroke", "value": "Enter" },
+    { "type": "wait_ms", "value": 9000 },
+    { "type": "command", "value": "/exit" },
+    { "type": "keystroke", "value": "Enter" }
+  ],
+  "timeout_ms": 20000
+}
