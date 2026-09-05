@@ -230,6 +230,12 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
             fields.task_id = nonEmptyOrNull(ctx.task_id);
             fields.task_subject = nonEmptyOrNull(ctx.task_subject);
         },
+        // hooks-permissions-03: Elicitation/ElicitationResult carry the raw
+        // MCP `elicitation/create` request params / response JSON as
+        // `message` -- see agent_runtime.fireElicitationHook's doc comment
+        // for why this reuses the generic carrier rather than a dedicated
+        // field.
+        .elicitation, .elicitation_result => fields.message = nonEmptyOrNull(ctx.message),
         else => {},
     }
     return hook_io.buildLifecycleEventPayload(allocator, name, ctx.cwd, fields, baseFieldsFor(ctx));

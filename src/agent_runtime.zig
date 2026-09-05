@@ -1458,9 +1458,38 @@ pub const AgentRuntime = struct {
         const self: *AgentRuntime = @ptrCast(@alignCast(ctx));
         if (std.mem.eql(u8, method, "sampling/createMessage"))
             return try agent_history.handleMcpSamplingRequest(self.buildMcpContext(), params_json);
-        if (std.mem.eql(u8, method, "elicitation/create"))
-            return try agent_history.handleMcpElicitationRequest(self.buildMcpContext(), params_json);
+        if (std.mem.eql(u8, method, "elicitation/create")) {
+            // hooks-permissions-03: fire Elicitation immediately before the
+            // actual prompt (agent_history.handleMcpElicitationRequest owns
+            // the real approve/deny UX -- this wrapper is the one owned
+            // "hook emission point" call site around it, per this package's
+            // agent_runtime.zig ownership scope) and ElicitationResult right
+            // after it resolves, carrying the request/response JSON as the
+            // lifecycle `message` field (the closest existing generic
+            // carrier; Elicitation has no reference-documented matcher
+            // target to wire a dedicated discriminator against).
+            self.fireElicitationHook(.elicitation, params_json);
+            const result = try agent_history.handleMcpElicitationRequest(self.buildMcpContext(), params_json);
+            self.fireElicitationHook(.elicitation_result, result);
+            return result;
+        }
         return null;
+    }
+
+    /// See `mcpBridgeHandleRequest`'s elicitation/create branch. Best-effort
+    /// and non-blocking: elicitation already has its own real approve/deny
+    /// UX via the MCP protocol itself, so a hook here observes rather than
+    /// gates (matching `fireNotificationHook`/`firePostToolBatchHook`).
+    fn fireElicitationHook(self: *AgentRuntime, event: hooks_mod.HookEvent, payload_json: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = event,
+            .cwd = self.cwd,
+            .message = payload_json,
+            .session_id = self.session_id,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
     }
 
     fn mcpBridgeHandleNotification(ctx: *anyopaque, allocator: std.mem.Allocator, server_name: []const u8, method: []const u8, params_json: []const u8) anyerror!void {
@@ -7278,6 +7307,91 @@ test "hooks-permissions-04: PostToolBatch fires exactly once for a resolved roun
     // second firing would double the file's line count / duplicate content,
     // which the single parseFromSlice call above would already have failed
     // on if the file held two concatenated JSON objects).
+}
+
+fn hooksPermissions03DummyAskUser(ctx: *anyopaque, allocator: std.mem.Allocator, question: []const u8, choices: []const []const u8) anyerror![]u8 {
+    _ = ctx;
+    _ = question;
+    _ = choices;
+    return allocator.dupe(u8, "accept");
+}
+
+test "hooks-permissions-03: Elicitation fires before the MCP prompt and ElicitationResult fires after" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |h| {
+            if (alloc.dupeZ(u8, h)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    const elicit_sentinel = try std.fs.path.join(alloc, &.{ root, "elicitation.json" });
+    defer alloc.free(elicit_sentinel);
+    const result_sentinel = try std.fs.path.join(alloc, &.{ root, "elicitation_result.json" });
+    defer alloc.free(result_sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"Elicitation\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"ElicitationResult\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ elicit_sentinel, result_sentinel },
+    );
+    defer alloc.free(settings);
+    try skillGuardWriteFile(tmp.dir, ".zcode/settings.json", settings);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+    hooks_test_override = true;
+    defer hooks_test_override = false;
+
+    // Interactive with a working (unused, since this schema-less request
+    // short-circuits to "accept" before ever prompting) ask_user_fn so
+    // handleMcpElicitationRequest's access-check passes.
+    h.runtime.interactive = true;
+    var dummy_ctx: u8 = 0;
+    h.runtime.ask_user_fn = hooksPermissions03DummyAskUser;
+    h.runtime.ask_user_ctx = @ptrCast(&dummy_ctx);
+
+    const params_json = "{\"message\":\"need info\"}";
+    const result = try AgentRuntime.mcpBridgeHandleRequest(@ptrCast(&h.runtime), alloc, "elicitation/create", params_json);
+    defer if (result) |r| alloc.free(r);
+    try testing.expect(result != null);
+
+    const elicit_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, elicit_sentinel, alloc, .limited(4096)) catch |err| {
+        std.debug.print("Elicitation hook did not fire: {any}\n", .{err});
+        return error.ElicitationHookDidNotRun;
+    };
+    defer alloc.free(elicit_bytes);
+    var elicit_parsed = try std.json.parseFromSlice(std.json.Value, alloc, elicit_bytes, .{});
+    defer elicit_parsed.deinit();
+    try testing.expectEqualStrings("Elicitation", elicit_parsed.value.object.get("hook_event_name").?.string);
+    try testing.expect(std.mem.indexOf(u8, elicit_parsed.value.object.get("message").?.string, "need info") != null);
+
+    const result_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, result_sentinel, alloc, .limited(4096)) catch |err| {
+        std.debug.print("ElicitationResult hook did not fire: {any}\n", .{err});
+        return error.ElicitationResultHookDidNotRun;
+    };
+    defer alloc.free(result_bytes);
+    var result_parsed = try std.json.parseFromSlice(std.json.Value, alloc, result_bytes, .{});
+    defer result_parsed.deinit();
+    try testing.expectEqualStrings("ElicitationResult", result_parsed.value.object.get("hook_event_name").?.string);
+    try testing.expect(std.mem.indexOf(u8, result_parsed.value.object.get("message").?.string, "accept") != null);
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
