@@ -91,15 +91,18 @@ pub const pronoun_and_accuracy_section: []const u8 =
 
 // system-prompt-missed-72 / system-prompt-missed-77: ported near-verbatim
 // from cc_system_prompt_2.1.261.md's "# Delivering work" section (lines
-// 83-90), substituting zcode's subagent tool name ("AgentRun") for the
-// reference's "Agent". Covers scope discipline, ambiguity handling,
-// refusal framing, and the "don't use subagents unless asked" rule.
+// 83-90). zcode's advertised subagent-launcher tool is named "Agent" (see
+// src/tools/tool_schemas.zig; "AgentRun" is only a dispatch-only legacy
+// alias in src/core/tool_name_map.zig), which matches the reference's own
+// wording exactly, so no substitution is needed here. Covers scope
+// discipline, ambiguity handling, refusal framing, and the "don't use
+// subagents unless asked" rule.
 pub const delivering_work_section: []const u8 =
     "\n# Delivering work\n" ++
     "Do ordinary work as asked, acting on the actual request rather than on speculation about what lies behind it. The requested scope is the deliverable -- don't quietly narrow, widen, or transform it. Interpret ambiguity the way a careful colleague would: make routine judgment calls yourself, and check in only when different readings would lead to materially different work. If you find a real problem with the task as specified, state the concern in a sentence or two, then keep building: deliver the complete work under explicitly stated assumptions, flagging important factors for the user. Finish the whole task, not just easy parts -- report completion only when fully done. If part of the scope turns out to be blocked or problematic, finish every other part in full and say explicitly what you left out and why -- scaling the work down is the user's call, not yours. Stop short of actions or changes clearly beyond what the user's ask implies.\n\n" ++
     "If you find an uncertainty mid-task, first do everything that doesn't depend on the answer; for what does, state your assumption or ask your question to the user at the right time. Reserve blocking questions -- stopping with nothing delivered until the user answers -- for cases where proceeding under any assumption would be unsafe or would make the work useless if wrong.\n\n" ++
     "If you raise a concern about a request and the user repeats or reaffirms it, treat that as their decision, communicate this, and proceed with the full request. Be fair and factual in resolving disagreements about the premises, scope, or approach of the work. Refusals are only for requests that are genuinely harmful or clearly prohibited, not for ordinary work that merely touches a sensitive-sounding topic. If you decline, say so plainly in a sentence, offer the nearest thing you can do, and move on without moralizing or criticism. This applies to producing work products: it doesn't override necessary refusals or the need for confirmation on risky or destructive actions.\n\n" ++
-    "Do not use subagents (the AgentRun tool) unless the user, a CLAUDE.md file, or a skill asks for them.\n";
+    "Do not use subagents (the Agent tool) unless the user, a CLAUDE.md file, or a skill asks for them.\n";
 
 // system-prompt-missed-73 / system-prompt-missed-77: ported verbatim from
 // cc_system_prompt_2.1.261.md's "# Writing for the user" section (lines
@@ -236,7 +239,7 @@ test "renderStaticPrefix carries the Delivering work section (system-prompt-miss
     const out = try renderStaticPrefix(testing.allocator, true);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "# Delivering work") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "Do not use subagents (the AgentRun tool) unless the user, a CLAUDE.md file, or a skill asks for them.") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Do not use subagents (the Agent tool) unless the user, a CLAUDE.md file, or a skill asks for them.") != null);
     try testing.expect(std.mem.indexOf(u8, out, "The requested scope is the deliverable") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Refusals are only for requests that are genuinely harmful or clearly prohibited") != null);
     // zcode identity, never Claude Code / Anthropic.
@@ -271,6 +274,32 @@ test "renderStaticPrefix drops the old zcode-only sections" {
     try testing.expect(std.mem.indexOf(u8, out, "# Prompt strategy") == null);
     try testing.expect(std.mem.indexOf(u8, out, "# Output efficiency") == null);
     try testing.expect(std.mem.indexOf(u8, out, "exit_plan_mode(plan=") == null);
+}
+
+test "renderStaticPrefix never self-identifies as Claude Code or Anthropic (identity-leak)" {
+    // zcode is a distinct product: it must never claim to BE Claude Code or
+    // Anthropic in text a model is expected to treat as its own identity.
+    // Covers every renderStaticPrefix composition branch (both keep_coding
+    // values, plus the coordinator-mode persona), so a future section added
+    // to any branch is caught here even if its own dedicated test forgets
+    // the identity assertion.
+    const with_coding = try renderStaticPrefix(testing.allocator, true);
+    defer testing.allocator.free(with_coding);
+    try testing.expect(std.mem.indexOf(u8, with_coding, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, with_coding, "Anthropic") == null);
+
+    const without_coding = try renderStaticPrefix(testing.allocator, false);
+    defer testing.allocator.free(without_coding);
+    try testing.expect(std.mem.indexOf(u8, without_coding, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, without_coding, "Anthropic") == null);
+
+    // The coordinator persona is a separate constant not reachable through
+    // either renderStaticPrefix branch above without toggling the
+    // CLAUDE_CODE_COORDINATOR_MODE env var (avoided here to keep this test
+    // free of shared global state); check it directly instead.
+    const coordinator_prompt = coordinator_mode.coordinatorSystemPrompt();
+    try testing.expect(std.mem.indexOf(u8, coordinator_prompt, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, coordinator_prompt, "Anthropic") == null);
 }
 
 test "renderStaticPrefix has no long dashes" {
