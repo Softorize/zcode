@@ -3056,6 +3056,12 @@ test "appendTurn writes the Claude-Code-shaped record with all required keys" {
 
     var lines = std.mem.splitScalar(u8, std.mem.trim(u8, bytes, "\n"), '\n');
     var seen: usize = 0;
+    // `parsed` (and every string slice it hands back, including "uuid") is
+    // freed by `parsed.deinit()` at the end of THIS iteration's block --
+    // `prev_uuid` must be copied into a buffer that outlives that free, not
+    // kept as a slice into the freed arena (that was a use-after-free: the
+    // next iteration read poisoned/reused memory instead of the real uuid).
+    var prev_uuid_buf: [36]u8 = undefined;
     var prev_uuid: []const u8 = "";
     while (lines.next()) |line| {
         seen += 1;
@@ -3079,7 +3085,9 @@ test "appendTurn writes the Claude-Code-shaped record with all required keys" {
         } else {
             try testing.expectEqualStrings(prev_uuid, obj.get("parentUuid").?.string);
         }
-        prev_uuid = obj.get("uuid").?.string;
+        const this_uuid = obj.get("uuid").?.string;
+        std.mem.copyForwards(u8, prev_uuid_buf[0..this_uuid.len], this_uuid);
+        prev_uuid = prev_uuid_buf[0..this_uuid.len];
 
         if (seen == 3) {
             // The tool-result turn carries toolUseResult.
