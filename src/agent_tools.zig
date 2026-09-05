@@ -662,6 +662,10 @@ pub const ToolExecContext = struct {
     /// simply omitted from the JSON rather than emitted blank -- see
     /// `hook_io.HookBaseFields`.
     session_id: []const u8 = "",
+    /// hooks-permissions-09: the session's on-disk transcript path
+    /// (`AgentRuntime.transcript_path`), threaded the same way as
+    /// `session_id` above.
+    transcript_path: []const u8 = "",
 };
 
 /// Resolve the approval-mode string the gate evaluates under: a live permission
@@ -1231,6 +1235,7 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
         .tool_name = effective_name,
         .tool_args = args,
         .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
         .permission_mode = effectiveApprovalMode(ctx),
     });
     defer pre_hook.deinit(ctx.allocator);
@@ -1464,6 +1469,7 @@ fn firePermissionRequestHook(ctx: ToolExecContext, tool_name: []const u8, tool_a
         .tool_args = tool_args,
         .reason = reason,
         .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
         .permission_mode = effectiveApprovalMode(ctx),
     }) catch return;
     result.deinit(ctx.allocator);
@@ -1485,6 +1491,7 @@ fn firePermissionDeniedHook(ctx: ToolExecContext, tool_name: []const u8, tool_ar
         .tool_args = tool_args,
         .reason = reason,
         .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
         .permission_mode = effectiveApprovalMode(ctx),
     }) catch return;
     result.deinit(ctx.allocator);
@@ -1530,6 +1537,7 @@ fn firePostToolUseFailureHook(ctx: ToolExecContext, tool_name: []const u8, tool_
         .tool_output = error_text,
         .tool_success = false,
         .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
         .permission_mode = effectiveApprovalMode(ctx),
     }) catch return;
     result.deinit(ctx.allocator);
@@ -1580,6 +1588,7 @@ fn runApprovedToolTrace(
             .tool_name = name,
             .tool_args = args,
             .session_id = ctx.session_id,
+            .transcript_path = ctx.transcript_path,
             .permission_mode = effectiveApprovalMode(ctx),
         });
         break :blk &owned_pre_hook.?;
@@ -1671,6 +1680,7 @@ fn runApprovedToolTrace(
         .tool_output = gate_output,
         .tool_success = executed,
         .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
         .permission_mode = effectiveApprovalMode(ctx),
     });
     defer post_hook.deinit(ctx.allocator);
@@ -5596,6 +5606,7 @@ test "hooks-permissions-01: PostToolUseFailure fires with an error field when th
         .control_plane_token = "",
         .is_git_repo = false,
         .session_id = "sess-failure-1",
+        .transcript_path = "/tmp/sessions/sess-failure-1.jsonl",
     };
 
     // Exercises the exact call site `toolExecErrorTrace` uses
@@ -5616,6 +5627,7 @@ test "hooks-permissions-01: PostToolUseFailure fires with an error field when th
     try testing.expect(parsed.value.object.get("error") != null);
     try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("error").?.string, "SomeDispatchError") != null);
     try testing.expectEqualStrings("sess-failure-1", parsed.value.object.get("session_id").?.string);
+    try testing.expectEqualStrings("/tmp/sessions/sess-failure-1.jsonl", parsed.value.object.get("transcript_path").?.string);
 }
 
 test "logToolInvocationRecord increments the tool_executions_total counter" {

@@ -615,6 +615,13 @@ pub const AgentRuntime = struct {
     strict: bool,
     yolo_mode: bool,
     session_id: []u8,
+    /// hooks-permissions-09: the session's on-disk transcript path (reference
+    /// `transcript_path` base hook field), computed once from `session_id` at
+    /// construction. `store.sessionPath` only fails on a malformed
+    /// `session_id`, which `store.createSessionId()`'s own output never is --
+    /// see the `catch` at the one construction site for the (unreachable in
+    /// practice) fallback.
+    transcript_path: []u8,
     history: agent_history.History,
     snapshot: types.SessionSnapshot,
     approval_handler: ?ApprovalHandler,
@@ -1002,6 +1009,16 @@ pub const AgentRuntime = struct {
             shell_snapshot_path = shell_snapshot_mod.createForSession(allocator) catch null;
         }
 
+        // hooks-permissions-09: session_id is computed as a local so
+        // transcript_path (its derived on-disk path) can be built from it
+        // before the struct literal below. `store.sessionPath` only fails on
+        // a malformed session_id, which our own freshly-minted one never is;
+        // the empty-string fallback keeps `AgentRuntime.init` infallible on
+        // this account rather than surfacing an unreachable-in-practice error.
+        const session_id = try store.createSessionId();
+        errdefer allocator.free(session_id);
+        const transcript_path = store.sessionPath(session_id) catch try allocator.dupe(u8, "");
+
         return .{
             .allocator = allocator,
             .cwd = cwd,
@@ -1018,7 +1035,8 @@ pub const AgentRuntime = struct {
             .auto_approve_high = auto_approve_high,
             .strict = strict,
             .yolo_mode = yolo_mode,
-            .session_id = try store.createSessionId(),
+            .session_id = session_id,
+            .transcript_path = transcript_path,
             .history = agent_history.History.init(allocator, store),
             .snapshot = try allocEmptySnapshot(allocator),
             .approval_handler = null,
@@ -1190,6 +1208,7 @@ pub const AgentRuntime = struct {
             self.allocator.free(p);
         }
         self.allocator.free(self.session_id);
+        self.allocator.free(self.transcript_path);
         self.allocator.free(self.active_provider);
         self.allocator.free(self.active_model);
         self.allocator.free(self.preprocessor_provider);
@@ -1487,6 +1506,7 @@ pub const AgentRuntime = struct {
             .cwd = self.cwd,
             .message = payload_json,
             .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -5174,6 +5194,7 @@ pub const AgentRuntime = struct {
             .auto_mem_dir = self.auto_mem_dir_restriction,
             .session_mem_file = self.session_mem_file_restriction,
             .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
         };
     }
 
@@ -5539,6 +5560,7 @@ pub const AgentRuntime = struct {
             // free-text message (see hooks.matchFieldFor).
             .notification_type = "idle",
             .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -5567,6 +5589,7 @@ pub const AgentRuntime = struct {
             .cwd = self.cwd,
             .tool_calls_json = tool_calls_json,
             .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -6717,6 +6740,23 @@ const SkillGuardHarness = struct {
         self.allocator.destroy(self);
     }
 };
+
+test "hooks-permissions-09: transcript_path is derived from session_id at construction" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    try testing.expect(h.runtime.transcript_path.len > 0);
+    try testing.expect(std.mem.indexOf(u8, h.runtime.transcript_path, h.runtime.session_id) != null);
+    try testing.expect(std.mem.endsWith(u8, h.runtime.transcript_path, ".jsonl"));
+}
 
 test "sdk-headless-06: live-control mutators change runtime state through the dispatcher" {
     const test_helpers = @import("core/test_helpers.zig");
