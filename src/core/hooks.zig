@@ -13,6 +13,7 @@ const settings_sources = @import("settings_sources.zig");
 const session_env = @import("session_env.zig");
 const hook_exec_prompt = @import("hook_exec_prompt.zig");
 const hook_exec_http = @import("hook_exec_http.zig");
+const hook_exec_mcp_tool = @import("hook_exec_mcp_tool.zig");
 const async_hook_registry = @import("async_hook_registry.zig");
 const hooks_snapshot = @import("hooks_snapshot.zig");
 const session_hooks = @import("session_hooks.zig");
@@ -45,6 +46,12 @@ pub fn computeTimeoutMs(hook_type: hook_config.HookType, timeout_s: ?u32) u64 {
         .prompt => hook_exec_prompt.PROMPT_TIMEOUT_MS,
         .agent => hook_exec_prompt.AGENT_TIMEOUT_MS,
         .http => hook_exec_http.HTTP_TIMEOUT_MS,
+        // hooks-permissions-missed-163: a script file is a local process, same
+        // default budget as a command.
+        .script => COMMAND_HOOK_TIMEOUT_MS,
+        // hooks-permissions-06: an MCP tool call is a network round-trip to an
+        // already-connected server; matches the http hook default.
+        .mcp_tool => hook_exec_http.HTTP_TIMEOUT_MS,
     };
 }
 
@@ -627,12 +634,11 @@ fn processDef(
         if (path) |p| removeOnceHook(allocator, p, engine_event, def) catch {};
     }
 
-    // Task 6 (hooks-02): dispatch by hook type. command runs locally;
-    // prompt/agent query an LLM with the payload as `$ARGUMENTS`; http
-    // is wired in Task 7 (skipped here, so a settings.json http hook is
-    // a no-op rather than a crash until that task lands).
+    // Task 6 (hooks-02): dispatch by hook type. command/script run locally;
+    // prompt/agent query an LLM with the payload as `$ARGUMENTS`; http POSTs
+    // it; mcp_tool invokes an already-configured MCP server's tool.
     switch (def.hook_type) {
-        .command => {},
+        .command, .script => {},
         .prompt, .agent => {
             ran.* = true;
             var outcome = (if (def.hook_type == .agent)
@@ -649,11 +655,56 @@ fn processDef(
                 const reason = outcome.reason orelse "";
                 allocator.free(last_output.*);
                 last_output.* = try allocator.dupe(u8, reason);
+                // hooks-permissions-08: `continueOnBlock` (prompt hooks only)
+                // downgrades a block into a continuable signal -- the turn
+                // proceeds with the reason surfaced as additional context
+                // instead of stopping.
+                const continue_on_block = def.hook_type == .prompt and def.continue_on_block;
+                return .{
+                    .ran = true,
+                    .blocked = !continue_on_block,
+                    .output = last_output.*,
+                    .continue_run = if (continue_on_block) true else null,
+                    .stop_reason = try dupeOpt(allocator, reason),
+                    .additional_context = if (continue_on_block) try dupeOpt(allocator, reason) else null,
+                };
+            }
+            return null;
+        },
+        .mcp_tool => {
+            // hooks-permissions-06: invoke an already-configured MCP server's
+            // tool. No live registry hookup is wired at this call site (see
+            // hook_exec_mcp_tool.zig's header note), so this degrades to a
+            // documented non-blocking error rather than silently doing
+            // nothing -- but the type is fully parsed/dispatched, unlike
+            // before where it was silently dropped at parse time.
+            ran.* = true;
+            const fields = [_]hook_exec_mcp_tool.Field{
+                .{ .path = "tool_name", .value = ctx.tool_name },
+                .{ .path = "tool_input", .value = ctx.tool_args },
+            };
+            const mcp_timeout_ms = computeTimeoutMs(def.hook_type, def.timeout_s);
+            var outcome = hook_exec_mcp_tool.runMcpToolHook(allocator, def, &fields, mcp_timeout_ms, null, null) catch return null;
+            defer outcome.deinit(allocator);
+            if (outcome.blocked) {
+                const reason = outcome.reason orelse "";
+                allocator.free(last_output.*);
+                last_output.* = try allocator.dupe(u8, reason);
                 return .{
                     .ran = true,
                     .blocked = true,
                     .output = last_output.*,
                     .stop_reason = try dupeOpt(allocator, reason),
+                };
+            }
+            if (outcome.additional_context) |ac| {
+                allocator.free(last_output.*);
+                last_output.* = try allocator.dupe(u8, "");
+                return .{
+                    .ran = true,
+                    .blocked = false,
+                    .output = last_output.*,
+                    .additional_context = try dupeOpt(allocator, ac),
                 };
             }
             return null;
@@ -732,7 +783,11 @@ fn processDef(
     // non-blocking error (continue to the next hook), matching the
     // reference's cancelled/abort outcome.
     const cmd_timeout_ms = computeTimeoutMs(def.hook_type, def.timeout_s);
-    const run_res = runCommandWithStdin(allocator, def.body, ctx.cwd, zcode_home, payload, engine_event, cmd_timeout_ms) catch return null;
+    // hooks-permissions-07 / -missed-163: a `script` hook, or a `command` hook
+    // carrying exec-form `args`, is spawned directly (no shell) so its args
+    // are never re-parsed by a shell -- see runCommandWithStdin's doc comment.
+    const direct_spawn = def.hook_type == .script or def.args.len > 0;
+    const run_res = runCommandWithStdin(allocator, def.body, def.args, direct_spawn, ctx.cwd, zcode_home, payload, engine_event, cmd_timeout_ms) catch return null;
     defer allocator.free(run_res.stdout);
     if (run_res.timed_out) {
         // Task 16: a timed-out hook reports a `cancelled` response (reference
@@ -878,15 +933,25 @@ fn onceEntryMatches(entry: std.json.Value, def: hook_config.HookDef, group_match
         .prompt => "prompt",
         .http => "http",
         .agent => "agent",
+        .mcp_tool => "mcp_tool",
+        .script => "script",
     };
     if (!std.mem.eql(u8, type_str, want_type)) return false;
-    const body_key = switch (def.hook_type) {
-        .command => "command",
-        .http => "url",
-        .prompt, .agent => "prompt",
-    };
-    const body_str = jsonStr(entry.object.get(body_key), "");
-    if (!std.mem.eql(u8, body_str, def.body)) return false;
+    if (def.hook_type == .mcp_tool) {
+        // mcp_tool has no single "body" string; match on server+tool identity.
+        if (!std.mem.eql(u8, jsonStr(entry.object.get("server"), ""), def.mcp_server)) return false;
+        if (!std.mem.eql(u8, jsonStr(entry.object.get("tool"), ""), def.mcp_tool)) return false;
+    } else {
+        const body_key = switch (def.hook_type) {
+            .command => "command",
+            .http => "url",
+            .prompt, .agent => "prompt",
+            .script => if (entry.object.get("file") != null) "file" else "script",
+            .mcp_tool => unreachable,
+        };
+        const body_str = jsonStr(entry.object.get(body_key), "");
+        if (!std.mem.eql(u8, body_str, def.body)) return false;
+    }
     if (!std.mem.eql(u8, jsonStr(entry.object.get("if"), ""), def.if_cond)) return false;
     if (!std.mem.eql(u8, group_matcher, def.matcher)) return false;
     return true;
@@ -922,16 +987,29 @@ fn writeSettingsAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []
 
 const CommandResult = struct { exit_code: u8, stdout: []u8, timed_out: bool = false };
 
-/// Run `sh -c "<command> < <tmp>"` with `payload` written to the temp file so
-/// the hook receives it on stdin. Uses the one-shot runner (captures stdout,
-/// no manual pipe pumping). Temp file uses a hex-only name so no shell quoting
-/// is needed; it is removed afterward.
+/// Run a command hook with `payload` written to a temp file so the hook
+/// receives it on stdin. Uses the one-shot runner (captures stdout, no manual
+/// pipe pumping). Temp file uses a hex-only name so no shell quoting is
+/// needed; it is removed afterward.
+///
+/// Two spawn forms, selected by `direct`:
+///   - `direct == false` (the default `command` form): `sh -c "<command> <
+///     <tmp>"` -- `command` is a full shell string.
+///   - `direct == true` (hooks-permissions-07's exec form, and every `script`
+///     hook): `command` is resolved as an executable and spawned with `args`
+///     as its argv, delivered via `sh -c 'exec "$0" "$@" < <tmp>' <command>
+///     <args...>`. Each of `command`/`args` is bound to `sh`'s positional
+///     parameters as a literal argv element -- never interpolated into the
+///     script text -- so quotes/$/backticks in an argument never reach the
+///     shell parser (the documented exec-form security property). `sh` is
+///     still the process spawned (so the stdin-redirect trick keeps working
+///     unchanged), but it never re-parses `command`/`args` as script text.
 ///
 /// Task 8 (hooks-08): `timeout_ms` bounds the wall-clock the hook may take. On
 /// expiry `std.process.run` reaps the child internally (CLAUDE.md: do NOT
 /// `wait()` after a kill) and returns `error.Timeout`, which we surface as a
 /// `timed_out` result (a non-blocking outcome, not a block).
-fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: []const u8, home: []const u8, payload: []const u8, event: HookEvent, timeout_ms: u64) !CommandResult {
+fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, args: []const []const u8, direct: bool, cwd: []const u8, home: []const u8, payload: []const u8, event: HookEvent, timeout_ms: u64) !CommandResult {
     const nonce = clock.nowNanos();
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.hook-input-{x}.json", .{ home, nonce });
     defer allocator.free(tmp_path);
@@ -947,8 +1025,20 @@ fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: [
     // which would otherwise split the redirect target and inject a stray argv.
     // PRD #534 review fix. (A single quote in the home path is not escaped, but
     // that is vanishingly rare and would only fail the hook, not misbehave.)
-    const full = try std.fmt.allocPrint(allocator, "{s} < '{s}'", .{ command, tmp_path });
+    const full = if (direct)
+        try std.fmt.allocPrint(allocator, "exec \"$0\" \"$@\" < '{s}'", .{tmp_path})
+    else
+        try std.fmt.allocPrint(allocator, "{s} < '{s}'", .{ command, tmp_path });
     defer allocator.free(full);
+
+    var argv_storage: std.ArrayList([]const u8) = .empty;
+    defer argv_storage.deinit(allocator);
+    if (direct) {
+        try argv_storage.appendSlice(allocator, &.{ "sh", "-c", full, command });
+        try argv_storage.appendSlice(allocator, args);
+    } else {
+        try argv_storage.appendSlice(allocator, &.{ "sh", "-c", full });
+    }
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
@@ -972,7 +1062,7 @@ fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: [
     // already reaped the killed child (no manual wait); surface it as a
     // non-blocking timed_out result so a hung hook cannot stall the agent.
     const result = std.process.run(allocator, rt.io, .{
-        .argv = &.{ "sh", "-c", full },
+        .argv = argv_storage.items,
         .cwd = .{ .path = cwd },
         .environ_map = &env_map,
         .stdout_limit = .limited(64 * 1024),

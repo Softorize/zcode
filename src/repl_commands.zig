@@ -54,6 +54,7 @@ const terminal_caps = @import("core/terminal_caps.zig");
 const heap_diag = @import("core/heap_diag.zig");
 const ctx_viz = @import("core/ctx_viz.zig");
 const permission_rules_mod = @import("core/permission_rules.zig");
+const permission_rule_validation_mod = @import("core/permission_rule_validation.zig");
 const permission_rule_string_mod = @import("core/permission_rule_string.zig");
 const permission_reason_mod = @import("core/permission_reason.zig");
 const shadow_detection_mod = @import("core/shadow_detection.zig");
@@ -2923,6 +2924,13 @@ fn addPermissionRule(allocator: std.mem.Allocator, runtime: *AgentRuntime, raw_a
         return std.fmt.allocPrint(allocator, "invalid permission action: {s}\nexpected one of: allow, deny, ask", .{action_token.value});
     const tool_token = takeToken(action_token.rest) orelse return allocator.dupe(u8, "usage: /permissions add [--workspace] <allow|deny|ask> <tool|*> [args-contains]");
     const args_contains = std.mem.trim(u8, tool_token.rest, " \t");
+    // hooks-permissions-11: reject the rule up front with a corrective
+    // suggestion (matching the reference's customValidation UX) rather than
+    // letting it fall through to Store.addRule's generic
+    // error.InvalidPermissionRule.
+    if (permission_rule_validation_mod.validate(tool_token.value, args_contains)) |verr| {
+        return allocator.dupe(u8, verr.message);
+    }
     const scope: permission_rules_mod.ScopeSpec = if (workspace_scope)
         .{ .workspace = runtime.cwd }
     else

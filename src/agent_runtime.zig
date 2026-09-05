@@ -888,7 +888,11 @@ pub const AgentRuntime = struct {
         errdefer workspace_dirs_mod.freeList(allocator, additional_directories);
         if (!@import("builtin").is_test) {
             const empty: [][]u8 = &.{};
-            additional_directories = workspace_dirs_mod.load(allocator) catch empty;
+            // config-layout-13: also union in settings.json's
+            // `permissions.additionalDirectories` so a checked-in team
+            // declaration widens the workspace without a `/add-dir` ever
+            // having been run.
+            additional_directories = workspace_dirs_mod.loadWithSettings(allocator, cwd, null) catch empty;
         }
 
         // bash-shell-02: source the user's rc once at session start and

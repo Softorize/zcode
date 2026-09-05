@@ -33,6 +33,19 @@ pub const Event = enum {
     notification,
     elicitation,
     elicitation_result,
+    // hooks-permissions-04: six more reference events that were missing from
+    // the enum entirely (not merely unwired). `post_tool_batch` fires once
+    // after a turn's full batch of parallel tool calls has resolved, before
+    // the next model request (distinct from `post_tool_use`, which fires per
+    // tool and may run concurrently). The other five round out the reference's
+    // canonical `Coe` event list so a settings.json hook configured under any
+    // of these keys is parsed rather than silently dropped by `fromName`.
+    post_tool_batch,
+    user_prompt_expansion,
+    pre_model_switch,
+    post_model_switch,
+    directory_added,
+    message_display,
 };
 
 /// Reference-exact PascalCase event name as used in settings.json keys.
@@ -65,6 +78,12 @@ pub fn canonicalName(e: Event) []const u8 {
         .notification => "Notification",
         .elicitation => "Elicitation",
         .elicitation_result => "ElicitationResult",
+        .post_tool_batch => "PostToolBatch",
+        .user_prompt_expansion => "UserPromptExpansion",
+        .pre_model_switch => "PreModelSwitch",
+        .post_model_switch => "PostModelSwitch",
+        .directory_added => "DirectoryAdded",
+        .message_display => "MessageDisplay",
     };
 }
 
