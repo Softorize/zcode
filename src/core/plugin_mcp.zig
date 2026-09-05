@@ -150,6 +150,17 @@ test "plugin_mcp.collect: disabled plugin contributes zero servers" {
     const cwd = try test_helpers.tmpDirCwd(allocator, &tmp);
     defer allocator.free(cwd);
 
+    // Force-disable rather than relying solely on the untrusted-tmp-dir
+    // default: trust status walks up via `git -C <cwd> rev-parse
+    // --show-toplevel`, which resolves this tmp dir (created under the real
+    // repo's .zig-cache/tmp) to THIS repo's own root. On a machine where the
+    // real ~/.zcode/trust/repos.json already trusts this repo (e.g. a
+    // developer's checkout), trust_default alone would come back true and
+    // this test's premise would silently break. An explicit workspace-scope
+    // `setEnabled(..., false)` (mirrors the sibling "enabled" test above,
+    // which force-*enables* the same way) pins the state deterministically.
+    try plugin_settings.setEnabled(allocator, cwd, .workspace, "off@local", false);
+
     // Confirm the plugin is actually present-but-disabled (workspace, untrusted).
     const list = try plugins.list(allocator, cwd);
     defer plugins.freeList(allocator, list);

@@ -1509,6 +1509,23 @@ test "Task 17.4: disabled plugin agents are absent from list" {
     // (trust_default = false), so its agents must not appear. The plugin ships
     // an agents/ dir to prove it is the disabled gate, not a missing dir, that
     // suppresses it.
+    //
+    // Pin HOME to a private tmp dir before touching the tmp workspace: trust
+    // status walks up via `git -C <cwd> rev-parse --show-toplevel`, which
+    // resolves this tmp dir (created under the real repo's .zig-cache/tmp) to
+    // THIS repo's own root -- and on a machine where the real
+    // ~/.zcode/trust/repos.json has already trusted this repo (e.g. a
+    // developer's checkout), that would make the "untrusted tmp" assumption
+    // false and the plugin load enabled. Pinning HOME points the trust-store
+    // lookup at an empty, private store so the test's trust_default=false
+    // premise holds regardless of the real machine's trust state.
+    var home_tmp = testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const fake_home = try @import("test_helpers.zig").tmpDirCwd(allocator, &home_tmp);
+    defer allocator.free(fake_home);
+    const home_restore = try pinPluginAgentsHome(allocator, fake_home);
+    defer home_restore.deinit(allocator);
+
     try tmp.dir.createDirPath(rt.io, ".zcode/plugins/plugb/agents");
     try tmp.dir.writeFile(rt.io, .{
         .sub_path = ".zcode/plugins/plugb/plugin.json",
