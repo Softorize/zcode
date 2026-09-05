@@ -59,6 +59,7 @@ const budget_control_mod = @import("core/budget_control.zig");
 const structured_output_mod = @import("tools/structured_output.zig");
 const model_usage_mod = @import("core/model_usage.zig");
 const hooks_mod = @import("core/hooks.zig");
+const hook_io_mod = @import("core/hook_io.zig");
 const plugins_mod = @import("core/plugins.zig");
 const async_hook_registry = @import("core/async_hook_registry.zig");
 const agent_registry_mod = @import("core/agent_registry.zig");
@@ -2832,6 +2833,13 @@ pub const AgentRuntime = struct {
                 var round_had_action_tool_attempt = false;
                 var round_had_failed_action_tool = false;
                 var round_had_successful_action_tool = false;
+                // hooks-permissions-04: `traces` accumulates across the WHOLE
+                // turn (every round), so mark where this round's entries
+                // begin now -- both the parallel batch pass below and the
+                // sequential loop append into the same list -- and fire
+                // PostToolBatch once after both have finished, covering
+                // every call this round regardless of which pass ran it.
+                const round_trace_start = traces.items.len;
 
                 // Parallel execution pass: batch read-only tools and run concurrently.
                 // Track which call indices were executed in parallel to skip them
@@ -3051,6 +3059,17 @@ pub const AgentRuntime = struct {
                     if (self.strict and agent_tools.isStrictViolationTrace(trace)) {
                         strict_violation_any = true;
                     }
+                }
+
+                // hooks-permissions-04: PostToolBatch fires exactly once here,
+                // after every tool call this round (parallel batch + sequential
+                // alike) has resolved and its own PostToolUse/PostToolUseFailure
+                // hook has already run, and BEFORE any round-level continue/
+                // break decision below sends the turn back to the model. Only
+                // fires when the round actually ran at least one tool (matching
+                // the reference: an empty batch is not a batch).
+                if (traces.items.len > round_trace_start) {
+                    self.firePostToolBatchHook(traces.items[round_trace_start..]);
                 }
 
                 if (strict_violation_any) {
@@ -5496,6 +5515,68 @@ pub const AgentRuntime = struct {
         result.deinit(self.allocator);
     }
 
+    /// hooks-permissions-04: fire `PostToolBatch` once for a resolved round of
+    /// tool calls (`round_traces` is this round's slice of `traces`, both the
+    /// parallel-batch and sequential entries -- see the call site). Best-
+    /// effort and non-blocking by construction: PostToolBatch is
+    /// observability-only in the reference (its own per-tool PostToolUse/
+    /// PostToolUseFailure hooks already had the chance to gate/rewrite each
+    /// call; this event exists purely so a hook can see the whole batch shape
+    /// at once), so a block/error outcome here is discarded, matching
+    /// `fireNotificationHook`. `tool_use_id` is left empty on every element:
+    /// zcode's tool-call parsing (`core.parse_helpers.ToolCall`) does not
+    /// carry a per-call id today, unlike the reference's native tool_use
+    /// blocks -- a real gap, but a separate, much larger one (threading an id
+    /// through the whole parse/dispatch/trace pipeline) than this event's
+    /// wiring.
+    fn firePostToolBatchHook(self: *AgentRuntime, round_traces: []const ToolTrace) void {
+        if (!hooksLiveEnabled()) return;
+        const tool_calls_json = self.buildPostToolBatchJson(round_traces) catch return;
+        defer self.allocator.free(tool_calls_json);
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .post_tool_batch,
+            .cwd = self.cwd,
+            .tool_calls_json = tool_calls_json,
+            .session_id = self.session_id,
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// Assemble `round_traces` into the `tool_calls` JSON array
+    /// `hook_io.buildPostToolBatchPayload` expects. Each element embeds
+    /// `tool_input`/`tool_response` as a nested object when the trace's
+    /// `args`/`output` already parse as JSON (matching every other tool-event
+    /// payload builder's raw-vs-string rule), else as a JSON string. Caller
+    /// owns the returned slice.
+    fn buildPostToolBatchJson(self: *AgentRuntime, round_traces: []const ToolTrace) ![]u8 {
+        var out = std_io.StringBuilder.init(self.allocator);
+        errdefer out.deinit();
+        const w = out.writer();
+        try w.writeAll("[");
+        for (round_traces, 0..) |t, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.print("{{\"tool_name\":{f},\"tool_input\":", .{std.json.fmt(t.name, .{})});
+            if (hook_io_mod.isValidJson(self.allocator, t.args)) {
+                try w.writeAll(t.args);
+            } else {
+                try w.print("{f}", .{std.json.fmt(t.args, .{})});
+            }
+            try w.writeAll(",\"tool_use_id\":\"\"");
+            if (t.executed) {
+                try w.writeAll(",\"tool_response\":");
+                if (hook_io_mod.isValidJson(self.allocator, t.output)) {
+                    try w.writeAll(t.output);
+                } else {
+                    try w.print("{f}", .{std.json.fmt(t.output, .{})});
+                }
+            }
+            try w.writeAll("}");
+        }
+        try w.writeAll("]");
+        return out.toOwnedSlice();
+    }
+
     /// Drain any finished background (async / asyncRewake) hooks and deliver
     /// their effects into the session: additionalContext is appended as a system
     /// turn; an asyncRewake hook that exited 2 injects a continuation nudge with
@@ -7105,6 +7186,98 @@ test "config-layout-missed-148: resolveInitialPermissionMode falls back to setti
 test "config-layout-missed-148: resolveInitialPermissionMode is null when neither source sets it" {
     try testing.expect(resolveInitialPermissionMode("tiered-auto", null) == null);
     try testing.expect(resolveInitialPermissionMode("strict", null) == null);
+}
+
+test "hooks-permissions-04: PostToolBatch fires exactly once for a resolved round with both tool_calls present" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |h| {
+            if (alloc.dupeZ(u8, h)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "post_tool_batch.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PostToolBatch\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer alloc.free(settings);
+    try skillGuardWriteFile(tmp.dir, ".zcode/settings.json", settings);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    hooks_test_override = true;
+    defer hooks_test_override = false;
+
+    // A round with two parallel-eligible tool calls, mirroring what the
+    // parallel-batch pass would have appended into `traces` this round.
+    var round_traces = [_]ToolTrace{
+        .{
+            .name = try alloc.dupe(u8, "Read"),
+            .args = try alloc.dupe(u8, "{\"path\":\"a.txt\"}"),
+            .risk = .LOW,
+            .approval_state = .auto_approved,
+            .executed = true,
+            .duration_ms = 5,
+            .output = try alloc.dupe(u8, "file contents"),
+        },
+        .{
+            .name = try alloc.dupe(u8, "Glob"),
+            .args = try alloc.dupe(u8, "{\"pattern\":\"*.zig\"}"),
+            .risk = .LOW,
+            .approval_state = .auto_approved,
+            .executed = true,
+            .duration_ms = 3,
+            .output = try alloc.dupe(u8, "src/main.zig"),
+        },
+    };
+    defer for (&round_traces) |*t| t.deinit(alloc);
+
+    h.runtime.firePostToolBatchHook(&round_traces);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, sentinel, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("PostToolBatch hook did not fire: {s} ({any})\n", .{ sentinel, err });
+        return error.PostToolBatchHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("PostToolBatch", parsed.value.object.get("hook_event_name").?.string);
+    const calls = parsed.value.object.get("tool_calls").?.array;
+    try testing.expectEqual(@as(usize, 2), calls.items.len);
+    try testing.expectEqualStrings("Read", calls.items[0].object.get("tool_name").?.string);
+    try testing.expectEqualStrings("Glob", calls.items[1].object.get("tool_name").?.string);
+    // The parallel Read call's tool_input round-trips as a nested object (it
+    // was valid JSON), not a re-escaped string.
+    try testing.expectEqualStrings("a.txt", calls.items[0].object.get("tool_input").?.object.get("path").?.string);
+
+    // Exactly once: the hook wrote the payload exactly one time (a stray
+    // second firing would double the file's line count / duplicate content,
+    // which the single parseFromSlice call above would already have failed
+    // on if the file held two concatenated JSON objects).
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

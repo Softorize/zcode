@@ -120,6 +120,10 @@ pub const HookContext = struct {
     // it for other events).
     tool_use_id: []const u8 = "",
     duration_ms: ?u64 = null,
+    // hooks-permissions-04: `PostToolBatch`-only. A pre-built, already-valid
+    // JSON array literal -- see `hook_io.buildPostToolBatchPayload`'s doc
+    // comment for why the caller (not this module) assembles each element.
+    tool_calls_json: []const u8 = "",
 };
 
 /// True for the tool-shaped events: the 3 original events with an on-disk
@@ -176,6 +180,13 @@ fn baseFieldsFor(ctx: HookContext) hook_io.HookBaseFields {
 /// discriminating field(s).
 fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
     const name = hook_event.canonicalName(ctx.event);
+    // hooks-permissions-04: PostToolBatch has neither a single tool_name/
+    // tool_input pair (it is NOT `isToolEvent`, matched like Setup/
+    // StopFailure on an empty discriminator) nor a lifecycle-style single
+    // field -- its own `tool_calls` array shape, built separately.
+    if (ctx.event == .post_tool_batch) {
+        return hook_io.buildPostToolBatchPayload(allocator, ctx.cwd, ctx.tool_calls_json, baseFieldsFor(ctx));
+    }
     if (isToolEvent(ctx.event)) {
         // PostToolUse / PostToolUseFailure carry the tool's response on stdin so
         // hooks can inspect it (reference: hooks.ts:3465 `tool_response`). PreToolUse

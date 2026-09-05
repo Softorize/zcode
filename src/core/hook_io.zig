@@ -236,7 +236,43 @@ pub fn buildLifecycleEventPayload(
     return allocator.dupe(u8, builder.items());
 }
 
-fn isValidJson(allocator: std.mem.Allocator, bytes: []const u8) bool {
+/// hooks-permissions-04: build the stdin JSON for `PostToolBatch`. Unlike
+/// every other tool-shaped event, PostToolBatch has no single tool_name/
+/// tool_input pair -- its payload is `tool_calls: [{tool_name, tool_input,
+/// tool_use_id, tool_response?}, ...]` for the whole batch (reference `Moe`/
+/// `Ioe` schemas). `tool_calls_json` is a pre-built, already-valid JSON array
+/// literal (the caller assembles each element; this function only embeds it
+/// verbatim, matching the tool builder's "raw JSON in, raw JSON out"
+/// convention for structured sub-values) -- an empty array `"[]"` is passed
+/// when the round had no tool calls (never actually reached by the one real
+/// call site, which only fires after at least one call resolved).
+pub fn buildPostToolBatchPayload(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    tool_calls_json: []const u8,
+    base: HookBaseFields,
+) ![]u8 {
+    var builder = sb.StringBuilder.init(allocator);
+    defer builder.deinit();
+    const w = builder.writer();
+
+    try w.print("{{\"hook_event_name\":\"PostToolBatch\",\"cwd\":{f},\"tool_calls\":", .{std.json.fmt(cwd, .{})});
+    if (tool_calls_json.len > 0 and isValidJson(allocator, tool_calls_json)) {
+        try w.writeAll(tool_calls_json);
+    } else {
+        try w.writeAll("[]");
+    }
+    try writeBaseFields(w, base);
+    try w.writeAll("}");
+    return allocator.dupe(u8, builder.items());
+}
+
+/// hooks-permissions-04: made `pub` so `agent_runtime.zig`'s PostToolBatch
+/// call site can apply the same "embed as object when it already parses as
+/// JSON, else as a JSON string" rule used throughout this file (`tool_input`/
+/// `tool_response`) when assembling each `tool_calls[]` element -- rather than
+/// duplicating this exact check there.
+pub fn isValidJson(allocator: std.mem.Allocator, bytes: []const u8) bool {
     const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
     if (trimmed.len == 0) return false;
     var p = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return false;
@@ -577,6 +613,33 @@ test "hooks-permissions-10: buildLifecycleEventPayload emits notification_type" 
     defer parsed.deinit();
     try testing.expectEqualStrings("idle for a while", parsed.value.object.get("message").?.string);
     try testing.expectEqualStrings("idle", parsed.value.object.get("notification_type").?.string);
+}
+
+test "hooks-permissions-04: buildPostToolBatchPayload embeds the tool_calls array and base fields" {
+    const p = try buildPostToolBatchPayload(
+        testing.allocator,
+        "/repo",
+        "[{\"tool_name\":\"Read\",\"tool_input\":{\"path\":\"a.txt\"},\"tool_use_id\":\"\"},{\"tool_name\":\"Glob\",\"tool_input\":{\"pattern\":\"*.zig\"},\"tool_use_id\":\"\"}]",
+        .{ .session_id = "sess-batch" },
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("PostToolBatch", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("/repo", parsed.value.object.get("cwd").?.string);
+    try testing.expectEqualStrings("sess-batch", parsed.value.object.get("session_id").?.string);
+    const calls = parsed.value.object.get("tool_calls").?.array;
+    try testing.expectEqual(@as(usize, 2), calls.items.len);
+    try testing.expectEqualStrings("Read", calls.items[0].object.get("tool_name").?.string);
+    try testing.expectEqualStrings("Glob", calls.items[1].object.get("tool_name").?.string);
+}
+
+test "hooks-permissions-04: buildPostToolBatchPayload falls back to an empty array for invalid input" {
+    const p = try buildPostToolBatchPayload(testing.allocator, "/repo", "not valid json", .{});
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed.value.object.get("tool_calls").?.array.items.len);
 }
 
 test "buildLifecycleEventPayload UserPromptSubmit emits prompt only" {
