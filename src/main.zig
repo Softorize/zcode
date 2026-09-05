@@ -1619,6 +1619,8 @@ fn runHeadlessDispatch(
             .max_budget_usd = opts.max_budget_usd,
             .json_schema = opts.json_schema,
             .max_thinking_tokens = opts.max_thinking_tokens,
+            .session_id_override = opts.session_id_override,
+            .no_session_persistence = opts.no_session_persistence,
         },
     };
 

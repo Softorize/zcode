@@ -249,6 +249,16 @@ pub const CliOptions = struct {
     /// into a fresh copy before the headless run, so the run does not mutate
     /// the original transcript. Only honored under the headless gate.
     fork_session: bool = false,
+    /// headless-sdk-02: `--session-id <uuid>` overrides the session id this
+    /// headless run uses (validated as a UUID at parse time -- the reference
+    /// rejects anything else with "must be a valid UUID"). Threaded into
+    /// sdk_headless.RunCaps.session_id_override. Only honored under the
+    /// headless gate.
+    session_id_override: ?[]const u8 = null,
+    /// headless-sdk-02: `--no-session-persistence` (only meaningful with
+    /// `--print`/headless mode) skips writing this run's session file to
+    /// disk. Threaded into sdk_headless.RunCaps.no_session_persistence.
+    no_session_persistence: bool = false,
     /// sdk-headless-14: `--thinking` / `--max-thinking-tokens N` sets the
     /// reserved reasoning-token budget for a headless run. `--thinking` with
     /// no value is a sentinel "on"; `--max-thinking-tokens N` (or
@@ -492,6 +502,24 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
             } else if (std.mem.eql(u8, arg, "--fork-session")) {
                 // sdk-headless-14: fork the resumed session before running.
                 options.fork_session = true;
+                options.headless = true;
+            } else if (std.mem.eql(u8, arg, "--session-id") or std.mem.startsWith(u8, arg, "--session-id=")) {
+                // headless-sdk-02: override the session id for this headless
+                // run. Validated as a UUID (matches the reference's own
+                // "must be a valid UUID" rejection message).
+                const raw = try parseFlagValue(argv, &i, arg, "--session-id");
+                if (!isValidUuid(raw)) {
+                    std_io.stderrWriter().print(
+                        "error: --session-id: must be a valid UUID.\n",
+                        .{},
+                    ) catch {};
+                    return error.InvalidFlagValue;
+                }
+                options.session_id_override = raw;
+                options.headless = true;
+            } else if (std.mem.eql(u8, arg, "--no-session-persistence")) {
+                // headless-sdk-02: skip writing this run's session file.
+                options.no_session_persistence = true;
                 options.headless = true;
             } else if (std.mem.eql(u8, arg, "--thinking")) {
                 // sdk-headless-14: bare `--thinking` is a sentinel "on". It does
@@ -1967,6 +1995,23 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
     return error.UnknownCommand;
 }
 
+/// headless-sdk-02: true when `s` is a canonical 36-char dashed UUID (8-4-4-4-12
+/// hex groups). Deliberately permissive about version/variant nibbles -- the
+/// reference's own `--session-id` validation is "must be a valid UUID", not a
+/// v4-only check, and zcode may itself be handed a v1/v4/etc. session id from
+/// a resumed reference session.
+fn isValidUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, idx| {
+        if (idx == 8 or idx == 13 or idx == 18 or idx == 23) {
+            if (c != '-') return false;
+        } else if (!std.ascii.isHex(c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn parseFlagValue(argv: []const []const u8, index: *usize, arg: []const u8, flag_name: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, arg, '=')) |eq_idx| {
         const val = arg[eq_idx + 1 ..];
@@ -2098,6 +2143,8 @@ pub fn printUsage(writer: anytype) !void {
         \\      --max-budget-usd <x>        Cap estimated spend in USD (headless)
         \\      --json-schema <schema|@file>  Constrain output to a JSON schema (headless)
         \\      --fork-session              Fork the resumed session before running (headless)
+        \\      --session-id <uuid>         Use a specific session ID for the conversation (must be a valid UUID)
+        \\      --no-session-persistence    Disable session persistence to disk (headless; only works with --print)
         \\      --thinking | --max-thinking-tokens <n>  Set reserved reasoning-token budget (headless)
         \\      --include-partial-messages  Emit per-chunk stream_event messages (stream-json; headless)
         \\      --include-hook-events       Emit hook-lifecycle system events (stream-json; headless)
@@ -2900,6 +2947,32 @@ test "sdk-headless-14: --fork-session sets the flag and headless gate" {
     defer opts.deinit(allocator);
 
     try testing.expect(opts.fork_session);
+    try testing.expect(opts.headless);
+}
+
+test "headless-sdk-02: --session-id accepts a valid UUID and sets the headless gate" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--session-id", "123e4567-e89b-12d3-a456-426614174000", "--print", "hi" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+
+    try testing.expectEqualStrings("123e4567-e89b-12d3-a456-426614174000", opts.session_id_override.?);
+    try testing.expect(opts.headless);
+}
+
+test "headless-sdk-02: --session-id rejects a non-UUID value" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--session-id", "not-a-uuid", "--print", "hi" };
+    try testing.expectError(error.InvalidFlagValue, parse(allocator, argv[0..]));
+}
+
+test "headless-sdk-02: --no-session-persistence sets the flag and headless gate" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--no-session-persistence", "--print", "hi" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+
+    try testing.expect(opts.no_session_persistence);
     try testing.expect(opts.headless);
 }
 
