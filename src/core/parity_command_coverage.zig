@@ -14,7 +14,7 @@ const command_canonical = @import("command_canonical.zig");
 const commands_565 = [_][]const u8{
     "/summary",    "/tag",            "/stats",
     "/status",     "/rewind",         "/rename",
-    "/onboarding", "/output-style",   "/terminalSetup",
+    "/onboarding", "/output-style",   "/terminal-setup",
     "/insights",   "/upgrade",        "/usage",
     "/session",    "/thinkback",      "/release-notes",
     "/bughunter",  "/init",           "/ide",
@@ -32,12 +32,12 @@ const commands_565 = [_][]const u8{
 /// pulls in the whole runtime). When a new command is added to
 /// repl_commands.zig, add it here too. The canonical map is checked live.
 const known_handled = [_][]const u8{
-    "/summary",        "/tag",         "/stats",       "/status",
-    "/rewind",         "/rename",      "/onboarding",  "/insights",
-    "/upgrade",        "/usage",       "/session",     "/thinkback",
-    "/release-notes",  "/bughunter",   "/init",        "/ide",
-    "/hooks",          "/keybindings", "/permissions", "/plugin",
-    "/sandbox-toggle",
+    "/summary",        "/tag",            "/stats",       "/status",
+    "/rewind",         "/rename",         "/onboarding",  "/insights",
+    "/upgrade",        "/usage",          "/session",     "/thinkback",
+    "/release-notes",  "/bughunter",      "/init",        "/ide",
+    "/hooks",          "/keybindings",    "/permissions", "/plugin",
+    "/sandbox-toggle", "/terminal-setup",
 };
 
 fn isKnownHandled(cmd: []const u8) bool {
@@ -74,9 +74,12 @@ test "#565: all 23 user-facing commands resolve to a handler or canonical mappin
 
 test "#565: known_handled list matches commands_565 list (no drift)" {
     // Every known_handled entry must be in commands_565, and vice versa
-    // (except the two that are canonically mapped: /output-style and
-    // /terminalSetup, which are NOT in known_handled because they resolve
-    // via toDispatch).
+    // (except /output-style, which is canonically mapped: it is NOT in
+    // known_handled because it resolves via toDispatch. commands-05:
+    // "/terminal-setup" moved INTO known_handled -- it has a direct dispatch
+    // arm in repl_commands.zig now that its commands_565 entry uses the
+    // reference-exact spelling instead of the nonexistent "/terminalSetup",
+    // so it no longer round-trips through toDispatch).
     for (known_handled) |h| {
         var found = false;
         for (commands_565) |c| {
@@ -90,8 +93,8 @@ test "#565: known_handled list matches commands_565 list (no drift)" {
             return error.DriftBetweenLists;
         }
     }
-    // commands_565 has 23 entries; known_handled has 21 (the 2 canonically
-    // mapped ones are excluded). Verify the count.
+    // commands_565 has 23 entries; known_handled has 22 (only /output-style
+    // is excluded as canonically mapped). Verify the count.
     try std.testing.expectEqual(@as(usize, 23), commands_565.len);
-    try std.testing.expectEqual(@as(usize, 21), known_handled.len);
+    try std.testing.expectEqual(@as(usize, 22), known_handled.len);
 }
