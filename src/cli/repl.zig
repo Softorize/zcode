@@ -8009,6 +8009,23 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             continue;
         }
 
+        // commands-37: /help all -- the same catalog, but also including the
+        // zcode-only extras (and non-canonical spellings) the default
+        // catalog above hides. Every one of them still dispatches normally;
+        // this only restores their listing.
+        if (std.mem.eql(u8, line, "/help all")) {
+            const help_cwd = if (options.status_workspace.len > 0) options.status_workspace else ".";
+            if (use_fullscreen) {
+                const help_plain = try repl_help_mod.buildPlaintextWithDynamicAll(allocator, help_cwd);
+                defer allocator.free(help_plain);
+                try appendTranscriptSectionText(allocator, &transcript, "Help Commands (all)", help_plain);
+                try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+            } else {
+                try repl_help_mod.writeHelpScreenWithDynamicAll(writer, allocator, help_cwd, shouldUseColor(options));
+            }
+            continue;
+        }
+
         if (std.mem.eql(u8, line, "/!") or std.mem.startsWith(u8, line, "/! ")) {
             const shell_command = std.mem.trim(u8, line[2..], " \t");
             if (shell_command.len == 0) {
@@ -8245,7 +8262,8 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             continue;
         }
 
-        if ((std.mem.eql(u8, line, "/rewind") or std.mem.eql(u8, line, "/checkpoint")) and use_fullscreen and handler.command != null) {
+        // sessions-storage-10: /undo is the reference's alias for /rewind.
+        if ((std.mem.eql(u8, line, "/rewind") or std.mem.eql(u8, line, "/checkpoint") or std.mem.eql(u8, line, "/undo")) and use_fullscreen and handler.command != null) {
             try runRewindSelectorUi(
                 allocator,
                 writer,

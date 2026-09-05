@@ -179,6 +179,13 @@ All notable changes to `zcode` should be documented in this file.
 - Add builtin specialist agents (`explore`, `plan`, `verify`, `reviewer`) and allow `AgentRun` to target them directly.
 - Enforce follow-up polling for background tasks and verification after mutating work instead of letting the agent stop immediately after the first successful action.
 - Reduce persistent-memory prompt noise by selecting only memories relevant to the current request.
+- Restore `/advisor`, `/cd`, `/security-review`/`/security_review`, and bare `/marketplace`: all four are genuine Claude Code 2.1.261 commands with a working zcode handler that an over-broad "removed for parity" list was wrongly blocking.
+- Fix `/terminal-setup` command-name reconciliation: it was canonicalizing to the nonexistent `/terminalSetup` spelling; the reference name is `/terminal-setup` (hyphenated).
+- Add missing 2.1.261 command aliases: `/allowed-tools` (`/permissions`), `/checkup` (`/doctor`), `/settings` (`/config`), `/name` (`/rename`), `/restart` (`/update`), and `/undo` (`/rewind`, alongside the existing `/checkpoint`).
+- Add `/stop [id|pid]` to terminate a registered background session (transcript and worktree are kept), and surface background sessions in `/tasks` / `/bashes` alongside subagent tasks.
+- Add `/autocompact [auto|<tokens>]` to inspect and override the auto-compact token threshold for the current session without restarting or setting an env var.
+- Add `/scroll-speed [N]`, `/daemon`, `/recap`, `/reload-skills`, `/skill-doctor`, `/explain-usage`, `/debug [issue]`, `/claude-api [subtopic]`, `/loops` + `/loops delete <id>`, and `/pause-memory` (+ `/memory-pause`, `/toggle-memory` aliases) -- 2.1.261 commands zcode was missing, built on existing zcode subsystems (kairos, remote_daemon, skill_usage, cron store) rather than new engines.
+- `/help` (the default catalog) now hides 65 zcode-only commands and non-canonical spellings that have no 2.1.261 counterpart; every one of them still runs when typed directly, and `/help all` lists the full catalog including them.
 
 ## 0.6.30
 

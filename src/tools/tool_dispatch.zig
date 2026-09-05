@@ -1345,6 +1345,13 @@ fn handleCronCreate(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: T
 
 fn handleCronDelete(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: ToolExecutionRequest) ![]u8 {
     const id = getArg(req.args, "id") orelse return missingArg(allocator, "id");
+    return removeCronJob(allocator, id);
+}
+
+/// commands-20: pub wrapper so the /loops slash command can cancel a job by
+/// id without needing a full ToolExecutionRequest. Identical body to what
+/// handleCronDelete did inline; shared by both callers now.
+pub fn removeCronJob(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
     const store = try getCronStore(allocator);
     if (store.remove(id)) {
         return std.fmt.allocPrint(allocator, "Cancelled job {s}.", .{id});
@@ -1352,7 +1359,10 @@ fn handleCronDelete(allocator: std.mem.Allocator, _: ?*mcp_client.Client, req: T
     return std.fmt.allocPrint(allocator, "Job not found: {s}", .{id});
 }
 
-fn handleCronList(allocator: std.mem.Allocator, _: ?*mcp_client.Client, _: ToolExecutionRequest) ![]u8 {
+/// commands-20: made pub so the /loops slash command (a thin management
+/// layer over the jobs /loop already creates) can list the same store the
+/// CronList tool renders, without a second listing engine.
+pub fn handleCronList(allocator: std.mem.Allocator, _: ?*mcp_client.Client, _: ToolExecutionRequest) ![]u8 {
     const store = try getCronStore(allocator);
     const entries = store.list();
     if (entries.len == 0) {
