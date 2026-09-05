@@ -14,8 +14,15 @@
 const std = @import("std");
 
 /// zcode-only commands removed for exact-match parity with Claude Code.
+///
+/// commands-01/02/03/04 (wp1a-commands-surface): /advisor, /cd,
+/// /security-review, /security_review, and /marketplace were previously
+/// listed here, but all five ARE real 2.1.261 commands (cc_commands_full.json:
+/// advisor, cd, security-review [bundled plugin-skill], and plugin's
+/// "marketplace" alias) with full, already-working zcode handlers that this
+/// list was wrongly short-circuiting. Restored below the list is the reviewed
+/// removal policy for the ones that really do have no reference counterpart.
 pub const removed = [_][]const u8{
-    "/advisor",
     "/changelog",
     "/density",
     "/errors",
@@ -30,12 +37,8 @@ pub const removed = [_][]const u8{
     // (then also drop its inline handler + autocomplete subcommands).
     "/preprocessor",
     "/prompt",
-    "/security-review",
-    "/security_review",
     "/whoami",
-    "/marketplace",
     "/todos",
-    "/cd",
     "/pwd",
 };
 
@@ -57,8 +60,6 @@ const testing = std.testing;
 test "removed commands are recognized, with and without args" {
     try testing.expect(isRemoved("/whoami"));
     try testing.expect(isRemoved("/density 2"));
-    try testing.expect(isRemoved("/SECURITY-REVIEW"));
-    try testing.expect(isRemoved("/marketplace add x y"));
 }
 
 test "kept and unrelated commands are not removed" {
@@ -73,4 +74,20 @@ test "kept and unrelated commands are not removed" {
     // "unknown command".
     try testing.expect(!isRemoved("/insights"));
     try testing.expect(!isRemoved("/insights --since 7d"));
+}
+
+test "commands-01/02/03/04: real 2.1.261 commands are no longer blocked" {
+    // These five were wrongly listed as removed; each is a genuine 2.1.261
+    // command (advisor, cd, security-review [bundled plugin-skill],
+    // security_review, and plugin's "marketplace" alias) with a working zcode
+    // handler that must be reachable again.
+    try testing.expect(!isRemoved("/advisor"));
+    try testing.expect(!isRemoved("/advisor on"));
+    try testing.expect(!isRemoved("/cd"));
+    try testing.expect(!isRemoved("/cd /tmp"));
+    try testing.expect(!isRemoved("/security-review"));
+    try testing.expect(!isRemoved("/SECURITY-REVIEW"));
+    try testing.expect(!isRemoved("/security_review"));
+    try testing.expect(!isRemoved("/marketplace"));
+    try testing.expect(!isRemoved("/marketplace add x y"));
 }

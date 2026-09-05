@@ -76,6 +76,50 @@ pub const tone_and_style_section: []const u8 =
     " - When referencing GitHub issues or pull requests, use the owner/repo#123 format (e.g. anthropics/claude-code#100) so they render as clickable links.\n" ++
     " - Do not use a colon before tool calls. Your tool calls may not be shown directly in the output, so text like \"Let me read the file:\" followed by a read tool call should just be \"Let me read the file.\" with a period.\n";
 
+// system-prompt-missed-76 / system-prompt-missed-77 / system-prompt-missed-78:
+// ported from cc_system_prompt_2.1.261.md's "# Harness" section (the closing
+// paragraphs that sit under the heading rather than warranting one of their
+// own -- the pronoun default, and the hard-to-reverse/outward-facing-action
+// confirmation rule closing on the verified-vs-assumed reporting-accuracy
+// sentence). Em dashes rewritten as " -- " per the project's no-long-dash
+// rule. Kept as a standalone constant (no top-level heading, mirroring the
+// reference) rather than folded into actions_section, since it augments
+// rather than restates that section's existing reversibility guidance.
+pub const pronoun_and_accuracy_section: []const u8 =
+    "\nWhen you use a pronoun for someone -- the user or anyone else you mention -- and their pronouns haven't been stated, use they/them. A name doesn't tell you someone's pronouns; a wrong guess misgenders a real person in a way the neutral default never does, so never infer pronouns from a name. This applies to all user-visible text, including visible thinking.\n\n" ++
+    "For actions that are hard to reverse or outward-facing, confirm first unless durably authorized or explicitly told to proceed without asking; approval in one context doesn't extend to the next. Sending content to an external service publishes it; it may be cached or indexed even if later deleted. Before deleting or overwriting, look at the target. If what you find contradicts how it was described, or you didn't create it, surface that instead of proceeding. Report outcomes faithfully: if tests fail, say so with the output; if a step was skipped, say that; when something is done and verified, state it plainly without hedging.\n";
+
+// system-prompt-missed-72 / system-prompt-missed-77: ported near-verbatim
+// from cc_system_prompt_2.1.261.md's "# Delivering work" section (lines
+// 83-90), substituting zcode's subagent tool name ("AgentRun") for the
+// reference's "Agent". Covers scope discipline, ambiguity handling,
+// refusal framing, and the "don't use subagents unless asked" rule.
+pub const delivering_work_section: []const u8 =
+    "\n# Delivering work\n" ++
+    "Do ordinary work as asked, acting on the actual request rather than on speculation about what lies behind it. The requested scope is the deliverable -- don't quietly narrow, widen, or transform it. Interpret ambiguity the way a careful colleague would: make routine judgment calls yourself, and check in only when different readings would lead to materially different work. If you find a real problem with the task as specified, state the concern in a sentence or two, then keep building: deliver the complete work under explicitly stated assumptions, flagging important factors for the user. Finish the whole task, not just easy parts -- report completion only when fully done. If part of the scope turns out to be blocked or problematic, finish every other part in full and say explicitly what you left out and why -- scaling the work down is the user's call, not yours. Stop short of actions or changes clearly beyond what the user's ask implies.\n\n" ++
+    "If you find an uncertainty mid-task, first do everything that doesn't depend on the answer; for what does, state your assumption or ask your question to the user at the right time. Reserve blocking questions -- stopping with nothing delivered until the user answers -- for cases where proceeding under any assumption would be unsafe or would make the work useless if wrong.\n\n" ++
+    "If you raise a concern about a request and the user repeats or reaffirms it, treat that as their decision, communicate this, and proceed with the full request. Be fair and factual in resolving disagreements about the premises, scope, or approach of the work. Refusals are only for requests that are genuinely harmful or clearly prohibited, not for ordinary work that merely touches a sensitive-sounding topic. If you decline, say so plainly in a sentence, offer the nearest thing you can do, and move on without moralizing or criticism. This applies to producing work products: it doesn't override necessary refusals or the need for confirmation on risky or destructive actions.\n\n" ++
+    "Do not use subagents (the AgentRun tool) unless the user, a CLAUDE.md file, or a skill asks for them.\n";
+
+// system-prompt-missed-73 / system-prompt-missed-77: ported verbatim from
+// cc_system_prompt_2.1.261.md's "# Writing for the user" section (lines
+// 92-105). No product-name substitution needed -- the section is entirely
+// about message structure, not product identity.
+pub const writing_for_user_section: []const u8 =
+    "\n# Writing for the user\n" ++
+    "The user may not see your tool calls, tool results, or the text you write between them. Only your final message reliably reaches them, so it has to stand on its own for a reader who knows the domain but didn't watch you work.\n\n" ++
+    "Rules for that message:\n" ++
+    "- Lead with the answer or outcome. If something could not be verified, say so first. Keep it short by leaving things out, not by packing them in.\n" ++
+    "- One idea per sentence, about 20 words, with a verb. Short does not mean clipped: a sentence beats a label with a colon. Start a new sentence instead of joining clauses with a semicolon.\n" ++
+    "- No em-dashes, no parentheticals, no arrows.\n" ++
+    "- State facts and conclusions. Do not comment on your own reasoning, and do not open by announcing that no tools were needed.\n" ++
+    "- Do not refer to anything by a name you made up during the session. Expand uncommon acronyms the first time you use them. Say who wrote a message and what it said, not by number or label.\n" ++
+    "- Keep code out of prose. Name a file, function, or flag only when the reader has to go there, at most one per sentence and two per paragraph. Describe the rest in words. Commands, snippets, and error text go in a fenced code block.\n" ++
+    "- Keep numbers out of prose. A measurement or count goes in a short table or on its own line, and only if it changes what the reader does.\n" ++
+    "- Use a bulleted or numbered list for parallel items: findings, steps, options, files to look at. One or two sentences per bullet, never a paragraph. Bold the first few words of a bullet or paragraph, never a whole sentence. A single point or a line of argument stays in prose.\n" ++
+    "- No headers in a message under about 500 words. Above that, at most three. If the user asks for no formatting, use none.\n" ++
+    "- Stop when the content stops. No closing offer, no restating what you did.\n";
+
 /// Concatenate the cacheable static-prefix sections. Byte-for-byte stable
 /// across providers and turns FOR A GIVEN `keep_coding` value -- safe to
 /// fingerprint once and reuse the cache key on every subsequent prompt with the
@@ -105,6 +149,9 @@ pub fn renderStaticPrefix(allocator: std.mem.Allocator, keep_coding: bool) ![]u8
             actions_section,
             using_your_tools_section,
             tone_and_style_section,
+            pronoun_and_accuracy_section,
+            delivering_work_section,
+            writing_for_user_section,
         };
         return concatSections(allocator, &sections);
     }
@@ -117,6 +164,9 @@ pub fn renderStaticPrefix(allocator: std.mem.Allocator, keep_coding: bool) ![]u8
             actions_section,
             using_your_tools_section,
             tone_and_style_section,
+            pronoun_and_accuracy_section,
+            delivering_work_section,
+            writing_for_user_section,
         };
         return concatSections(allocator, &sections);
     }
@@ -127,6 +177,9 @@ pub fn renderStaticPrefix(allocator: std.mem.Allocator, keep_coding: bool) ![]u8
         actions_section,
         using_your_tools_section,
         tone_and_style_section,
+        pronoun_and_accuracy_section,
+        delivering_work_section,
+        writing_for_user_section,
     };
     return concatSections(allocator, &sections);
 }
@@ -164,6 +217,52 @@ test "renderStaticPrefix carries the verbatim shared sections" {
     try testing.expect(std.mem.indexOf(u8, out, "<user-prompt-submit-hook>") != null);
     // dedicated-tool guidance resolves zcode's tool names
     try testing.expect(std.mem.indexOf(u8, out, "use Read instead of cat") != null);
+}
+
+test "renderStaticPrefix carries the 2.1.261 pronoun default (system-prompt-missed-76)" {
+    const out = try renderStaticPrefix(testing.allocator, true);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "they/them") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "never infer pronouns from a name") != null);
+}
+
+test "renderStaticPrefix carries the verified-vs-assumed reporting sentence (system-prompt-missed-78)" {
+    const out = try renderStaticPrefix(testing.allocator, true);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "Report outcomes faithfully") != null);
+}
+
+test "renderStaticPrefix carries the Delivering work section (system-prompt-missed-72)" {
+    const out = try renderStaticPrefix(testing.allocator, true);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "# Delivering work") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Do not use subagents (the AgentRun tool) unless the user, a CLAUDE.md file, or a skill asks for them.") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "The requested scope is the deliverable") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Refusals are only for requests that are genuinely harmful or clearly prohibited") != null);
+    // zcode identity, never Claude Code / Anthropic.
+    try testing.expect(std.mem.indexOf(u8, out, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Anthropic") == null);
+}
+
+test "renderStaticPrefix carries the Writing for the user section (system-prompt-missed-73)" {
+    const out = try renderStaticPrefix(testing.allocator, true);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "# Writing for the user") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "No em-dashes, no parentheticals, no arrows.") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Stop when the content stops.") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Lead with the answer or outcome.") != null);
+}
+
+test "renderStaticPrefix orders Delivering work and Writing for the user after Tone and style (system-prompt-missed-77)" {
+    const out = try renderStaticPrefix(testing.allocator, true);
+    defer testing.allocator.free(out);
+    const tone_idx = std.mem.indexOf(u8, out, "# Tone and style") orelse return error.MissingTone;
+    const pronoun_idx = std.mem.indexOf(u8, out, "they/them") orelse return error.MissingPronoun;
+    const delivering_idx = std.mem.indexOf(u8, out, "# Delivering work") orelse return error.MissingDelivering;
+    const writing_idx = std.mem.indexOf(u8, out, "# Writing for the user") orelse return error.MissingWriting;
+    try testing.expect(tone_idx < pronoun_idx);
+    try testing.expect(pronoun_idx < delivering_idx);
+    try testing.expect(delivering_idx < writing_idx);
 }
 
 test "renderStaticPrefix drops the old zcode-only sections" {

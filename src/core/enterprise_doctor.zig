@@ -95,6 +95,114 @@ pub fn run(
     return fail_count == 0;
 }
 
+/// cli-flags-28: `zcode doctor` (no subcommand) -- a GENERAL installation
+/// health check, distinct from `doctor enterprise`'s managed-policy-specific
+/// checks. Mirrors the reference: "Check the health of your Claude Code
+/// installation. Reads settings files in the current directory without a
+/// trust prompt. For a full checkup that can also fix issues, run /doctor
+/// in a session." Reuses the same Check/Status machinery and JSON output
+/// shape as `run` (enterprise doctor) so `--json` behaves identically.
+pub fn runGeneral(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    cfg: *const config_mod.Config,
+    json: bool,
+    writer: anytype,
+) !bool {
+    var checks = std.array_list.Managed(Check).init(allocator);
+    defer {
+        for (checks.items) |*check| check.deinit(allocator);
+        checks.deinit();
+    }
+
+    try checkPlatform(allocator, &checks);
+    try checkConfigValidity(allocator, cfg, &checks);
+    try checkProviderConfigured(allocator, cfg, &checks);
+    try checkKeychain(allocator, &checks);
+    try checkWorkspaceSettingsFiles(allocator, cwd, &checks);
+
+    var pass_count: usize = 0;
+    var warn_count: usize = 0;
+    var fail_count: usize = 0;
+    for (checks.items) |check| switch (check.status) {
+        .pass => pass_count += 1,
+        .warn => warn_count += 1,
+        .fail => fail_count += 1,
+    };
+
+    if (json) {
+        try writeJson(writer, checks.items, pass_count, warn_count, fail_count);
+    } else {
+        try writer.writeAll("zcode doctor\n\n");
+        for (checks.items) |check| {
+            try writer.print("{s} {s}: {s}\n", .{ check.status.label(), check.id, check.message });
+        }
+        try writer.print(
+            "\nSummary: {d} pass, {d} warn, {d} fail\nFor a full checkup that can also fix issues, run /doctor in a session.\n",
+            .{ pass_count, warn_count, fail_count },
+        );
+    }
+
+    return fail_count == 0;
+}
+
+fn checkConfigValidity(allocator: std.mem.Allocator, cfg: *const config_mod.Config, checks: *std.array_list.Managed(Check)) !void {
+    cfg.validate() catch |err| {
+        try add(checks, allocator, "config_valid", .fail, "loaded configuration failed validation: {s}", .{@errorName(err)});
+        return;
+    };
+    try add(checks, allocator, "config_valid", .pass, "configuration is well-formed", .{});
+}
+
+fn checkProviderConfigured(allocator: std.mem.Allocator, cfg: *const config_mod.Config, checks: *std.array_list.Managed(Check)) !void {
+    // Providers that don't require an API key to reach a local/mock server.
+    const no_key_needed = [_][]const u8{ "local", "ollama", "mock" };
+    for (no_key_needed) |p| {
+        if (std.ascii.eqlIgnoreCase(cfg.default_provider, p)) {
+            try add(checks, allocator, "provider_configured", .pass, "default provider '{s}' does not require an API key", .{cfg.default_provider});
+            return;
+        }
+    }
+    if (cfg.provider_api_key.len > 0) {
+        try add(checks, allocator, "provider_configured", .pass, "an API key is configured for '{s}'", .{cfg.default_provider});
+        return;
+    }
+    try add(
+        checks,
+        allocator,
+        "provider_configured",
+        .warn,
+        "no API key configured for '{s}' -- run `zcode keychain set {s} <key>` or set the provider's *_API_KEY env var",
+        .{ cfg.default_provider, cfg.default_provider },
+    );
+}
+
+/// Reads (does not validate/trust-prompt) `.claude/settings.json` and
+/// `.claude/settings.local.json` in `cwd`, if present, confirming each
+/// parses as JSON. Absent files are not an error -- most projects don't
+/// have either.
+fn checkWorkspaceSettingsFiles(allocator: std.mem.Allocator, cwd: []const u8, checks: *std.array_list.Managed(Check)) !void {
+    const candidates = [_][]const u8{ ".claude/settings.json", ".claude/settings.local.json" };
+    for (candidates) |rel| {
+        const path = try std.fs.path.join(allocator, &.{ cwd, rel });
+        defer allocator.free(path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(1 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => {
+                try add(checks, allocator, "workspace_settings", .warn, "could not read {s}: {s}", .{ rel, @errorName(err) });
+                continue;
+            },
+        };
+        defer allocator.free(bytes);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch {
+            try add(checks, allocator, "workspace_settings", .fail, "{s} does not contain valid JSON", .{rel});
+            continue;
+        };
+        parsed.deinit();
+        try add(checks, allocator, "workspace_settings", .pass, "{s} parses as valid JSON", .{rel});
+    }
+}
+
 fn checkPlatform(allocator: std.mem.Allocator, checks: *std.array_list.Managed(Check)) !void {
     switch (builtin.os.tag) {
         .macos, .linux => try add(checks, allocator, "platform", .pass, "supported enterprise platform ({s})", .{@tagName(builtin.os.tag)}),
@@ -654,6 +762,78 @@ fn writeJson(writer: anytype, checks: []const Check, pass_count: usize, warn_cou
         try writer.writeByte('}');
     }
     try writer.writeAll("]}\n");
+}
+
+test "runGeneral passes on a default config with a local provider" {
+    const alloc = testing.allocator;
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    allocator_free_and_set(alloc, &cfg.default_provider, "local");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(cwd);
+
+    var out = std_io.StringBuilder.init(alloc);
+    defer out.deinit();
+    const ok = try runGeneral(alloc, cwd, &cfg, false, out.writer());
+    try testing.expect(ok);
+    try testing.expect(std.mem.indexOf(u8, out.items(), "zcode doctor") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items(), "does not require an API key") != null);
+}
+
+test "runGeneral warns when the default provider has no configured API key" {
+    const alloc = testing.allocator;
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    // Config.init defaults default_provider to "anthropic" with an empty key.
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(cwd);
+
+    var out = std_io.StringBuilder.init(alloc);
+    defer out.deinit();
+    const ok = try runGeneral(alloc, cwd, &cfg, false, out.writer());
+    // A warn does not fail the overall health check.
+    try testing.expect(ok);
+    try testing.expect(std.mem.indexOf(u8, out.items(), "no API key configured") != null);
+}
+
+test "runGeneral flags an invalid .claude/settings.json as a fail" {
+    const alloc = testing.allocator;
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    allocator_free_and_set(alloc, &cfg.default_provider, "local");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(cwd);
+
+    const dot_claude = try std.fs.path.join(alloc, &.{ cwd, ".claude" });
+    defer alloc.free(dot_claude);
+    try std.Io.Dir.cwd().createDirPath(rt.io, dot_claude);
+    const settings_path = try std.fs.path.join(alloc, &.{ dot_claude, "settings.json" });
+    defer alloc.free(settings_path);
+    {
+        const f = try std.Io.Dir.cwd().createFile(rt.io, settings_path, .{ .truncate = true });
+        defer f.close(rt.io);
+        try f.writeStreamingAll(rt.io, "{ not json");
+    }
+
+    var out = std_io.StringBuilder.init(alloc);
+    defer out.deinit();
+    const ok = try runGeneral(alloc, cwd, &cfg, false, out.writer());
+    try testing.expect(!ok);
+    try testing.expect(std.mem.indexOf(u8, out.items(), "does not contain valid JSON") != null);
+}
+
+fn allocator_free_and_set(allocator: std.mem.Allocator, field: *[]u8, value: []const u8) void {
+    allocator.free(field.*);
+    field.* = allocator.dupe(u8, value) catch unreachable;
 }
 
 test "enterprise permission helpers classify unsafe modes" {

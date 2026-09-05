@@ -80,9 +80,14 @@ pub fn cmdPs(allocator: std.mem.Allocator, writer: anytype) !void {
 // kill
 // ===========================================================================
 
-/// Resolve `subject` (a numeric pid or a session_id) to a registry entry,
-/// SIGTERM the pid, and delete the registry file. Prints `killed pid=<n>` on
-/// success or `no such session: <subject>` when nothing matches.
+/// cli-flags-27: resolve `subject` (a numeric pid or a session_id) to a
+/// registry entry, SIGTERM the pid, and mark its registry entry `.stopped`
+/// WITHOUT deleting it -- so the conversation stays discoverable by
+/// `zcode attach`/`zcode ps`. This is `kill`/`stop`'s reference-matching
+/// behavior ("its conversation is kept: `claude attach <id>` opens it
+/// again"). Prints `stopped pid=<n>` on success or `no such session:
+/// <subject>` when nothing matches. `zcode rm` (see `cmdRm`) is the
+/// destructive alternative zcode's `kill` used to perform unconditionally.
 pub fn cmdKill(allocator: std.mem.Allocator, subject: []const u8, writer: anytype) !void {
     const pid = (try resolvePid(allocator, subject)) orelse {
         try writer.print("no such session: {s}\n", .{subject});
@@ -94,8 +99,88 @@ pub fn cmdKill(allocator: std.mem.Allocator, subject: []const u8, writer: anytyp
     // would assert here - we deliberately do not use it.)
     std.posix.kill(pid, std.posix.SIG.TERM) catch {};
 
+    _ = registry.setStatusForPid(allocator, pid, .stopped);
+    try writer.print(
+        "stopped pid={d}\n  zcode attach {d}   # resume this session's conversation\n  zcode rm {d}      # delete it instead\n",
+        .{ pid, pid, pid },
+    );
+}
+
+/// `stop` is a pure alias of `kill` (matching the reference's `stop|kill
+/// <id>`, which are the same command under two names).
+pub const cmdStop = cmdKill;
+
+/// cli-flags-27: the destructive delete zcode's `kill` used to perform
+/// unconditionally before the stop/kill-vs-rm split. SIGTERMs the pid (if
+/// still running) and removes its registry file outright. Matches the
+/// reference's `rm <id>`: "Delete a background session... Works on sessions
+/// that have already exited" -- so a `.stopped` (already-dead) entry is a
+/// valid target too, not just a live one.
+pub fn cmdRm(allocator: std.mem.Allocator, subject: []const u8, writer: anytype) !void {
+    const pid = (try resolvePid(allocator, subject)) orelse {
+        try writer.print("no such session: {s}\n", .{subject});
+        return;
+    };
+
+    std.posix.kill(pid, std.posix.SIG.TERM) catch {};
     deleteEntryFile(allocator, pid);
-    try writer.print("killed pid={d}\n", .{pid});
+    try writer.print("removed pid={d}\n", .{pid});
+}
+
+/// cli-flags-27: resolve `subject` to a registered session's session_id, so
+/// the caller can hand it to the same interactive-resume path `--resume`
+/// already implements (`session_mgmt.cmdSessionResume`). Returns null when
+/// `subject` does not resolve to any registry entry (caller prints "no such
+/// session"); returns `error.NoSessionId` when the entry exists but never
+/// recorded a session_id (e.g. a daemon/daemon_worker kind).
+pub fn resolveAttachSessionId(allocator: std.mem.Allocator, subject: []const u8) !?[]u8 {
+    const pid = (try resolvePid(allocator, subject)) orelse return null;
+    const entry = (try registry.read(allocator, pid)) orelse return null;
+    defer entry.deinit(allocator);
+    const sid = entry.session_id orelse return error.NoSessionId;
+    return try allocator.dupe(u8, sid);
+}
+
+// ===========================================================================
+// respawn (cli-flags-30)
+// ===========================================================================
+
+/// `zcode respawn [id] [--all]`: stop the targeted background session(s) so
+/// they run under the currently installed zcode binary. zcode's registry
+/// does not persist the original launch argv (unlike a full process
+/// supervisor), so this stops the target and points the operator at
+/// `zcode attach <id>` (to resume the same conversation) or a fresh `--bg`
+/// launch, rather than silently fabricating a best-guess re-invocation
+/// command that might not match what actually started the session.
+pub fn cmdRespawn(allocator: std.mem.Allocator, subject: ?[]const u8, all: bool, writer: anytype) !void {
+    if (all) {
+        const entries = try registry.list(allocator);
+        defer registry.freeEntries(allocator, entries);
+        var stopped: usize = 0;
+        for (entries) |entry| {
+            if (entry.kind != .bg) continue;
+            if (entry.status == .stopped) continue;
+            std.posix.kill(entry.pid, std.posix.SIG.TERM) catch {};
+            if (registry.setStatusForPid(allocator, entry.pid, .stopped)) stopped += 1;
+        }
+        try writer.print(
+            "stopped {d} background session(s). zcode does not persist the original launch command -- use `zcode attach <id>` to resume a conversation, or start a fresh `--bg` run.\n",
+            .{stopped},
+        );
+        return;
+    }
+
+    const id = subject orelse return error.MissingToolArg;
+    const pid = (try resolvePid(allocator, id)) orelse {
+        try writer.print("no such session: {s}\n", .{id});
+        return;
+    };
+    std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+    _ = registry.setStatusForPid(allocator, pid, .stopped);
+    try writer.print(
+        "stopped pid={d}. zcode does not persist the original launch command -- run `zcode attach {d}` to resume its conversation, or start a fresh `--bg` run.\n",
+        .{ pid, pid },
+    );
 }
 
 // ===========================================================================
@@ -409,7 +494,7 @@ test "cmdPs prints 'no live sessions' on an empty registry" {
     try testing.expectEqualStrings("no live sessions\n", out.items());
 }
 
-test "cmdKill SIGTERMs a spawned child and removes its registry file" {
+test "cmdKill SIGTERMs a spawned child, marks it stopped, and KEEPS its registry file (cli-flags-27)" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -446,9 +531,14 @@ test "cmdKill SIGTERMs a spawned child and removes its registry file" {
     defer out.deinit();
     try cmdKill(alloc, pid_str, out.writer());
 
-    // The registry file is gone.
-    try testing.expect(!fileExists(file_path));
-    try testing.expect(std.mem.indexOf(u8, out.items(), "killed pid=") != null);
+    // The registry file is KEPT (this is the reference-matching change:
+    // kill/stop keeps the conversation, only `rm` deletes it), but marked
+    // stopped.
+    try testing.expect(fileExists(file_path));
+    try testing.expect(std.mem.indexOf(u8, out.items(), "stopped pid=") != null);
+    const after = (try registry.read(alloc, pid)).?;
+    defer after.deinit(alloc);
+    try testing.expectEqual(registry.SessionStatus.stopped, after.status);
 
     // The process is terminated by the SIGTERM cmdKill sent. We reap it here
     // (cmdKill itself never wait()s a foreign pid - there is no Child to reap;
@@ -463,6 +553,76 @@ test "cmdKill SIGTERMs a spawned child and removes its registry file" {
         else => {},
     }
     try testing.expect(!registry.isPidRunning(pid));
+}
+
+test "cmdRm SIGTERMs a spawned child and deletes its registry file" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    setRegistryRoot(root_z);
+    defer clearRegistryRoot();
+
+    var child = std.process.spawn(rt.io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest;
+    const pid: i32 = @intCast(child.id orelse return error.SkipZigTest);
+
+    try writeRawEntry(alloc, root, pid, "bg", "victim", null);
+
+    const dir = try registry.registryDir(alloc);
+    defer alloc.free(dir);
+    const file_path = try std.fmt.allocPrint(alloc, "{s}/{d}.json", .{ dir, pid });
+    defer alloc.free(file_path);
+
+    var pid_str_buf: [16]u8 = undefined;
+    const pid_str = try std.fmt.bufPrint(&pid_str_buf, "{d}", .{pid});
+
+    var out = std_io.StringBuilder.init(alloc);
+    defer out.deinit();
+    try cmdRm(alloc, pid_str, out.writer());
+
+    try testing.expect(!fileExists(file_path));
+    try testing.expect(std.mem.indexOf(u8, out.items(), "removed pid=") != null);
+
+    const term = child.wait(rt.io) catch return error.SkipZigTest;
+    switch (term) {
+        .signal => |sig| try testing.expectEqual(std.posix.SIG.TERM, sig),
+        else => {},
+    }
+}
+
+test "resolveAttachSessionId returns the registered session_id, null for unknown, and errors without one" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    setRegistryRoot(root_z);
+    defer clearRegistryRoot();
+
+    const me = registry.currentPid();
+    try writeRawEntry(alloc, root, me, "interactive", "has-session", null);
+
+    // Patch in a session_id (writeRawEntry doesn't take one directly).
+    registry.update(alloc, .{ .session_id = "resume-me-1234" });
+
+    var pid_buf: [16]u8 = undefined;
+    const pid_str = try std.fmt.bufPrint(&pid_buf, "{d}", .{me});
+
+    const sid = (try resolveAttachSessionId(alloc, pid_str)).?;
+    defer alloc.free(sid);
+    try testing.expectEqualStrings("resume-me-1234", sid);
+
+    try testing.expect((try resolveAttachSessionId(alloc, "999999")) == null);
 }
 
 test "cmdKill on an unknown subject prints 'no such session'" {

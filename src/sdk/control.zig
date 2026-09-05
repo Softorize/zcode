@@ -54,6 +54,20 @@ pub const ControlSubtype = enum {
     set_max_thinking_tokens,
     hook_callback,
     elicitation,
+    /// headless-sdk-11: "Requests the current status of all MCP server
+    /// connections." Recognized and answered -- see `buildMcpStatusResponse`
+    /// / headless.zig's `.mcp_status` branch.
+    mcp_status,
+    /// headless-sdk-11: "Rewinds file changes made since a specific user
+    /// message." Recognized (distinguishable from a truly unsupported
+    /// subtype in logs/metrics) but NOT YET actually wired to zcode's
+    /// checkpoint/undo mechanism -- that lives in session_cmds.zig /
+    /// session_mgmt.zig, keyed by session id + a user-supplied label, not by
+    /// the reference's `user_message_id`, and reconciling the two keying
+    /// schemes is a bigger design task than this package's scope. Answered
+    /// with an error response (see the dispatcher), same as `.unsupported`,
+    /// but the subtype itself is no longer silently misclassified.
+    rewind_files,
     unsupported,
 
     pub fn toString(self: ControlSubtype) []const u8 {
@@ -66,6 +80,8 @@ pub const ControlSubtype = enum {
             .set_max_thinking_tokens => "set_max_thinking_tokens",
             .hook_callback => "hook_callback",
             .elicitation => "elicitation",
+            .mcp_status => "mcp_status",
+            .rewind_files => "rewind_files",
             .unsupported => "unsupported",
         };
     }
@@ -81,9 +97,31 @@ pub const ControlSubtype = enum {
         if (std.mem.eql(u8, s, "set_max_thinking_tokens")) return .set_max_thinking_tokens;
         if (std.mem.eql(u8, s, "hook_callback")) return .hook_callback;
         if (std.mem.eql(u8, s, "elicitation")) return .elicitation;
+        if (std.mem.eql(u8, s, "mcp_status")) return .mcp_status;
+        if (std.mem.eql(u8, s, "rewind_files")) return .rewind_files;
         return .unsupported;
     }
 };
+
+/// Build the inner `mcp_status` response body as raw JSON:
+/// `{"mcpServers":[{"name":...,"status":...},...]}` (headless-sdk-11).
+/// `servers_json` is the caller-supplied JSON array of already-built
+/// `{"name":...,"status":...}` entries -- this module stays agnostic to the
+/// MCP client's status representation, matching the `InitResponseData`
+/// design (raw-JSON registries assembled by the caller). Caller owns the
+/// returned slice.
+pub fn buildMcpStatusResponse(allocator: std.mem.Allocator, servers_json: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"mcpServers\":{s}}}", .{if (servers_json.len > 0) servers_json else "[]"});
+}
+
+/// Dispatch an `mcp_status` control_request: build the success
+/// `control_response` carrying `{"mcpServers":[...]}` (headless-sdk-11).
+/// Caller owns the returned NDJSON line.
+pub fn dispatchMcpStatus(allocator: std.mem.Allocator, request_id: []const u8, servers_json: []const u8) ![]u8 {
+    const body = try buildMcpStatusResponse(allocator, servers_json);
+    defer allocator.free(body);
+    return encodeSuccessResponse(allocator, request_id, body);
+}
 
 /// A decoded inbound `control_request`. The `request_id` and `raw_request`
 /// slices borrow from the parse arena held by `DecodedRequest`; copy them out
@@ -1128,13 +1166,47 @@ const testing = std.testing;
 
 test "ControlSubtype round-trips through strings; unknown maps to unsupported" {
     const all = [_]ControlSubtype{
-        .interrupt, .can_use_tool,            .initialize,    .set_permission_mode,
-        .set_model, .set_max_thinking_tokens, .hook_callback, .elicitation,
+        .interrupt,   .can_use_tool,            .initialize,     .set_permission_mode,
+        .set_model,   .set_max_thinking_tokens, .hook_callback,  .elicitation,
+        .mcp_status,  .rewind_files,
     };
     for (all) |s| {
         try testing.expectEqual(s, ControlSubtype.fromString(s.toString()));
     }
     try testing.expectEqual(ControlSubtype.unsupported, ControlSubtype.fromString("nope"));
+}
+
+test "buildMcpStatusResponse: wraps the servers array under mcpServers" {
+    const allocator = testing.allocator;
+    const body = try buildMcpStatusResponse(allocator, "[{\"name\":\"fs\",\"status\":\"connected\"}]");
+    defer allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const servers = parsed.value.object.get("mcpServers").?.array.items;
+    try testing.expectEqual(@as(usize, 1), servers.len);
+    try testing.expectEqualStrings("fs", servers[0].object.get("name").?.string);
+}
+
+test "buildMcpStatusResponse: empty input defaults to an empty array" {
+    const allocator = testing.allocator;
+    const body = try buildMcpStatusResponse(allocator, "");
+    defer allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed.value.object.get("mcpServers").?.array.items.len);
+}
+
+test "dispatchMcpStatus: encodes a success control_response carrying mcpServers" {
+    const allocator = testing.allocator;
+    const line = try dispatchMcpStatus(allocator, "req-1", "[{\"name\":\"fs\",\"status\":\"connected\"}]");
+    defer allocator.free(line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, std.mem.trimEnd(u8, line, "\n"), .{});
+    defer parsed.deinit();
+    const resp = parsed.value.object.get("response").?.object;
+    try testing.expectEqualStrings("success", resp.get("subtype").?.string);
+    try testing.expectEqualStrings("req-1", resp.get("request_id").?.string);
+    const servers = resp.get("response").?.object.get("mcpServers").?.array.items;
+    try testing.expectEqualStrings("connected", servers[0].object.get("status").?.string);
 }
 
 test "decodeRequest: round-trips request_id, subtype, and raw inner request for each supported subtype" {

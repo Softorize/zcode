@@ -32,6 +32,7 @@ const types = @import("../core/types.zig");
 const control = @import("control.zig");
 const env = @import("../core/env.zig");
 const output = @import("output.zig");
+const args_json = @import("args_json.zig");
 
 /// The two `--input-format` choices. `stream_json` is spelled with an
 /// underscore in Zig but parses from / renders to the hyphenated wire token
@@ -86,10 +87,15 @@ pub const StdinMessageKind = enum {
 
 /// A classified stdin line. `kind` is the union member; `prompt` is the
 /// extracted user-turn text (only set for `.user`, borrowing from `arena`).
-/// The caller deinits `arena` to free everything the classification borrows.
+/// `message_uuid` is the line's own top-level `uuid` field when the host set
+/// one (only set for `.user`, borrowing from `arena`; empty when absent) --
+/// the client-supplied correlation id the reference calls `submitMessage
+/// options.uuid` (headless-sdk-missed-186). The caller deinits `arena` to
+/// free everything the classification borrows.
 pub const ClassifiedLine = struct {
     kind: StdinMessageKind,
     prompt: []const u8 = "",
+    message_uuid: []const u8 = "",
     arena: std.json.Parsed(std.json.Value),
 
     pub fn deinit(self: *ClassifiedLine) void {
@@ -116,9 +122,15 @@ pub fn classifyLine(allocator: std.mem.Allocator, line: []const u8) !ClassifiedL
     const kind = StdinMessageKind.fromTypeString(type_val.string);
 
     var prompt: []const u8 = "";
-    if (kind == .user) prompt = extractUserPrompt(obj);
+    var message_uuid: []const u8 = "";
+    if (kind == .user) {
+        prompt = extractUserPrompt(obj);
+        if (obj.get("uuid")) |uv| {
+            if (uv == .string) message_uuid = uv.string;
+        }
+    }
 
-    return .{ .kind = kind, .prompt = prompt, .arena = parsed };
+    return .{ .kind = kind, .prompt = prompt, .message_uuid = message_uuid, .arena = parsed };
 }
 
 /// Pull the prompt text out of an SDKUserMessage object. The reference shape is
@@ -167,9 +179,11 @@ pub const TOTAL_CAP: usize = 10 * 1024 * 1024;
 /// handler; an unhandled control_request is simply skipped here).
 pub const Handlers = struct {
     ctx: *anyopaque,
-    /// Run one user turn to completion. `prompt` borrows from the line's parse
-    /// arena and is only valid for the duration of the call.
-    on_user: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
+    /// Run one user turn to completion. `prompt` and `message_uuid` (the
+    /// line's own top-level `uuid`, or "" when absent -- headless-sdk-
+    /// missed-186) borrow from the line's parse arena and are only valid for
+    /// the duration of the call.
+    on_user: ?*const fn (ctx: *anyopaque, prompt: []const u8, message_uuid: []const u8) anyerror!void = null,
     /// Route a control_request line (raw JSON) to the control dispatcher.
     on_control_request: ?*const fn (ctx: *anyopaque, raw: []const u8) anyerror!void = null,
     /// Resolve a pending CLI-originated request from a control_response line.
@@ -239,7 +253,7 @@ pub fn dispatchLine(
 
     switch (classified.kind) {
         .user => {
-            if (handlers.on_user) |cb| try cb(handlers.ctx, classified.prompt);
+            if (handlers.on_user) |cb| try cb(handlers.ctx, classified.prompt, classified.message_uuid);
         },
         .control_request => {
             if (handlers.on_control_request) |cb| try cb(handlers.ctx, trimmed);
@@ -346,6 +360,9 @@ pub const RelayApprover = struct {
     /// Raw JSON array of permission suggestions, or "[]" when none. Embedded
     /// verbatim into the request envelope.
     pending_permission_suggestions: []const u8 = "[]",
+    /// Owns the `args_json.toJsonObject`-converted JSON, freed on the next
+    /// `setPendingCb` call and on `deinit`. `pending_input_json` borrows it.
+    pending_input_json_owned: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, dispatcher: Dispatcher) RelayApprover {
         return .{ .allocator = allocator, .dispatcher = dispatcher };
@@ -354,6 +371,7 @@ pub const RelayApprover = struct {
     pub fn deinit(self: *RelayApprover) void {
         for (self.resolved_ids.items) |id| self.allocator.free(id);
         self.resolved_ids.deinit(self.allocator);
+        if (self.pending_input_json_owned) |owned| self.allocator.free(owned);
     }
 
     /// True when `tool_use_id` has already been resolved this session.
@@ -448,6 +466,34 @@ pub const RelayApprover = struct {
     /// Type-erased pointer to this approver, for the ApprovalHandler `ctx` slot.
     pub fn ctxPtr(self: *RelayApprover) *anyopaque {
         return @ptrCast(self);
+    }
+
+    /// ApprovalHandler.setPending adapter (headless-sdk-01): the runtime calls
+    /// this once per dispatched tool call, right before it may reach `promptCb`,
+    /// so the eventual `can_use_tool` request carries the REAL tool_name/input
+    /// instead of the previous hardcoded ""/"{}" placeholders.
+    ///
+    /// `raw_args` is zcode's INTERNAL tool-args encoding (`key=value;...`,
+    /// see core/parse_helpers.argsToKvText), never JSON -- args_json.zig
+    /// converts it to a real JSON object here, once, at the SDK boundary. A
+    /// conversion failure (OOM) fails safe to `{}` rather than propagating
+    /// (this callback has no error return; a bad allocation should not corrupt
+    /// or skip the upcoming approval gate).
+    pub fn setPendingCb(ctx: *anyopaque, tool_name: []const u8, raw_args: []const u8, tool_use_id: []const u8) void {
+        const self: *RelayApprover = @ptrCast(@alignCast(ctx));
+        const converted = args_json.toJsonObject(self.allocator, raw_args) catch
+            (self.allocator.dupe(u8, "{}") catch {
+                // Total allocation failure: leave the previous pending_* state
+                // (or the struct defaults) rather than crash.
+                self.pending_tool_name = tool_name;
+                self.pending_tool_use_id = tool_use_id;
+                return;
+            });
+        if (self.pending_input_json_owned) |old| self.allocator.free(old);
+        self.pending_input_json_owned = converted;
+        self.pending_tool_name = tool_name;
+        self.pending_input_json = converted;
+        self.pending_tool_use_id = tool_use_id;
     }
 };
 
@@ -694,7 +740,8 @@ const TurnRecorder = struct {
         self.prompts.deinit(self.allocator);
     }
 
-    fn onUser(ctx: *anyopaque, prompt: []const u8) anyerror!void {
+    fn onUser(ctx: *anyopaque, prompt: []const u8, message_uuid: []const u8) anyerror!void {
+        _ = message_uuid;
         const self: *TurnRecorder = @ptrCast(@alignCast(ctx));
         try self.prompts.append(self.allocator, try self.allocator.dupe(u8, prompt));
     }
@@ -709,7 +756,8 @@ const ReplayRecorder = struct {
     out: *std.ArrayList(u8),
     session_id: []const u8,
 
-    fn onUser(ctx: *anyopaque, prompt: []const u8) anyerror!void {
+    fn onUser(ctx: *anyopaque, prompt: []const u8, message_uuid: []const u8) anyerror!void {
+        _ = message_uuid;
         const self: *ReplayRecorder = @ptrCast(@alignCast(ctx));
         const line = try output.serializeUserReplay(self.allocator, prompt, self.session_id);
         defer self.allocator.free(line);
@@ -735,6 +783,26 @@ test "classifyLine: a user message yields .user with the extracted prompt" {
     defer classified.deinit();
     try testing.expectEqual(StdinMessageKind.user, classified.kind);
     try testing.expectEqualStrings("hello there", classified.prompt);
+}
+
+test "classifyLine: a top-level uuid on a user message is captured as message_uuid (missed-186)" {
+    const allocator = testing.allocator;
+    var classified = try classifyLine(
+        allocator,
+        "{\"type\":\"user\",\"uuid\":\"client-uuid-42\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}",
+    );
+    defer classified.deinit();
+    try testing.expectEqualStrings("client-uuid-42", classified.message_uuid);
+}
+
+test "classifyLine: message_uuid is empty when the line carries no top-level uuid" {
+    const allocator = testing.allocator;
+    var classified = try classifyLine(
+        allocator,
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}",
+    );
+    defer classified.deinit();
+    try testing.expectEqualStrings("", classified.message_uuid);
 }
 
 test "classifyLine: array content blocks extract the text block" {
@@ -1035,6 +1103,31 @@ test "RelayApprover: a dispatcher error fails safe to deny and does not record t
     try testing.expectEqual(types.ApprovalResponse.deny, resp);
     // The id was NOT recorded, so a retry can still reach the host.
     try testing.expect(!approver.alreadyResolved("tool-err"));
+}
+
+test "RelayApprover.setPendingCb stamps pending_* so a following promptCb carries real tool_name/input (headless-sdk-01)" {
+    const allocator = testing.allocator;
+    var stub = StubDispatcher{ .allocator = allocator, .decision = .allow };
+    defer stub.deinit();
+    var approver = RelayApprover.init(allocator, stub.dispatcher());
+    defer approver.deinit();
+
+    // Simulate the runtime's single dispatch call site: stamp pending fields
+    // BEFORE the gate calls promptCb with only a human message.
+    RelayApprover.setPendingCb(approver.ctxPtr(), "Bash", "{\"command\":\"ls -la\"}", "tool-77");
+
+    const resp = try RelayApprover.promptCb(approver.ctxPtr(), "Approve Bash [MEDIUM]?");
+    try testing.expectEqual(types.ApprovalResponse.approve, resp);
+    try testing.expect(std.mem.indexOf(u8, stub.last_request, "\"tool_name\":\"Bash\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stub.last_request, "\"command\":\"ls -la\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stub.last_request, "\"tool_use_id\":\"tool-77\"") != null);
+}
+
+test "RelayApprover.setPendingCb defaults empty input_json to {}" {
+    const allocator = testing.allocator;
+    var approver = RelayApprover.init(allocator, undefined);
+    RelayApprover.setPendingCb(approver.ctxPtr(), "Read", "", "");
+    try testing.expectEqualStrings("{}", approver.pending_input_json);
 }
 
 test "RelayApprover.promptCb maps through the pending_* fields (ApprovalHandler path)" {

@@ -338,6 +338,24 @@ pub const SpinnerState = struct {
         self.tool_use_count += 1;
     }
 
+    /// repl-ux-04: sink for `http_common.RetryStatusCallback`. Routes the
+    /// formatted "Waiting for API response \xc2\xb7 next try in {d}s \xc2\xb7
+    /// attempt {d} \xc2\xb7 esc to interrupt" line through the same `update`
+    /// path a normal progress verb uses, so it replaces the spinner's usual
+    /// thinking verb for the duration of a retry backoff instead of a
+    /// separate rendering path.
+    fn retryStatusSink(ctx: ?*anyopaque, status: []const u8) void {
+        const self: *SpinnerState = @ptrCast(@alignCast(ctx orelse return));
+        self.update(status);
+    }
+
+    /// Build a retry-status callback bound to this spinner state, ready to
+    /// pass as `callHttpWithResilienceAndRetryStatus`'s `retry_status`
+    /// argument so a provider's retry loop can drive the spinner line.
+    pub fn retryStatusCallback(self: *SpinnerState) http_common.RetryStatusCallback {
+        return .{ .ctx = self, .on_retry = retryStatusSink };
+    }
+
     pub fn update(self: *SpinnerState, message: []const u8) void {
         var normalized_buf: [80]u8 = undefined;
         const normalized = normalizeSummary(message, &normalized_buf);
@@ -2018,6 +2036,19 @@ test "getTurnCompletionVerb is deterministic and in the completion list" {
 
 test "getTurnCompletionVerb zero seed returns stable Worked" {
     try testing.expectEqualStrings("Worked", getTurnCompletionVerb(0));
+}
+
+test "retryStatusCallback routes a provider retry-status line into the spinner's latest text" {
+    var state: SpinnerState = .{};
+    const cb = state.retryStatusCallback();
+    var status_buf: [96]u8 = undefined;
+    cb.on_retry(cb.ctx, http_common.formatRetryStatus(&status_buf, 4_000, 3));
+
+    state.mutex.lock(rt.io) catch {};
+    const latest = state.latest[0..state.latest_len];
+    state.mutex.unlock(rt.io);
+    try testing.expect(std.mem.indexOf(u8, latest, "attempt 3") != null);
+    try testing.expect(std.mem.indexOf(u8, latest, "esc to interrupt") != null);
 }
 
 test "prompt queue enqueues the buffered input as a new slot" {

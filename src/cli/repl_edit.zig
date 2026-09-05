@@ -4,6 +4,7 @@ const repl_markdown = @import("repl_markdown.zig");
 const parse_helpers = @import("../core/parse_helpers.zig");
 const word_diff = @import("../core/word_diff.zig");
 const env = @import("../core/env.zig");
+const figures = @import("../core/figures.zig");
 
 /// Whether diff-content syntax highlighting is enabled, gated by
 /// CLAUDE_CODE_SYNTAX_HIGHLIGHT (parity with the reference's
@@ -1162,101 +1163,68 @@ fn startsWithAnyIgnoreCase(text: []const u8, needles: []const []const u8) bool {
     return false;
 }
 
-/// Tone-colored left-edge accent rail for tool cards. The bar is
-/// `▎` (U+258E LEFT ONE QUARTER BLOCK) -- thicker than `│` so the
-/// status color reads at a glance, and tinted per-tone so a
-/// failure card looks unmistakably different from a success card
-/// without having to read the body text.
-///
-///   neutral -> dim gray  (quiet, no decoration noise)
-///   success -> mint green (matches the brand accent from the
-///              welcome banner and spinner pulse)
-///   warning -> amber
-///   failure -> red
-///   diff    -> cyan
-///
-/// Previously every line of every card used the same dim `│`
-/// bracket regardless of outcome, which meant a long successful
-/// Bash run and a failed one looked identical at a glance and
-/// the user had to scan the footer to spot errors.
-fn toneRail(tone: Tone) []const u8 {
-    return switch (tone) {
-        .neutral => "\x1b[2m\xe2\x96\x8e\x1b[0m",
-        .success => "\x1b[38;5;114m\xe2\x96\x8e\x1b[0m",
-        .warning => "\x1b[38;5;180m\xe2\x96\x8e\x1b[0m",
-        .failure => "\x1b[38;5;203m\xe2\x96\x8e\x1b[0m",
-        .diff => "\x1b[38;5;81m\xe2\x96\x8e\x1b[0m",
-    };
-}
+
+// repl-ux-02: Claude Code renders every tool call as a flat bullet line
+// ("⏺ Tool(args)", cc_strings.txt: `Ar=P()==="macos"?"⏺":"●"`) followed
+// by dim, indented result lines each prefixed with the "⎿" connector
+// (cc_strings.txt: `[dimColor:!0,children:["  ","⎿  "]]`), not a
+// bordered card. `writeCardHeader`/`writeCardFooter`/`writeCardLine`/
+// `writeSectionLabel`/`writeKeyValueLine`/`writeMultilineSection` keep
+// their original names and signatures (every specialized formatter --
+// formatBashBlock, formatReadBlock, formatGlobBlock, ... -- calls them
+// unchanged) but now emit that flat idiom instead of the `toneRail`
+// bordered card.
 
 fn writeCardHeader(writer: anytype, label: []const u8, subtitle: []const u8, tone: Tone) !void {
-    try writer.writeAll(toneRail(tone));
+    // repl-ux-02: plain "⏺ Tool(args)" -- no inline SGR codes on this
+    // line, so the call line stays a clean, greppable substring
+    // (reference: `Ar=P()==="macos"?"⏺":"●"` with no color/weight
+    // change called out for the bullet or label itself).
+    _ = tone;
+    try writer.writeAll(figures.toolCallGlyph());
     try writer.writeByte(' ');
-    // Approval indicator: checkmark for success/neutral, X for failure
-    switch (tone) {
-        .success, .neutral, .diff => {
-            try writer.writeAll("\x1b[38;5;114m\xe2\x9c\x93\x1b[0m "); // green checkmark
-        },
-        .failure => {
-            try writer.writeAll("\x1b[38;5;203m\xe2\x9c\x97\x1b[0m "); // red X
-        },
-        .warning => {
-            try writer.writeAll("\x1b[38;5;180m\xe2\x9a\xa0\x1b[0m "); // amber warning
-        },
-    }
-    try writer.writeAll(repl_markdown.ANSI_BOLD);
-    try writer.writeAll(toneColor(tone));
     try writer.writeAll(label);
-    try writer.writeAll(repl_markdown.ANSI_RESET);
     if (subtitle.len > 0) {
-        try writer.writeByte(' ');
-        try writer.writeAll(repl_markdown.ANSI_PATH);
+        try writer.writeByte('(');
         try writer.writeAll(subtitle);
-        try writer.writeAll(repl_markdown.ANSI_RESET);
+        try writer.writeByte(')');
     }
     try writer.writeByte('\n');
 }
 
-fn writeCardFooter(writer: anytype, summary: []const u8, tone: Tone) !void {
-    try writer.writeAll(toneRail(tone));
-    try writer.writeByte(' ');
+/// One flat, dim "  ⎿  <text>" result line beneath the "⏺ Tool(...)"
+/// call line. `tone` still layers a foreground color over the dim base
+/// (failure -> red, warning -> amber, diff -> cyan) so errors and diff
+/// hunks stay visually distinct without reintroducing a bordered rail.
+fn writeConnectorLine(writer: anytype, text: []const u8, tone: Tone) !void {
+    try writer.writeAll("  ");
     try writer.writeAll(repl_markdown.ANSI_DIM);
-    try writer.writeAll(toneColor(tone));
-    try writer.writeAll(summary);
-    try writer.writeAll(repl_markdown.ANSI_RESET);
-    try writer.writeByte('\n');
-}
-
-fn writeCardLine(writer: anytype, text: []const u8, tone: Tone) !void {
-    try writer.writeAll(toneRail(tone));
-    try writer.writeByte(' ');
+    try writer.writeAll(figures.CONNECTOR);
+    try writer.writeAll("  ");
     try writer.writeAll(toneColor(tone));
     try writer.writeAll(text);
     try writer.writeAll(repl_markdown.ANSI_RESET);
     try writer.writeByte('\n');
 }
 
+fn writeCardFooter(writer: anytype, summary: []const u8, tone: Tone) !void {
+    try writeConnectorLine(writer, summary, tone);
+}
+
+fn writeCardLine(writer: anytype, text: []const u8, tone: Tone) !void {
+    try writeConnectorLine(writer, text, tone);
+}
+
 fn writeSectionLabel(writer: anytype, label: []const u8, tone: Tone) !void {
-    try writer.writeAll(toneRail(tone));
-    try writer.writeByte(' ');
-    try writer.writeAll(repl_markdown.ANSI_DIM);
-    try writer.writeAll(label);
-    try writer.writeAll(repl_markdown.ANSI_RESET);
-    try writer.writeByte('\n');
+    try writeConnectorLine(writer, label, tone);
 }
 
 fn writeKeyValueLine(writer: anytype, key: []const u8, value: []const u8, tone: Tone) !void {
-    try writer.writeAll(toneRail(tone));
-    try writer.writeByte(' ');
-    try writer.writeAll(repl_markdown.ANSI_DIM);
-    try writer.writeAll(key);
-    try writer.writeAll(": ");
-    try writer.writeAll(repl_markdown.ANSI_RESET);
-    try writer.writeAll(toneColor(tone));
+    var line_buf: [200]u8 = undefined;
     var value_buf: [160]u8 = undefined;
-    try writer.writeAll(clipMiddleInto(&value_buf, value, 120));
-    try writer.writeAll(repl_markdown.ANSI_RESET);
-    try writer.writeByte('\n');
+    const clipped_value = clipMiddleInto(&value_buf, value, 120);
+    const line = std.fmt.bufPrint(&line_buf, "{s}: {s}", .{ key, clipped_value }) catch key;
+    try writeConnectorLine(writer, line, tone);
 }
 
 fn writeMultilineSection(writer: anytype, text: []const u8, tone: Tone, max_lines: usize) !void {
@@ -1272,20 +1240,14 @@ fn writeMultilineSection(writer: anytype, text: []const u8, tone: Tone, max_line
         const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0 and !non_empty_seen) continue;
         non_empty_seen = true;
-        try writer.writeAll(toneRail(tone));
-        try writer.writeByte(' ');
-        try writer.writeAll(toneColor(tone));
-        try writer.writeAll("  ");
         var line_buf: [160]u8 = undefined;
-        try writer.writeAll(clipMiddleInto(&line_buf, trimmed, 140));
-        try writer.writeAll(repl_markdown.ANSI_RESET);
-        try writer.writeByte('\n');
+        try writeConnectorLine(writer, clipMiddleInto(&line_buf, trimmed, 140), tone);
         shown += 1;
     }
 
     if (total > shown) {
         var buf: [64]u8 = undefined;
-        const more = std.fmt.bufPrint(&buf, "... {d} more lines omitted", .{total - shown}) catch "...";
+        const more = std.fmt.bufPrint(&buf, "... +{d} lines (ctrl+o to expand)", .{total - shown}) catch "...";
         try writeCardLine(writer, more, .warning);
     }
 }
@@ -1567,6 +1529,33 @@ test "writeDiffCodeLine context line with syntax off emits no keyword SGR" {
     const out = buf[0..fbs.end];
     try testing.expect(std.mem.indexOf(u8, out, "const x = 1;") != null);
     try testing.expect(std.mem.indexOf(u8, out, repl_markdown.ANSI_CODE_KEYWORD) == null);
+}
+
+test "formatToolOutputBlock renders a flat bullet-and-connector transcript, not a bordered card" {
+    // repl-ux-02: the reference renders every tool call as a plain
+    // "⏺ Tool(args)" bullet line followed by dim "  ⎿  <result>" lines,
+    // never a bordered card (toneRail's "▎" bar + check/X/warning icon).
+    var out: [8192]u8 = undefined;
+    const block = formatToolOutputBlock(&out, "Bash", "npm test", "$ npm test\nall tests passed\n[exit_code=0]\n");
+
+    var glyph_line_buf: [64]u8 = undefined;
+    const glyph_line = std.fmt.bufPrint(&glyph_line_buf, "{s} Bash(", .{figures.toolCallGlyph()}) catch unreachable;
+    try testing.expect(std.mem.startsWith(u8, block, glyph_line));
+    try testing.expect(std.mem.indexOf(u8, block, "Bash(npm test)") != null);
+    try testing.expect(std.mem.indexOf(u8, block, figures.CONNECTOR) != null);
+    // No leftover card chrome: the old rail bar and check/X/warning icons.
+    try testing.expect(std.mem.indexOf(u8, block, "\xe2\x96\x8e") == null);
+    try testing.expect(std.mem.indexOf(u8, block, "\xe2\x9c\x93") == null);
+    try testing.expect(std.mem.indexOf(u8, block, "\xe2\x9c\x97") == null);
+}
+
+test "writeConnectorLine result lines are indented two spaces before the connector" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.Io.Writer.fixed(&buf);
+    try writeConnectorLine(&fbs, "ok", .success);
+    const out = buf[0..fbs.end];
+    try testing.expect(std.mem.startsWith(u8, out, "  "));
+    try testing.expect(std.mem.indexOf(u8, out, figures.CONNECTOR) != null);
 }
 
 test "env_registry lists CLAUDE_CODE_SYNTAX_HIGHLIGHT" {

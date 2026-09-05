@@ -54,10 +54,17 @@ pub const Category = enum { searches, reads, writes, commands, other };
 // `startsWith`, so these are prefixes.
 const search_tools = [_][]const u8{ "Grep", "Glob", "WebSearch", "LSP" };
 const read_tools = [_][]const u8{ "Read", "ListMcpResourcesTool" };
-const write_tools = [_][]const u8{ "Write", "Edit", "NotebookEdit" };
+// tools-06 (wp2-tools-surface): MultiEdit no longer canonicalizes onto Edit
+// (it's the reference's own distinct tool), so it needs its own bucket entry
+// here to keep landing in .writes.
+const write_tools = [_][]const u8{ "Write", "Edit", "MultiEdit", "NotebookEdit" };
 // SHELL_TOOL_NAMES is Bash + PowerShell in the reference; plus Tmux and the
 // task-stop tool. zcode's canonical name for the kill-shell tool is TaskStop.
-const command_tools = [_][]const u8{ "Bash", "PowerShell", "Tmux", "TaskStop" };
+// tools-05 (wp2-tools-surface): BashOutput/AgentOutput(Tool)/KillBash now
+// canonicalize to TaskOutput (the reference's LEGACY_TOOL_NAME_ALIASES
+// target), so TaskOutput needs its own bucket entry to keep landing in
+// .commands.
+const command_tools = [_][]const u8{ "Bash", "PowerShell", "Tmux", "TaskStop", "TaskOutput" };
 
 /// Categorize a (possibly legacy-aliased) tool name into one of the five
 /// buckets. Aliases are normalized to the reference-exact name first, then

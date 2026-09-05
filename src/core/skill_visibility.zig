@@ -170,6 +170,9 @@ fn makeSpec(user_invocable: bool, disable_model_invocation: bool, paths: [][]u8)
         .version = empty,
         .aliases = empty_list,
         .hooks_json = empty,
+        .disallowed_tools = empty_list,
+        .argument_hint = empty,
+        .metadata_json = empty,
     };
 }
 

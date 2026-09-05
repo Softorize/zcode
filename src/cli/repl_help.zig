@@ -18,6 +18,15 @@ const ANSI_BRAND_ACCENT_DIM = repl_markdown.ANSI_BRAND_ACCENT_DIM;
 pub const HelpEntry = struct {
     usage: []const u8,
     desc: []const u8,
+    /// commands-37: true for a zcode-only command (or a non-canonical
+    /// spelling of a real one already reconciled by command_canonical.zig)
+    /// that has no counterpart in the 2.1.261 command surface
+    /// (cc_commands_full.json / cmd_diff.json "extra"). Hidden entries stay
+    /// fully dispatchable in repl_commands.zig -- only their default /help
+    /// visibility changes, matching the reference's own `isHidden` commands
+    /// (still runnable, just excluded from the printed catalog). `/help all`
+    /// shows them.
+    is_hidden: bool = false,
 };
 
 /// A titled section of related commands. Groups exist so users can scan
@@ -35,6 +44,7 @@ const getting_started = [_]HelpEntry{
     .{ .usage = "/help", .desc = "Show this screen" },
     .{ .usage = "/help keys", .desc = "Show the fullscreen keyboard and leader-key reference" },
     .{ .usage = "/help commands", .desc = "Show the full slash-command catalog" },
+    .{ .usage = "/help all", .desc = "Show the full catalog, including zcode-only extras hidden by default" },
     .{ .usage = "/exit, /quit", .desc = "Exit the session" },
     .{ .usage = "/version, /v", .desc = "Print the zcode build version" },
     .{ .usage = "/whoami", .desc = "One-line provider/model/agent/version" },
@@ -58,12 +68,12 @@ const getting_started = [_]HelpEntry{
     .{ .usage = "/cost", .desc = "Show session cost estimation" },
     .{ .usage = "/compact", .desc = "Force a conversation compaction snapshot" },
     .{ .usage = "/copy [N]", .desc = "Copy the last assistant response (or the Nth-latest) to the clipboard" },
-    .{ .usage = "/transcript", .desc = "Open the transcript pager with search, export, and scrollback dump" },
+    .{ .usage = "/transcript", .desc = "Open the transcript pager with search, export, and scrollback dump", .is_hidden = true },
     .{ .usage = "/todos", .desc = "Show the current open-task checklist" },
     .{ .usage = "/tasks, /bashes", .desc = "List and manage tracked background tasks" },
-    .{ .usage = "/teams", .desc = "Show local team metadata and recent team message status" },
-    .{ .usage = "/bridge", .desc = "Show browser and MCP bridge status for this local runtime" },
-    .{ .usage = "/files", .desc = "List files the model has Read or Edited this session" },
+    .{ .usage = "/teams", .desc = "Show local team metadata and recent team message status", .is_hidden = true },
+    .{ .usage = "/bridge", .desc = "Show browser and MCP bridge status for this local runtime", .is_hidden = true },
+    .{ .usage = "/files", .desc = "List files the model has Read or Edited this session", .is_hidden = true },
 };
 
 const input_and_keys = [_]HelpEntry{
@@ -101,20 +111,22 @@ const input_and_keys = [_]HelpEntry{
 };
 
 const modes_and_plans = [_]HelpEntry{
-    .{ .usage = "/mode [name]", .desc = "Show or set mode (execution|planning|brainstorm|review)" },
+    .{ .usage = "/mode [name]", .desc = "Show or set mode (execution|planning|brainstorm|review)", .is_hidden = true },
     .{ .usage = "/density [full|clean]", .desc = "Show or set fullscreen UI density" },
     .{ .usage = "/brief", .desc = "Toggle brief mode for the fullscreen transcript" },
-    .{ .usage = "/vim", .desc = "Toggle vim editing for the fullscreen prompt" },
+    .{ .usage = "/focus", .desc = "Toggle focus view: just the recent exchange, not the full scrollback" },
+    .{ .usage = "/vim", .desc = "Toggle vim editing for the fullscreen prompt", .is_hidden = true },
+    .{ .usage = "/tui [default|fullscreen]", .desc = "Show or report the terminal UI renderer" },
     .{ .usage = "/plan <action>", .desc = "Plan actions: approve | discuss | cancel" },
-    .{ .usage = "/approve-plan", .desc = "Alias for /plan approve" },
-    .{ .usage = "/yolo", .desc = "Open the auto-mode dialog (fullscreen) or toggle YOLO inline" },
+    .{ .usage = "/approve-plan", .desc = "Alias for /plan approve", .is_hidden = true },
+    .{ .usage = "/yolo", .desc = "Open the auto-mode dialog (fullscreen) or toggle YOLO inline", .is_hidden = true },
     .{ .usage = "/effort [level]", .desc = "Show or set reasoning effort (auto|low|medium|high|max)" },
     .{ .usage = "/format json <schema>", .desc = "Enforce a JSON schema on the next response" },
     .{ .usage = "/format clear", .desc = "Clear any pending response schema" },
 };
 
 const models_and_providers = [_]HelpEntry{
-    .{ .usage = "/models", .desc = "List models for the active provider" },
+    .{ .usage = "/models", .desc = "List models for the active provider", .is_hidden = true },
     .{ .usage = "/model", .desc = "Open model picker (fullscreen)" },
     .{ .usage = "/model current", .desc = "Show active provider / model" },
     .{ .usage = "/model <id>", .desc = "Switch active model (or provider/model)" },
@@ -147,11 +159,11 @@ const sessions = [_]HelpEntry{
 
 const agents_and_skills = [_]HelpEntry{
     .{ .usage = "/agents", .desc = "List available agents" },
-    .{ .usage = "/agent current", .desc = "Show the active agent" },
-    .{ .usage = "/agent <name>", .desc = "Activate an agent for this session" },
-    .{ .usage = "/agent none", .desc = "Clear the active agent" },
+    .{ .usage = "/agent current", .desc = "Show the active agent", .is_hidden = true },
+    .{ .usage = "/agent <name>", .desc = "Activate an agent for this session", .is_hidden = true },
+    .{ .usage = "/agent none", .desc = "Clear the active agent", .is_hidden = true },
     .{ .usage = "/skills", .desc = "List available skills" },
-    .{ .usage = "/skill <name> ...", .desc = "Show or run a skill" },
+    .{ .usage = "/skill <name> ...", .desc = "Show or run a skill", .is_hidden = true },
     .{ .usage = "/hooks", .desc = "List installed hooks" },
 };
 
@@ -161,7 +173,7 @@ const plugins_and_commands = [_]HelpEntry{
     .{ .usage = "/plugin install <name>", .desc = "Install a marketplace plugin" },
     .{ .usage = "/plugin uninstall <name>", .desc = "Remove an installed plugin" },
     .{ .usage = "/plugin update <name>", .desc = "Reinstall a plugin from its catalog" },
-    .{ .usage = "/commands", .desc = "List reusable commands" },
+    .{ .usage = "/commands", .desc = "List reusable commands", .is_hidden = true },
     .{ .usage = "/command <name> ...", .desc = "Show or run a reusable command" },
     .{ .usage = "/command install <name>", .desc = "Install a marketplace command" },
     .{ .usage = "/command uninstall <name>", .desc = "Remove an installed command" },
@@ -190,44 +202,50 @@ const mcp_commands = [_]HelpEntry{
 };
 
 const git_and_review = [_]HelpEntry{
-    .{ .usage = "/review [target]", .desc = "Review working changes, commit, or branch" },
-    .{ .usage = "/commit [context]", .desc = "Stage changes and create a git commit" },
-    .{ .usage = "/pr [context]", .desc = "Push branch and open a pull request via gh" },
-    .{ .usage = "/pr-comments [target]", .desc = "Fetch PR review comments" },
-    .{ .usage = "/pr-status", .desc = "Show PR review state (approved/pending/changes_requested)" },
+    .{ .usage = "/review [target]", .desc = "Review working changes, commit, or branch", .is_hidden = true },
+    .{ .usage = "/commit [context]", .desc = "Stage changes and create a git commit", .is_hidden = true },
+    .{ .usage = "/pr [context]", .desc = "Push branch and open a pull request via gh", .is_hidden = true },
+    .{ .usage = "/pr-comments [target]", .desc = "Fetch PR review comments", .is_hidden = true },
+    .{ .usage = "/pr-status", .desc = "Show PR review state (approved/pending/changes_requested)", .is_hidden = true },
     .{ .usage = "/diff [target]", .desc = "Show a unified diff for working changes" },
-    .{ .usage = "/open, /quick-open", .desc = "Open the quick-open file picker (fullscreen)" },
+    .{ .usage = "/open, /quick-open", .desc = "Open the quick-open file picker (fullscreen)", .is_hidden = true },
     .{ .usage = "/security-review", .desc = "Run the security review flow" },
-    .{ .usage = "/worktree [path]", .desc = "Show or switch git worktree context" },
+    .{ .usage = "/worktree [path]", .desc = "Show or switch git worktree context", .is_hidden = true },
 };
 
 const trust_and_policy = [_]HelpEntry{
-    .{ .usage = "/trust", .desc = "Show repo trust status" },
-    .{ .usage = "/trust hooks", .desc = "Show hook fingerprint trust state" },
-    .{ .usage = "/trust hook allow <path>", .desc = "Trust a workspace hook fingerprint" },
-    .{ .usage = "/trust hook revoke <path>", .desc = "Revoke a trusted hook fingerprint" },
-    .{ .usage = "/trust marketplace", .desc = "Show marketplace allow/block policy" },
-    .{ .usage = "/trust marketplace allow <prefix>", .desc = "Allow a remote source prefix" },
-    .{ .usage = "/trust marketplace block <prefix>", .desc = "Block a remote source prefix" },
-    .{ .usage = "/policy", .desc = "Print the effective policy" },
+    .{ .usage = "/trust", .desc = "Show repo trust status", .is_hidden = true },
+    .{ .usage = "/trust hooks", .desc = "Show hook fingerprint trust state", .is_hidden = true },
+    .{ .usage = "/trust hook allow <path>", .desc = "Trust a workspace hook fingerprint", .is_hidden = true },
+    .{ .usage = "/trust hook revoke <path>", .desc = "Revoke a trusted hook fingerprint", .is_hidden = true },
+    .{ .usage = "/trust marketplace", .desc = "Show marketplace allow/block policy", .is_hidden = true },
+    .{ .usage = "/trust marketplace allow <prefix>", .desc = "Allow a remote source prefix", .is_hidden = true },
+    .{ .usage = "/trust marketplace block <prefix>", .desc = "Block a remote source prefix", .is_hidden = true },
+    .{ .usage = "/policy", .desc = "Print the effective policy", .is_hidden = true },
     .{ .usage = "/permissions", .desc = "Show and manage approval permission rules" },
-    .{ .usage = "/sandbox", .desc = "Show the current sandbox configuration" },
-    .{ .usage = "/sandbox-toggle", .desc = "Cycle through sandbox profiles" },
+    .{ .usage = "/sandbox", .desc = "Show the current sandbox configuration", .is_hidden = true },
+    // commands-37: cc_commands_full.json has no "sandbox-toggle" key at all
+    // (verified directly against the 2.1.261 extraction), matching
+    // cmd_diff.json's "extra" list. Note this conflicts with the older #565
+    // fixture in parity_command_coverage.zig, which assumes /sandbox-toggle
+    // IS a real reference command; that fixture is outside this gap's scope
+    // to reconcile (see wp1a-commands-surface's final report).
+    .{ .usage = "/sandbox-toggle", .desc = "Cycle through sandbox profiles", .is_hidden = true },
 };
 
 const workspace_and_setup = [_]HelpEntry{
     .{ .usage = "/init", .desc = "Initialize zcode in the current workspace" },
-    .{ .usage = "/onboarding", .desc = "Run the first-launch onboarding flow" },
+    .{ .usage = "/onboarding", .desc = "Run the first-launch onboarding flow", .is_hidden = true },
     .{ .usage = "/add-dir <path>", .desc = "Add a directory to the workspace scope" },
-    .{ .usage = "/env", .desc = "Show detected environment info (platform, shell, cwd, ...)" },
-    .{ .usage = "/env list", .desc = "List session env vars applied to spawned shell commands" },
-    .{ .usage = "/env set NAME=VAL", .desc = "Set a session env var for subprocess children" },
-    .{ .usage = "/env unset NAME", .desc = "Drop a session env var" },
-    .{ .usage = "/env clear", .desc = "Clear all session env vars" },
-    .{ .usage = "/env registry", .desc = "List every environment variable zcode reads (provider keys redacted)" },
+    .{ .usage = "/env", .desc = "Show detected environment info (platform, shell, cwd, ...)", .is_hidden = true },
+    .{ .usage = "/env list", .desc = "List session env vars applied to spawned shell commands", .is_hidden = true },
+    .{ .usage = "/env set NAME=VAL", .desc = "Set a session env var for subprocess children", .is_hidden = true },
+    .{ .usage = "/env unset NAME", .desc = "Drop a session env var", .is_hidden = true },
+    .{ .usage = "/env clear", .desc = "Clear all session env vars", .is_hidden = true },
+    .{ .usage = "/env registry", .desc = "List every environment variable zcode reads (provider keys redacted)", .is_hidden = true },
     .{ .usage = "/keybindings", .desc = "Open the context-aware keybindings file in your editor" },
-    .{ .usage = "/styles, /style [name]", .desc = "Open the output style picker (fullscreen) or list/switch styles inline" },
-    .{ .usage = "/reload", .desc = "Reload prompt-side keybindings from disk without restarting" },
+    .{ .usage = "/styles, /style [name]", .desc = "Open the output style picker (fullscreen) or list/switch styles inline", .is_hidden = true },
+    .{ .usage = "/reload", .desc = "Reload prompt-side keybindings from disk without restarting", .is_hidden = true },
     .{ .usage = "/reload-plugins", .desc = "Rescan and reload installed plugins" },
 };
 
@@ -237,7 +255,7 @@ const updates_and_feedback = [_]HelpEntry{
     .{ .usage = "/release-notes", .desc = "Show release notes for the current version" },
     .{ .usage = "/changelog", .desc = "Show the project changelog" },
     .{ .usage = "/feedback", .desc = "Send feedback to the maintainers" },
-    .{ .usage = "/issue [title]", .desc = "Open a GitHub issue for the project" },
+    .{ .usage = "/issue [title]", .desc = "Open a GitHub issue for the project", .is_hidden = true },
     .{ .usage = "/stickers", .desc = "Open the stickers redemption page" },
 };
 
@@ -281,7 +299,7 @@ const overview_runtime_review = [_]HelpEntry{
     .{ .usage = "Ctrl+X A", .desc = "Open the runtime control panel for tasks, approvals, model state, and automation" },
     .{ .usage = "Ctrl+X T", .desc = "Open the background tasks overlay" },
     .{ .usage = "/status", .desc = "Append the full runtime state to the transcript" },
-    .{ .usage = "/review [target]", .desc = "Review the current diff, commit, or branch" },
+    .{ .usage = "/review [target]", .desc = "Review the current diff, commit, or branch", .is_hidden = true },
 };
 
 const overview_display_customize = [_]HelpEntry{
@@ -345,7 +363,12 @@ fn writeHelpHeader(writer: anytype, use_color: bool, title: []const u8, subtitle
     }
 }
 
-fn writeHelpGroups(writer: anytype, groups: []const HelpGroup, use_color: bool) !void {
+/// commands-37: `show_hidden` selects whether `is_hidden` entries (zcode-only
+/// commands and non-canonical spellings with no 2.1.261 counterpart) print.
+/// The default catalog passes false; `/help all` passes true. Hidden
+/// commands stay fully dispatchable either way -- this only gates the
+/// printed listing, mirroring the reference's own `isHidden` commands.
+fn writeHelpGroups(writer: anytype, groups: []const HelpGroup, use_color: bool, show_hidden: bool) !void {
     const section_bar = "\xe2\x96\x8e";
     for (groups) |group| {
         try writer.writeAll("\n");
@@ -366,6 +389,7 @@ fn writeHelpGroups(writer: anytype, groups: []const HelpGroup, use_color: bool) 
         }
         for (group.entries) |entry| {
             if (removed_commands.isRemoved(entry.usage)) continue; // hide removed commands (PRD #534)
+            if (entry.is_hidden and !show_hidden) continue; // commands-37
             try writeHelpEntry(writer, entry, use_color);
         }
     }
@@ -373,7 +397,7 @@ fn writeHelpGroups(writer: anytype, groups: []const HelpGroup, use_color: bool) 
 
 pub fn writeOverviewScreen(writer: anytype, use_color: bool) !void {
     try writeHelpHeader(writer, use_color, "zcode help", "task-first guide");
-    try writeHelpGroups(writer, OVERVIEW_GROUPS[0..], use_color);
+    try writeHelpGroups(writer, OVERVIEW_GROUPS[0..], use_color, false);
     if (use_color) {
         try writer.print("\n  {s}Any other input runs an agent turn.{s}\n\n", .{ ANSI_DIM, ANSI_RESET });
     } else {
@@ -387,7 +411,7 @@ pub fn writeKeysScreen(writer: anytype, use_color: bool) !void {
         .{ .title = "Modes & planning", .entries = &modes_and_plans },
     };
     try writeHelpHeader(writer, use_color, "zcode keys", "fullscreen shortcuts and leader actions");
-    try writeHelpGroups(writer, key_groups[0..], use_color);
+    try writeHelpGroups(writer, key_groups[0..], use_color, false);
     if (use_color) {
         try writer.print("\n  {s}Run /help commands for the full slash-command catalog.{s}\n\n", .{ ANSI_DIM, ANSI_RESET });
     } else {
@@ -399,10 +423,45 @@ pub fn writeKeysScreen(writer: anytype, use_color: bool) !void {
 /// the title row uses the brand mint accent, group titles are bold brand,
 /// command names stay default weight, and descriptions dim to secondary.
 /// When false, output is pure ASCII/UTF-8 with no escape sequences so it
-/// composes safely into the scrollable transcript or into pipes.
+/// composes safely into the scrollable transcript or into pipes. Excludes
+/// `is_hidden` entries (commands-37); use `writeHelpScreenAll` to include them.
+/// repl-ux-06: zcode's own rendering of the reference's General tab body
+/// ("Claude understands your codebase, makes edits with your permission,
+/// and executes commands -- right from your terminal.", cc_strings.txt,
+/// immediately followed by a bold "Shortcuts" heading) -- reworded to say
+/// zcode instead of pasting the Anthropic-authored sentence verbatim.
+const HELP_INTRO = "zcode understands your codebase, makes edits with your permission, and executes commands -- right from your terminal.";
+
+/// repl-ux-06: mirrors the reference's closing "For more help:" + docs
+/// link row (cc_strings.txt: "For more help:" -> Link to
+/// https://code.claude.com/docs/en/overview) with zcode's own project
+/// home, since zcode has no hosted docs site of its own yet.
+const HELP_DOCS_URL = "https://github.com/Softorize/zcode";
+
 pub fn writeHelpScreen(writer: anytype, use_color: bool) !void {
     try writeHelpHeader(writer, use_color, "zcode commands", "grouped by topic");
-    try writeHelpGroups(writer, GROUPS[0..], use_color);
+    if (use_color) {
+        try writer.print("  {s}{s}{s}\n", .{ ANSI_DIM, HELP_INTRO, ANSI_RESET });
+    } else {
+        try writer.print("  {s}\n", .{HELP_INTRO});
+    }
+    try writeHelpGroups(writer, GROUPS[0..], use_color, false);
+
+    if (use_color) {
+        try writer.print("\n  {s}Any other input runs an agent turn.{s}\n", .{ ANSI_DIM, ANSI_RESET });
+        try writer.print("  {s}For more help: {s}{s}\n\n", .{ ANSI_DIM, HELP_DOCS_URL, ANSI_RESET });
+    } else {
+        try writer.writeAll("\n  Any other input runs an agent turn.\n");
+        try writer.print("  For more help: {s}\n\n", .{HELP_DOCS_URL});
+    }
+}
+
+/// commands-37: the same catalog as `writeHelpScreen` but including
+/// `is_hidden` entries (zcode-only commands and non-canonical spellings with
+/// no 2.1.261 counterpart), for the `/help all` view.
+pub fn writeHelpScreenAll(writer: anytype, use_color: bool) !void {
+    try writeHelpHeader(writer, use_color, "zcode commands (all)", "grouped by topic, including zcode-only extras");
+    try writeHelpGroups(writer, GROUPS[0..], use_color, true);
 
     if (use_color) {
         try writer.print("\n  {s}Any other input runs an agent turn.{s}\n\n", .{ ANSI_DIM, ANSI_RESET });
@@ -550,6 +609,28 @@ pub fn writeHelpScreenWithDynamic(
     _ = try writeDynamicCommandsSection(writer, allocator, cwd, use_color);
 }
 
+/// commands-37: `/help all` variant -- the same as `buildPlaintextWithDynamic`
+/// but including `is_hidden` entries (zcode-only commands and non-canonical
+/// spellings with no 2.1.261 counterpart).
+pub fn buildPlaintextWithDynamicAll(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
+    var buf = std_io.StringBuilder.init(allocator);
+    defer buf.deinit();
+    try writeHelpScreenAll(buf.writer(), false);
+    _ = try writeDynamicCommandsSection(buf.writer(), allocator, cwd, false);
+    return buf.toOwnedSlice();
+}
+
+/// commands-37: `/help all` variant of `writeHelpScreenWithDynamic`.
+pub fn writeHelpScreenWithDynamicAll(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    use_color: bool,
+) !void {
+    try writeHelpScreenAll(writer, use_color);
+    _ = try writeDynamicCommandsSection(writer, allocator, cwd, use_color);
+}
+
 fn writeHelpEntry(writer: anytype, entry: HelpEntry, use_color: bool) !void {
     if (entry.usage.len >= USAGE_COLUMN) {
         // Long usage: keep it on its own line, then description on a new
@@ -589,6 +670,15 @@ pub fn buildPlaintext(allocator: std.mem.Allocator) ![]u8 {
     return buf.toOwnedSlice();
 }
 
+/// commands-37: `/help all` variant of `buildPlaintext` -- includes
+/// `is_hidden` entries.
+pub fn buildPlaintextAll(allocator: std.mem.Allocator) ![]u8 {
+    var buf = std_io.StringBuilder.init(allocator);
+    defer buf.deinit();
+    try writeHelpScreenAll(buf.writer(), false);
+    return buf.toOwnedSlice();
+}
+
 pub fn buildOverviewPlaintext(allocator: std.mem.Allocator) ![]u8 {
     var buf = std_io.StringBuilder.init(allocator);
     defer buf.deinit();
@@ -605,6 +695,17 @@ pub fn buildKeysPlaintext(allocator: std.mem.Allocator) ![]u8 {
 
 const testing = std.testing;
 
+test "help plaintext opens with the app description and closes with a docs link" {
+    const plaintext = try buildPlaintext(testing.allocator);
+    defer testing.allocator.free(plaintext);
+
+    try testing.expect(std.mem.indexOf(u8, plaintext, "understands your codebase, makes edits with your permission") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "For more help:") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "https://github.com/Softorize/zcode") != null);
+    // The description names zcode, never Claude Code / Anthropic.
+    try testing.expect(std.mem.indexOf(u8, plaintext, "Claude") == null);
+}
+
 test "help groups cover core commands" {
     const plaintext = try buildPlaintext(testing.allocator);
     defer testing.allocator.free(plaintext);
@@ -617,12 +718,55 @@ test "help groups cover core commands" {
     try testing.expect(std.mem.indexOf(u8, plaintext, "/agents") != null);
     try testing.expect(std.mem.indexOf(u8, plaintext, "/skills") != null);
     try testing.expect(std.mem.indexOf(u8, plaintext, "/plugins") != null);
-    // /marketplace was removed for CC parity (use /plugins); group still covered by /plugins above.
+    // /marketplace is restored (commands-04, a real reference alias of
+    // /plugin); group still covered by /plugins above.
     try testing.expect(std.mem.indexOf(u8, plaintext, "/mcp tools") != null);
-    try testing.expect(std.mem.indexOf(u8, plaintext, "/review") != null);
+    // commands-37: /review, /trust, and /policy are zcode-only inventions
+    // with no 2.1.261 counterpart and are hidden from the default catalog
+    // now (see "help all screen surfaces zcode-only extras" below);
+    // /permissions and /security-review are real reference commands and
+    // remain visible.
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/permissions") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/security-review") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/effort") != null);
+}
+
+test "commands-37: default help catalog hides zcode-only extras" {
+    const plaintext = try buildPlaintext(testing.allocator);
+    defer testing.allocator.free(plaintext);
+
+    // A representative sample of the 65 zcode-only commands (cmd_diff.json
+    // "extra") that have no 2.1.261 counterpart -- none of these should
+    // appear in the default catalog, though each command still runs when
+    // typed directly (repl_commands.zig dispatch is untouched by this).
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/yolo") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/open, /quick-open") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/worktree") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/sandbox-toggle") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/trust") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/policy") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/review") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/commit") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/models") == null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/onboarding") == null);
+}
+
+test "commands-37: /help all surfaces the hidden zcode-only extras" {
+    const plaintext = try buildPlaintextAll(testing.allocator);
+    defer testing.allocator.free(plaintext);
+
+    // Everything hidden from the default catalog is present here instead.
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/yolo") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/open, /quick-open") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/worktree") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/sandbox-toggle") != null);
     try testing.expect(std.mem.indexOf(u8, plaintext, "/trust") != null);
     try testing.expect(std.mem.indexOf(u8, plaintext, "/policy") != null);
-    try testing.expect(std.mem.indexOf(u8, plaintext, "/effort") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/review [target]") != null);
+
+    // Non-hidden commands are still present too -- /help all is a superset.
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/permissions") != null);
+    try testing.expect(std.mem.indexOf(u8, plaintext, "/security-review") != null);
 }
 
 test "help plaintext contains group headers" {

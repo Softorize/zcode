@@ -10,6 +10,7 @@ const figures = @import("../core/figures.zig");
 const ui_theme = @import("../core/ui_theme.zig");
 const sandbox_mod = @import("../core/sandbox.zig");
 const terminal_caps = @import("../core/terminal_caps.zig");
+const permission_decision = @import("../core/permission_decision.zig");
 
 const UiTranscript = repl_spinner.UiTranscript;
 const TRANSCRIPT_DIVIDER_PREFIX = "[[divider:";
@@ -31,6 +32,52 @@ const TranscriptDecorState = struct {
     assistant_brief_rows_used: usize = 0,
     assistant_brief_hidden_rows: usize = 0,
 };
+
+// repl-ux-07: shared "Settings"-style sectioned panel for /status and
+// /config, mirroring the reference's Settings dialog (edualc
+// src/components/Settings/Status.tsx: named property groups like
+// `label:'Version'`, `buildAccountProperties()`, `buildMcpProperties()`,
+// rendered as Title-Case "Label: value" rows) instead of a raw
+// snake_case `key={value}` dump.
+pub const StatusField = struct {
+    label: []const u8,
+    value: []const u8,
+};
+
+pub const StatusSection = struct {
+    title: []const u8,
+    fields: []const StatusField,
+};
+
+/// Render `sections` as a bordered, Title-Case panel: a bold title row,
+/// then one bold-accent section heading per group followed by its
+/// "Label: value" rows (dim label, plain value). Used by both `/status`
+/// and `/config` (no args) so the two commands visibly share one panel
+/// surface rather than being unrelated raw dumps, per the reference's
+/// single Settings dialog on two different default tabs.
+pub fn renderStatusPanel(writer: anytype, title: []const u8, sections: []const StatusSection, use_color: bool) !void {
+    if (use_color) {
+        try writer.print("\n  {s}{s}{s}\n", .{ repl_markdown.ANSI_BRAND_ACCENT_BOLD, title, repl_markdown.ANSI_RESET });
+    } else {
+        try writer.print("\n{s}\n", .{title});
+    }
+    for (sections) |section| {
+        if (section.fields.len == 0) continue;
+        if (use_color) {
+            try writer.print("\n  {s}{s}{s}\n", .{ repl_markdown.ANSI_BRAND_ACCENT_BOLD, section.title, repl_markdown.ANSI_RESET });
+        } else {
+            try writer.print("\n{s}\n", .{section.title});
+        }
+        for (section.fields) |field| {
+            if (use_color) {
+                try writer.print("  {s}{s}:{s} {s}\n", .{ repl_markdown.ANSI_DIM, field.label, repl_markdown.ANSI_RESET, field.value });
+            } else {
+                try writer.print("  {s}: {s}\n", .{ field.label, field.value });
+            }
+        }
+    }
+    try writer.writeByte('\n');
+}
 
 pub fn formatTranscriptDivider(out: []u8, label: []const u8) []const u8 {
     var pos: usize = 0;
@@ -90,13 +137,24 @@ pub fn inputContentRows(input_text: []const u8, cols: usize) usize {
     return @min(@max(rows, 1), 3); // 1-3 rows
 }
 
+/// commands-16: /focus caps how many transcript rows are visible, so the
+/// bottom-anchored scroll window naturally shows mostly just the latest
+/// exchange (with "... N earlier rows above ..." standing in for the
+/// reference's one-line prior-turns summary) instead of the full
+/// scrollback -- reusing the existing scroll/window machinery rather than
+/// a bespoke turn-boundary content filter.
+const FOCUS_MODE_MAX_WINDOW_ROWS: usize = 12;
+
 pub fn transcriptWindowRows(total_rows: usize, options: anytype) usize {
     const margin = repl_spinner.boundedBottomMarginRows(total_rows, options.bottom_margin_rows);
     const panel_gap = inputPanelGapRows(total_rows);
     const chrome_gaps = bottomChromeGutterRows(total_rows) * 2;
     const reserved = 7 + chrome_gaps + panel_gap + margin + topContextBarRows(options); // input panel + footer + status + gutters + top bar + margin
-    if (total_rows <= reserved) return 1;
-    return total_rows - reserved;
+    const available = if (total_rows <= reserved) 1 else total_rows - reserved;
+    if (@hasField(@TypeOf(options), "focus_mode") and options.focus_mode) {
+        return @min(available, FOCUS_MODE_MAX_WINDOW_ROWS);
+    }
+    return available;
 }
 
 pub fn inputPanelGapRows(total_rows: usize) usize {
@@ -870,6 +928,81 @@ fn renderDraftMeter(writer: anytype, used_cols: *usize, cols: usize, input_text:
     try writeBestFooterSegment(writer, used_cols, cols, &candidates, .dim, options);
 }
 
+/// repl-ux-01: the reference `getNextPermissionMode` footer chip table
+/// (cc_strings.txt `var W=[{label:"default",...},{label:"accept edits
+/// on",symbol:xke,color:"autoAccept"},{label:"plan mode
+/// on",symbol:dkt,color:"planMode"},{label:"auto mode
+/// on",symbol:xke,color:"warning"}]` where `dkt="⏸"` and
+/// `xke="⏵⏵"`). `.default` and `.dontAsk` render no chip at all,
+/// matching the reference (dontAsk never appears in the Shift+Tab cycle).
+fn permissionModeChipText(buf: []u8, live_mode: permission_decision.Mode) []const u8 {
+    return switch (live_mode) {
+        .default, .dontAsk => "",
+        .acceptEdits => std.fmt.bufPrint(buf, "\xe2\x8f\xb5\xe2\x8f\xb5 accept edits on", .{}) catch "accept edits on",
+        .plan => std.fmt.bufPrint(buf, "\xe2\x8f\xb8 plan mode on", .{}) catch "plan mode on",
+        .bypassPermissions => std.fmt.bufPrint(buf, "\xe2\x8f\xb5\xe2\x8f\xb5 auto mode on", .{}) catch "auto mode on",
+    };
+}
+
+fn permissionModeChipTone(live_mode: permission_decision.Mode) FooterSegmentTone {
+    return switch (live_mode) {
+        .default, .dontAsk => .plain,
+        .acceptEdits => .accent,
+        .plan => .dim,
+        .bypassPermissions => .danger,
+    };
+}
+
+fn renderPermissionModeChip(writer: anytype, used_cols: *usize, cols: usize, options: anytype) !void {
+    if (!@hasField(@TypeOf(options), "live_permission_mode")) return;
+    var chip_buf: [48]u8 = undefined;
+    const chip = permissionModeChipText(&chip_buf, options.live_permission_mode);
+    if (chip.len == 0) return;
+    _ = try writeFooterSegment(writer, used_cols, cols, chip, permissionModeChipTone(options.live_permission_mode), options);
+}
+
+/// repl-ux-missed-128 / repl-ux-missed-130: once context usage crosses
+/// this percent-used threshold, show the proactive footer warning below
+/// -- well before compaction is actually forced, mirroring the
+/// reference's live, escalating notice (as opposed to zcode's prior
+/// only-after-the-fact compact-boundary marker in the transcript).
+const CONTEXT_LOW_WARNING_USED_PCT: usize = 90;
+
+/// Compute the reference's "Context low (N% remaining) \xc2\xb7 Run
+/// /compact to compact & continue" line (cc_strings.txt: `` `Context low
+/// (${pctLeft}% remaining) \xB7 ${...}` ``, "Run /compact to compact &
+/// continue"). Reuses the same percent-used inputs
+/// `buildTokenStatusVariants` already computes from the status-metrics
+/// provider and the model's context window -- no new plumbing needed.
+/// Returns "" when there is no metrics provider, no usage data yet, or
+/// usage is still comfortably below the threshold.
+fn computeContextLowWarning(buf: []u8, options: anytype) []const u8 {
+    if (!@hasField(@TypeOf(options), "status_metrics_provider")) return "";
+    const provider = options.status_metrics_provider orelse return "";
+    const metrics = provider.get(provider.ctx);
+
+    const ctx_base = if (metrics.last_budget_input > 0)
+        metrics.last_budget_input
+    else if (options.status_model_context_window > 0)
+        options.status_model_context_window
+    else
+        0;
+    if (ctx_base == 0 or metrics.last_prompt_tokens == 0) return "";
+
+    const used_pct = @min(@as(usize, 100), (metrics.last_prompt_tokens * 100) / ctx_base);
+    if (used_pct < CONTEXT_LOW_WARNING_USED_PCT) return "";
+
+    const percent_left = 100 -| used_pct;
+    return std.fmt.bufPrint(buf, "Context low ({d}% remaining) \xc2\xb7 Run /compact to compact & continue", .{percent_left}) catch "";
+}
+
+fn renderContextLowWarning(writer: anytype, used_cols: *usize, cols: usize, options: anytype) !void {
+    var warning_buf: [80]u8 = undefined;
+    const warning = computeContextLowWarning(&warning_buf, options);
+    if (warning.len == 0) return;
+    _ = try writeFooterSegment(writer, used_cols, cols, warning, .danger, options);
+}
+
 fn renderPromptFooter(writer: anytype, options: anytype, mode: anytype, cols: usize, input_text: []const u8) !void {
     if (cols == 0) return;
 
@@ -877,6 +1010,7 @@ fn renderPromptFooter(writer: anytype, options: anytype, mode: anytype, cols: us
 
     _ = mode;
     _ = try writeFooterSegment(writer, &used_cols, cols, "actions", .accent, options);
+    try renderPermissionModeChip(writer, &used_cols, cols, options);
 
     if (@hasField(@TypeOf(options), "input_mode_label")) {
         if (options.input_mode_label.len > 0) {
@@ -912,6 +1046,8 @@ fn renderPromptFooter(writer: anytype, options: anytype, mode: anytype, cols: us
             _ = try writeFooterSegment(writer, &used_cols, cols, safety_single, safety_tone, options);
         }
     }
+
+    try renderContextLowWarning(writer, &used_cols, cols, options);
 
     if (@hasField(@TypeOf(options), "footer_tmux_state")) {
         if (options.footer_tmux_state.len > 0) {
@@ -2480,6 +2616,23 @@ test "transcriptWindowRows accounts for bottom margin" {
     try testing.expectEqual(@as(usize, 18), transcriptWindowRows(30, options));
 }
 
+test "transcriptWindowRows caps the visible window when focus_mode is on" {
+    const options = .{
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .focus_mode = true,
+    };
+    try testing.expectEqual(@as(usize, FOCUS_MODE_MAX_WINDOW_ROWS), transcriptWindowRows(30, options));
+
+    // A terminal already smaller than the cap is unaffected either way.
+    const small_options = .{
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .focus_mode = true,
+    };
+    try testing.expectEqual(transcriptWindowRows(14, .{ .bottom_margin_rows = @as(usize, 2), .transcript_line_spacing = @as(usize, 1) }), transcriptWindowRows(14, small_options));
+}
+
 test "transcriptVisualRows applies configured line spacing" {
     var transcript = UiTranscript.init(testing.allocator, 10);
     defer transcript.deinit(testing.allocator);
@@ -3305,6 +3458,154 @@ test "renderPromptFooter shows compact shortcuts in the redesigned footer" {
     // to the prompt-hint row above this footer to reduce visual density on
     // the bottom bar. They are exercised by the prompt-hint test.
     try testing.expect(std.mem.indexOf(u8, buf.items(), "? shortcuts") == null);
+}
+
+const TestFooterOptions = struct {
+    yolo_mode: bool,
+    status_approval_mode: []const u8,
+    status_sandbox: []const u8,
+    status_show_safety: bool,
+    status_show_workspace: bool,
+    status_show_model: bool,
+    status_show_tokens: bool,
+    status_show_hint: bool,
+    color_enabled: bool,
+    enable_thinking_summary: bool,
+    live_permission_mode: permission_decision.Mode,
+};
+
+fn testFooterOptionsWithMode(live_mode: permission_decision.Mode) TestFooterOptions {
+    return .{
+        .yolo_mode = false,
+        .status_approval_mode = @as([]const u8, "acceptEdits"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_safety = false,
+        .status_show_workspace = false,
+        .status_show_model = false,
+        .status_show_tokens = false,
+        .status_show_hint = false,
+        .color_enabled = false,
+        .enable_thinking_summary = false,
+        .live_permission_mode = live_mode,
+    };
+}
+
+test "renderPromptFooter shows a persistent permission-mode chip for reference modes and stays silent on default" {
+    const TestMode = enum { execution, planning, brainstorm, review };
+
+    {
+        var buf = std_io.StringBuilder.init(testing.allocator);
+        defer buf.deinit();
+        try renderPromptFooter(buf.writer(), testFooterOptionsWithMode(.acceptEdits), TestMode.execution, 160, "");
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "accept edits on") != null);
+    }
+    {
+        var buf = std_io.StringBuilder.init(testing.allocator);
+        defer buf.deinit();
+        try renderPromptFooter(buf.writer(), testFooterOptionsWithMode(.plan), TestMode.execution, 160, "");
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "plan mode on") != null);
+    }
+    {
+        var buf = std_io.StringBuilder.init(testing.allocator);
+        defer buf.deinit();
+        try renderPromptFooter(buf.writer(), testFooterOptionsWithMode(.bypassPermissions), TestMode.execution, 160, "");
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "auto mode on") != null);
+    }
+    {
+        var buf = std_io.StringBuilder.init(testing.allocator);
+        defer buf.deinit();
+        try renderPromptFooter(buf.writer(), testFooterOptionsWithMode(.default), TestMode.execution, 160, "");
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "accept edits on") == null);
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "plan mode on") == null);
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "auto mode on") == null);
+    }
+}
+
+test "renderStatusPanel renders Title-Case section headers and Label: value rows, not snake_case keys" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const version_fields = [_]StatusField{
+        .{ .label = "Version", .value = "0.12.50" },
+    };
+    const provider_fields = [_]StatusField{
+        .{ .label = "Provider", .value = "anthropic" },
+        .{ .label = "Model", .value = "claude-sonnet-5" },
+    };
+    const sections = [_]StatusSection{
+        .{ .title = "Version", .fields = version_fields[0..] },
+        .{ .title = "Provider", .fields = provider_fields[0..] },
+    };
+    try renderStatusPanel(buf.writer(), "zcode status", sections[0..], false);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "Version") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Provider: anthropic") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Model: claude-sonnet-5") != null);
+    // No leftover snake_case dump style.
+    try testing.expect(std.mem.indexOf(u8, out, "provider=") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "version=") == null);
+}
+
+test "renderStatusPanel skips empty sections" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+    const empty_fields = [_]StatusField{};
+    const filled_fields = [_]StatusField{.{ .label = "Sandbox", .value = "workspace-write" }};
+    const sections = [_]StatusSection{
+        .{ .title = "Empty Section", .fields = empty_fields[0..] },
+        .{ .title = "Safety", .fields = filled_fields[0..] },
+    };
+    try renderStatusPanel(buf.writer(), "zcode status", sections[0..], false);
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "Empty Section") == null);
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "Sandbox: workspace-write") != null);
+}
+
+const TestContextMetrics = struct {
+    last_budget_input: usize = 0,
+    last_prompt_tokens: usize = 0,
+};
+const TestContextMetricsProvider = struct {
+    ctx: ?*anyopaque = null,
+    get: *const fn (ctx: ?*anyopaque) TestContextMetrics,
+};
+
+fn testContextMetricsGet(ctx: ?*anyopaque) TestContextMetrics {
+    const m: *const TestContextMetrics = @ptrCast(@alignCast(ctx.?));
+    return m.*;
+}
+
+test "computeContextLowWarning fires once usage crosses the threshold and reports percent remaining" {
+    var metrics = TestContextMetrics{ .last_budget_input = 100_000, .last_prompt_tokens = 92_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+    };
+    var buf: [80]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.startsWith(u8, warning, "Context low (8% remaining)"));
+    try testing.expect(std.mem.indexOf(u8, warning, "Run /compact to compact & continue") != null);
+}
+
+test "computeContextLowWarning stays silent comfortably below the threshold" {
+    var metrics = TestContextMetrics{ .last_budget_input = 100_000, .last_prompt_tokens = 40_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+    };
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("", computeContextLowWarning(&buf, options));
+}
+
+test "computeContextLowWarning falls back to status_model_context_window when last_budget_input is unset" {
+    var metrics = TestContextMetrics{ .last_budget_input = 0, .last_prompt_tokens = 95_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 100_000),
+    };
+    var buf: [80]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.startsWith(u8, warning, "Context low (5% remaining)"));
 }
 
 test "classifyInputHighlightByte marks slash commands and @references" {
