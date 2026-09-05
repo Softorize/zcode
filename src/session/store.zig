@@ -107,6 +107,12 @@ pub const Store = struct {
     /// `{"type":"system","subtype":"compact_boundary",...}` marker record,
     /// mirroring the reference's post-/compact transcript shape.
     mark_next_snapshot_compact: bool = false,
+    /// Cap on a single session's on-disk `.jsonl` size before
+    /// `trimIfOversized` drops the oldest whole records
+    /// (sessions-storage-missed-200). Matches `load()`'s own 256 MiB read
+    /// cap by default; a test can shrink this to exercise the trim path
+    /// without writing hundreds of megabytes.
+    max_session_bytes: u64 = 256 * 1024 * 1024,
 
     pub fn init(allocator: std.mem.Allocator, sessions_dir: []const u8, encryption_enabled: bool) !Store {
         try paths.ensureDir(sessions_dir);
@@ -266,6 +272,7 @@ pub const Store = struct {
         }
 
         try self.appendRecordLine(file, record_buf.items());
+        self.trimIfOversized(path);
     }
 
     /// Append a snapshot record. `origin_cwd` is an optional breadcrumb
@@ -345,6 +352,7 @@ pub const Store = struct {
         }, .{})});
 
         try self.appendRecordLine(file, record_buf.items());
+        self.trimIfOversized(path);
     }
 
     /// Emit a `{"type":"system","subtype":"compact_boundary",...}` marker
@@ -1016,13 +1024,23 @@ pub const Store = struct {
         return self.sidecarPath(session_id, ".branch");
     }
 
-    /// Read the persisted git branch for `session_id`. Returns null when
-    /// the sidecar is missing (session not on a branch, or pre-feature).
+    /// Read the persisted git branch for `session_id`. Prefers the `.branch`
+    /// sidecar (cheap, and reflects the branch as of the LAST write to it);
+    /// when the sidecar is missing (session predates the sidecar, or the
+    /// `.jsonl` was copied to another machine without it -- sessions-
+    /// storage-missed-201) falls back to the `gitBranch` field zcode's own
+    /// Claude-Code-shaped schema (sessions-storage-01) already stamps on
+    /// every turn record, so the branch is never silently lost even when
+    /// only the `.jsonl` survives. Returns null when neither source has it.
     /// Caller owns the returned slice.
     pub fn readBranch(self: *Store, session_id: []const u8) !?[]u8 {
         const path = try self.branchPath(session_id);
         defer self.allocator.free(path);
-        return readTrimmedSidecar(self.allocator, path, 1024);
+        if (try readTrimmedSidecar(self.allocator, path, 1024)) |sidecar| return sidecar;
+
+        const session_path = self.sessionPath(session_id) catch return null;
+        defer self.allocator.free(session_path);
+        return self.lastRecordField(session_path, "gitBranch");
     }
 
     /// Persist the git branch for `session_id`. Empty input deletes the
@@ -1090,12 +1108,23 @@ pub const Store = struct {
         return self.sidecarPath(session_id, ".firstprompt");
     }
 
-    /// Read the persisted first user prompt for `session_id`. Returns null
-    /// when absent. Caller owns the returned slice.
+    /// Read the persisted first user prompt for `session_id`. Prefers the
+    /// `.firstprompt` sidecar (a cheap, pre-truncated cache); when it is
+    /// missing (session predates the sidecar, or the `.jsonl` was copied
+    /// elsewhere without it -- sessions-storage-missed-201) falls back to
+    /// scanning the `.jsonl` itself for its first user turn's content,
+    /// mirroring the reference's own `extractFirstPromptFromEntries` (the
+    /// first prompt IS just the first user message; no separate write is
+    /// needed for a reader that has the transcript). Returns null when
+    /// neither source has one. Caller owns the returned slice.
     pub fn readFirstPrompt(self: *Store, session_id: []const u8) !?[]u8 {
         const path = try self.firstPromptPath(session_id);
         defer self.allocator.free(path);
-        return readTrimmedSidecar(self.allocator, path, 16 * 1024);
+        if (try readTrimmedSidecar(self.allocator, path, 16 * 1024)) |sidecar| return sidecar;
+
+        const session_path = self.sessionPath(session_id) catch return null;
+        defer self.allocator.free(session_path);
+        return self.firstUserTurnContent(session_path);
     }
 
     /// Persist the first user prompt for `session_id` ONLY if no first-prompt
@@ -1192,6 +1221,110 @@ pub const Store = struct {
         defer self.allocator.free(path);
         try paths.ensureDir(std.fs.path.dirname(path) orelse self.sessions_dir);
         try writeSidecarAtomic(self.allocator, path, parent_id);
+    }
+
+    /// Regenerate the session id for `/clear`/`/reset`/`/new`
+    /// (sessions-storage-08): mirrors edualc's
+    /// `regenerateSessionId({ setCurrentAsParent: true })` +
+    /// `resetSessionFilePointer()` (src/commands/clear/conversation.ts:203-208).
+    /// Writes `old_session_id` a final snapshot (best-effort -- a failure here
+    /// must never block the caller from actually clearing, since the whole
+    /// point is to leave a clean, resumable stopping point, not to guarantee
+    /// one), mints a brand-new UUIDv4 id via `createSessionId` (honoring any
+    /// pending `pinNextSessionId`), and records `old_session_id` as the new
+    /// id's `.parent` sidecar for traceability. The OLD session's `.jsonl` is
+    /// left completely untouched apart from that final snapshot line; the
+    /// returned id has no turns on disk yet. Caller owns the result and is
+    /// responsible for pointing the live runtime at it (free the old id,
+    /// assign the new one) -- this function only touches the store.
+    pub fn regenerateSessionForClear(
+        self: *Store,
+        old_session_id: []const u8,
+        final_snapshot: *const types.SessionSnapshot,
+        conversation_summary: []const u8,
+    ) ![]u8 {
+        self.appendSnapshot(old_session_id, final_snapshot, conversation_summary, self.active_cwd) catch |err| {
+            std.log.warn("session: /clear final snapshot on {s} failed: {s}", .{ old_session_id, @errorName(err) });
+        };
+        const new_id = try self.createSessionId();
+        errdefer self.allocator.free(new_id);
+        self.setParentSessionId(new_id, old_session_id) catch |err| {
+            std.log.warn("session: /clear could not record parent sidecar for {s}: {s}", .{ new_id, @errorName(err) });
+        };
+        return new_id;
+    }
+
+    /// Best-effort size-based transcript trim (sessions-storage-missed-200):
+    /// the reference tracks and can shrink an oversized transcript rather
+    /// than growing it unbounded (bundle symbols `oversized`, `keptBytes`,
+    /// `straddleSnapCarryLen`, `boundaryStartOffset` sit right next to its
+    /// isCompactSummary logic). Once `path` exceeds `self.max_session_bytes`
+    /// this drops the OLDEST whole records until the file is back under half
+    /// the cap, and writes a `{"type":"system","subtype":"transcript_trimmed",
+    /// "droppedBytes":N,"droppedRecords":M}` marker record in their place so
+    /// a reader knows earlier history was cut from disk -- the in-memory
+    /// conversation and any compaction summary already taken are unaffected;
+    /// this only bounds the on-disk file. Records are kept/dropped as OPAQUE
+    /// raw lines (never decoded), so trimming behaves identically whether or
+    /// not session encryption is enabled. Called after every append; never
+    /// propagates an error -- a failed trim just leaves the file oversized
+    /// until the next successful append, exactly like the pre-this-gap
+    /// behavior.
+    fn trimIfOversized(self: *Store, path: []const u8) void {
+        const stat = std.Io.Dir.cwd().statFile(rt.io, path, .{}) catch return;
+        if (stat.size <= self.max_session_bytes) return;
+
+        const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, self.allocator, .limited(self.max_session_bytes * 4 + 1024)) catch return;
+        defer self.allocator.free(bytes);
+
+        var lines = std.array_list.Managed([]const u8).init(self.allocator);
+        defer lines.deinit();
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            lines.append(line) catch return;
+        }
+        if (lines.items.len <= 1) return; // nothing safe to drop
+
+        const target: usize = @intCast(self.max_session_bytes / 2);
+
+        // Walk from the tail, keeping whole lines until the next one would
+        // push us past target -- but always keep at least the last line so
+        // a very large single record can never leave the file empty.
+        var kept_bytes: usize = 0;
+        var keep_from: usize = lines.items.len;
+        while (keep_from > 0) {
+            const candidate_len = lines.items[keep_from - 1].len + 1; // + '\n'
+            if (kept_bytes > 0 and kept_bytes + candidate_len > target) break;
+            kept_bytes += candidate_len;
+            keep_from -= 1;
+        }
+        if (keep_from == 0) return; // whole file already fits from the tail
+
+        var dropped_bytes: usize = 0;
+        for (lines.items[0..keep_from]) |line| dropped_bytes += line.len + 1;
+
+        const timestamp = formatIso8601(self.allocator, clock.nowSeconds()) catch return;
+        defer self.allocator.free(timestamp);
+        var minted: [36]u8 = undefined;
+        uuid.v4Hex(&minted);
+
+        var out = std_io.StringBuilder.init(self.allocator);
+        defer out.deinit();
+        out.writer().print("{f}\n", .{std.json.fmt(.{
+            .type = "system",
+            .subtype = "transcript_trimmed",
+            .uuid = &minted,
+            .timestamp = timestamp,
+            .isSidechain = false,
+            .droppedBytes = dropped_bytes,
+            .droppedRecords = keep_from,
+        }, .{})}) catch return;
+        for (lines.items[keep_from..]) |line| {
+            out.writer().print("{s}\n", .{line}) catch return;
+        }
+
+        writeJsonlAtomic(self.allocator, path, out.items()) catch {};
     }
 
     /// Read the PR links for `session_id` (one per line). Returns a
@@ -1389,15 +1522,25 @@ pub const Store = struct {
     }
 
     /// Read the `uuid` of the LAST record already on disk at `path`
-    /// (sessions-storage-01 `parentUuid` chaining). Reads only the tail of
-    /// the file (64 KiB, mirroring `core/logger.reseedPrevHashFromFile`'s
-    /// tail-read idiom) so appending to a very large session stays cheap.
-    /// Returns null when the file doesn't exist yet (this will be the
-    /// first record), is empty, or the last line is corrupt/unparseable/
-    /// larger than the tail window -- a missing parent link is a much
-    /// smaller problem than failing the append. Best-effort by design: no
-    /// error is ever propagated to the caller.
+    /// (sessions-storage-01 `parentUuid` chaining). Best-effort thin
+    /// wrapper over `lastRecordField`.
     fn lastRecordUuid(self: *Store, path: []const u8) ?[]u8 {
+        return self.lastRecordField(path, "uuid");
+    }
+
+    /// Read a top-level string `field` off the LAST record already on disk
+    /// at `path` (sessions-storage-01 `parentUuid` chaining;
+    /// sessions-storage-missed-201's `readBranch`/`readFirstPrompt`
+    /// sidecar-free fallback -- mirrors the reference's own
+    /// `extractFieldFromLastEntryStrict` JSONL-native metadata extraction
+    /// rather than a side file). Reads only the tail of the file (64 KiB,
+    /// mirroring `core/logger.reseedPrevHashFromFile`'s tail-read idiom) so
+    /// this stays cheap even on a very large session. Returns null when the
+    /// file doesn't exist, is empty, the last line is corrupt/unparseable/
+    /// larger than the tail window, or lacks that field -- every caller
+    /// treats a miss as "no such record", not an error. Best-effort by
+    /// design: no error is ever propagated to the caller.
+    fn lastRecordField(self: *Store, path: []const u8, field: []const u8) ?[]u8 {
         const file = std.Io.Dir.cwd().openFile(rt.io, path, .{}) catch return null;
         defer file.close(rt.io);
 
@@ -1426,7 +1569,7 @@ pub const Store = struct {
         // A last "line" spanning the entire tail window with no newline
         // before it, when the file is bigger than the window, means a
         // single record wider than 64 KiB precedes it -- we can't safely
-        // tell where it starts. Skip the parent link rather than guess.
+        // tell where it starts. Skip rather than guess.
         if (start == 0 and tail_start > 0) return null;
 
         const decoded = self.decodeRecordLine(last_line) catch return null;
@@ -1435,9 +1578,57 @@ pub const Store = struct {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, decoded, .{}) catch return null;
         defer parsed.deinit();
         if (parsed.value != .object) return null;
-        const found = getString(parsed.value.object, "uuid") orelse return null;
+        const found = getString(parsed.value.object, field) orelse return null;
         if (found.len == 0) return null;
         return self.allocator.dupe(u8, found) catch null;
+    }
+
+    /// Scan `path` from the START for the first "user"-typed turn record's
+    /// `message.content` (sessions-storage-missed-201: mirrors the
+    /// reference's `extractFirstPromptFromEntries` -- the very first user
+    /// message already IS the session's "first prompt", no separate write
+    /// needed). Reads at most `first_prompt_scan_cap` bytes so a very large
+    /// session cannot make this scan expensive; returns null on any error,
+    /// a missing file, or no user turn found in that scanned prefix.
+    /// Best-effort: never propagates an error.
+    fn firstUserTurnContent(self: *Store, path: []const u8) ?[]u8 {
+        const first_prompt_scan_cap: usize = 256 * 1024;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, self.allocator, .limited(first_prompt_scan_cap)) catch return null;
+        defer self.allocator.free(bytes);
+
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const decoded = self.decodeRecordLine(line) catch continue;
+            defer self.allocator.free(decoded);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, decoded, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const obj = parsed.value.object;
+            const kind = getString(obj, "type") orelse continue;
+            if (!(std.mem.eql(u8, kind, "user") or std.mem.eql(u8, kind, "turn"))) continue;
+            if (getString(obj, "subtype") != null) continue; // a structural marker, not a turn
+            // Legacy `{"type":"turn","role":"user",...}` shape.
+            if (std.mem.eql(u8, kind, "turn")) {
+                const role = getString(obj, "role") orelse continue;
+                if (!std.mem.eql(u8, role, "user")) continue;
+                const content = getString(obj, "content") orelse continue;
+                if (content.len == 0) continue;
+                return self.allocator.dupe(u8, content) catch null;
+            }
+            // sessions-storage-01-shaped `{"type":"user","message":{"role":...}}`.
+            const message_obj = switch (obj.get("message") orelse continue) {
+                .object => |m| m,
+                else => continue,
+            };
+            const role = getString(message_obj, "role") orelse continue;
+            if (!std.mem.eql(u8, role, "user")) continue;
+            const content = getString(message_obj, "content") orelse continue;
+            if (content.len == 0) continue;
+            return self.allocator.dupe(u8, content) catch null;
+        }
+        return null;
     }
 
     pub const TurnCounts = struct {
@@ -3433,6 +3624,204 @@ test "setParentSessionId / readParentSessionId roundtrip" {
     const parent = (try store.readParentSessionId("sess-new")) orelse return error.TestUnexpectedResult;
     defer testing.allocator.free(parent);
     try testing.expectEqualStrings("sess-old", parent);
+}
+
+test "regenerateSessionForClear mints a fresh id, snapshots the old session, and links parentage" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-preclear", .user, "before /clear", "");
+
+    const snapshot = emptySnapshot();
+    const new_id = try store.regenerateSessionForClear("sess-preclear", &snapshot, "cleared via /clear");
+    defer testing.allocator.free(new_id);
+
+    // A brand-new UUIDv4, distinct from the old id.
+    try testing.expect(!std.mem.eql(u8, new_id, "sess-preclear"));
+    try testing.expectEqual(@as(usize, 36), new_id.len);
+
+    // The old session gained a final snapshot but its pre-clear turn is
+    // untouched, and the new session has no turns of its own yet.
+    var old_loaded = try store.load("sess-preclear");
+    defer old_loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), old_loaded.history.len);
+    try testing.expectEqualStrings("before /clear", old_loaded.history[0].content);
+    try testing.expectEqualStrings("cleared via /clear", old_loaded.conversation_summary);
+
+    // The new session has no turns of its own yet -- exactly like a
+    // brand-new session, its .jsonl does not exist until the first turn is
+    // appended (the very next user prompt after /clear).
+    const new_path = try store.sessionPath(new_id);
+    defer testing.allocator.free(new_path);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(rt.io, new_path, .{}));
+
+    // Parentage sidecar links the new session back to the pre-clear one.
+    const parent = (try store.readParentSessionId(new_id)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(parent);
+    try testing.expectEqualStrings("sess-preclear", parent);
+}
+
+// ── sessions-storage-missed-200: size-based transcript trimming ───────────
+
+test "trimIfOversized drops the oldest turns and leaves a transcript_trimmed marker" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    // Force plaintext: this test asserts the raw on-disk shape.
+    store.encryption_key = null;
+    // A tiny cap so a handful of turns already trips the trim path without
+    // writing hundreds of megabytes. Each Claude-Code-shaped turn envelope
+    // (uuid/parentUuid/sessionId/timestamp/version/message/... ) runs a few
+    // hundred bytes on its own, so the cap must comfortably exceed one
+    // line + the trim marker or trimming could never get back under it.
+    store.max_session_bytes = 3000;
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const content = std.fmt.bufPrint(&buf, "turn number {d} with some padding text", .{i}) catch unreachable;
+        try store.appendTurn("sess-oversized", .user, content, "");
+    }
+
+    const path = try store.sessionPath("sess-oversized");
+    defer testing.allocator.free(path);
+    const stat = try std.Io.Dir.cwd().statFile(rt.io, path, .{});
+    // Trimmed back down to at most the cap (the marker record can push it
+    // slightly over half the cap, but never anywhere near the untrimmed
+    // ~20-turn size).
+    try testing.expect(stat.size <= store.max_session_bytes);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "transcript_trimmed") != null);
+    // The earliest turns are gone; the most recent turn survives.
+    try testing.expect(std.mem.indexOf(u8, bytes, "turn number 0 with") == null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "turn number 19 with") != null);
+
+    // load() still parses the trimmed file (the marker record has no
+    // `message` field and is skipped, not mistaken for a turn).
+    var loaded = try store.load("sess-oversized");
+    defer loaded.deinit(testing.allocator);
+    try testing.expect(loaded.history.len > 0);
+    try testing.expect(loaded.history.len < 20);
+}
+
+test "trimIfOversized is a no-op below the cap" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-small", .user, "just one small turn", "");
+
+    const path = try store.sessionPath("sess-small");
+    defer testing.allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "transcript_trimmed") == null);
+}
+
+// ── sessions-storage-missed-201: JSONL-native metadata fallback ───────────
+
+test "readBranch falls back to the last record's gitBranch field when the sidecar is absent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    // No .branch sidecar was ever written -- only the .jsonl's own turn
+    // records carry gitBranch (sessions-01), and only when there's a real
+    // git repo at active_cwd. Set active_cwd to this test's own repo
+    // checkout so git_fs.currentBranch resolves something non-empty.
+    store.active_cwd = "."; // the zcode repo checkout the test runs from
+    try store.appendTurn("sess-branch-fallback", .user, "hi", "");
+
+    const branch = try store.readBranch("sess-branch-fallback");
+    if (branch) |b| {
+        defer testing.allocator.free(b);
+        try testing.expect(b.len > 0);
+    } else {
+        // A CI checkout in detached-HEAD state reports no branch name --
+        // acceptable as long as no error was raised.
+    }
+
+    // Explicit no-fallback case: a session with a blank gitBranch (no
+    // active_cwd, so no git detection ran) has nothing to fall back to.
+    var store2 = try Store.init(testing.allocator, sessions_dir, false);
+    defer store2.deinit();
+    try store2.appendTurn("sess-no-branch", .user, "hi", "");
+    try testing.expect((try store2.readBranch("sess-no-branch")) == null);
+}
+
+test "readBranch prefers the .branch sidecar over the jsonl fallback" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-sidecar-branch", .user, "hi", "");
+    try store.setBranch("sess-sidecar-branch", "feature/explicit");
+
+    const branch = (try store.readBranch("sess-sidecar-branch")) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(branch);
+    try testing.expectEqualStrings("feature/explicit", branch);
+}
+
+test "readFirstPrompt falls back to the jsonl's first user turn when the sidecar is absent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    // No .firstprompt sidecar written -- mirrors a .jsonl copied to another
+    // machine without its sidecars.
+    try store.appendTurn("sess-fp-fallback", .user, "what is the first prompt here", "");
+    try store.appendTurn("sess-fp-fallback", .assistant, "an answer", "");
+    try store.appendTurn("sess-fp-fallback", .user, "a second question", "");
+
+    const fp = (try store.readFirstPrompt("sess-fp-fallback")) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(fp);
+    try testing.expectEqualStrings("what is the first prompt here", fp);
+}
+
+test "readFirstPrompt prefers the .firstprompt sidecar over the jsonl fallback" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    try store.appendTurn("sess-fp-sidecar", .user, "the real first prompt", "");
+    _ = try store.setFirstPromptIfAbsent("sess-fp-sidecar", "a cached, edited preview");
+
+    const fp = (try store.readFirstPrompt("sess-fp-sidecar")) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(fp);
+    try testing.expectEqualStrings("a cached, edited preview", fp);
 }
 
 // ── sessions-storage-03: UUIDv4 session ids, sessions-storage-missed-202 ──

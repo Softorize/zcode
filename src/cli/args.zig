@@ -328,6 +328,12 @@ pub const CliOptions = struct {
     strict: bool = false,
     approve_high: bool = false,
     yolo: bool = false,
+    /// sessions-storage-02/04: `--all-projects`/`-a`, honored by
+    /// `zcode session list`/`session resume` (src/session_cmds.zig). Shows
+    /// sessions from every `<zcode_home>/projects/<slug>/` bucket instead of
+    /// only the one for the current cwd. Mirrors the reference resume
+    /// picker's `showAllProjects` toggle.
+    all_projects: bool = false,
     /// phase-26 daemon-background-01: `--bg` / `--background` spawns the
     /// requested run detached (stdout/stderr redirected to a per-session log
     /// file recorded in the live-process registry) and returns immediately
@@ -919,6 +925,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
                 options.preprocessor_enabled = false;
             } else if (std.mem.eql(u8, arg, "--strict")) {
                 options.strict = true;
+            } else if (std.mem.eql(u8, arg, "--all-projects") or std.mem.eql(u8, arg, "-a")) {
+                options.all_projects = true;
             } else if (std.mem.eql(u8, arg, "--approve-high")) {
                 options.approve_high = true;
             } else if (std.mem.eql(u8, arg, "--yolo")) {

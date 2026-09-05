@@ -330,7 +330,11 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
     }
 
     if (std.mem.eql(u8, command, "/session list") or std.mem.eql(u8, command, "/resume list")) {
-        const entries = try runtime.store.list();
+        // sessions-storage-02/04: same-project sessions by default now that
+        // sessions land under `<zcode_home>/projects/<slug>/` -- `store.list()`
+        // only ever sees the legacy flat directory, which would otherwise make
+        // every session started after this migration invisible here.
+        const entries = try runtime.store.listForActiveProject();
         defer runtime.store.freeSessionEntries(entries);
         if (entries.len == 0) {
             return @as(?[]u8, try allocator.dupe(u8, "no saved sessions"));
@@ -390,7 +394,7 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         var early_reply: ?[]u8 = null;
         const loaded = runtime.store.load(arg) catch blk: {
             // Fuzzy fallback: resolve the term against the session list.
-            const entries = try runtime.store.list();
+            const entries = try runtime.store.listForActiveProject();
             defer runtime.store.freeSessionEntries(entries);
 
             const candidates = try allocator.alloc(session_search.Candidate, entries.len);
@@ -2780,11 +2784,27 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try runGitCommandWithArgs(allocator, runtime.cwd, &.{ "git", "diff" }, raw_args));
     }
 
-    // commands-sweep-02: reference `/branch` (alias `/fork`) forks the CURRENT
-    // CONVERSATION at this point into a new session id with traceability back to
-    // the source. It is a pure conversation operation, NOT git. `/fork` resolves
-    // to `/branch` via command_canonical.toDispatch. The old git-branch helper is
-    // re-homed below under `/git-branch` so the functionality is not lost.
+    // sessions-storage-09: /fork COPIES the current conversation into a NEW,
+    // independently-resumable session and leaves the live runtime completely
+    // untouched -- the OPPOSITE of /branch below (which switches the live
+    // session_id/history in place). 2.1.261 ships these as two distinct
+    // top-level commands ("Copy this conversation into a new background
+    // session and keep working here" vs "Create a branch of the current
+    // conversation at this point"); /fork used to alias to /branch via
+    // command_canonical.toDispatch, which was a stale-snapshot artifact.
+    if (std.mem.eql(u8, command, "/fork") or std.mem.startsWith(u8, command, "/fork ")) {
+        const raw_prompt = if (std.mem.startsWith(u8, command, "/fork "))
+            std.mem.trim(u8, command["/fork ".len..], " \t")
+        else
+            "";
+        return @as(?[]u8, try handleForkSession(allocator, runtime, if (raw_prompt.len > 0) raw_prompt else null));
+    }
+
+    // commands-sweep-02: reference `/branch` forks the CURRENT CONVERSATION at
+    // this point into a new session id with traceability back to the source,
+    // AND switches the live runtime to it. It is a pure conversation
+    // operation, NOT git. The old git-branch helper is re-homed below under
+    // `/git-branch` so the functionality is not lost.
     if (std.mem.eql(u8, command, "/branch") or std.mem.startsWith(u8, command, "/branch ")) {
         const raw_name = if (std.mem.startsWith(u8, command, "/branch "))
             std.mem.trim(u8, command["/branch ".len..], " \t")
@@ -4830,7 +4850,7 @@ fn renderSessionsOverlayData(allocator: std.mem.Allocator, runtime: *AgentRuntim
         items: []const SessionOverlayItem,
     };
 
-    const entries = try runtime.store.list();
+    const entries = try runtime.store.listForActiveProject();
     defer runtime.store.freeSessionEntries(entries);
 
     const items = try allocator.alloc(SessionOverlayItem, entries.len);
@@ -6322,8 +6342,61 @@ fn handleEffortSet(allocator: std.mem.Allocator, runtime: *AgentRuntime, arg: []
 /// turn starts fresh in the same session slot. Session history on disk
 /// is left untouched; only the live history buffer and recent outcomes
 /// snapshot are cleared. Aliases: /reset, /new.
+/// sessions-storage-09: `/fork`'s actual "copy this conversation into a new
+/// background session and keep working here" semantics (2.1.261's own
+/// description), distinct from `/branch`'s "switch the live session" (which
+/// `/fork` used to alias). Copies history+snapshot into a NEW session id via
+/// the same `session_bundles.forkSession` machinery `zcode session fork`
+/// already uses; the CURRENT runtime's session_id/history/snapshot are never
+/// touched. When `prompt` is given it is durably queued as the new session's
+/// next turn.
+///
+/// SCOPE NOTE: actually answering that queued prompt autonomously in a
+/// detached background process needs a headless (non-interactive) resume
+/// runner -- `session_mgmt.runHeadlessResumeResult` now exists as exactly
+/// that building block, but wiring a live, un-terminal-attached background
+/// PROCESS around it end-to-end is the same `--resume`-headless CLI plumbing
+/// gap noted on `session_mgmt.HeadlessCaps`'s doc comment, and is left to
+/// that follow-on. For now the new session is fully resumable
+/// (`/resume <id>` or `zcode --resume <id>`) with the prompt already queued.
+fn handleForkSession(allocator: std.mem.Allocator, runtime: *AgentRuntime, prompt: ?[]const u8) ![]u8 {
+    var forked = try session_bundles.forkSession(allocator, runtime.store, runtime.session_id, null);
+    defer forked.deinit(allocator);
+
+    if (prompt) |p| {
+        runtime.store.appendTurn(forked.session_id, .user, p, "") catch |err| {
+            std.log.warn("session: /fork could not queue the prompt on {s}: {s}", .{ forked.session_id, @errorName(err) });
+        };
+        return std.fmt.allocPrint(
+            allocator,
+            "forked into new session {s} (current session {s} is unchanged); queued prompt: {s}\nResume it with /resume {s} or `zcode --resume {s}`.",
+            .{ forked.session_id, forked.source_session_id, p, forked.session_id, forked.session_id },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "forked into new session {s} (current session {s} is unchanged).\nResume it with /resume {s} or `zcode --resume {s}`.",
+        .{ forked.session_id, forked.source_session_id, forked.session_id, forked.session_id },
+    );
+}
+
 fn handleClearConversation(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
     const cleared_count = runtime.history.len();
+
+    // sessions-storage-08: regenerate the session id BEFORE clearing
+    // in-memory state, so the final snapshot below captures the true
+    // pre-clear state -- mirrors edualc's
+    // `regenerateSessionId({setCurrentAsParent:true})` +
+    // `resetSessionFilePointer()`. Pre- and post-clear turns must never
+    // share one .jsonl file. Best-effort: a failure here degrades to the
+    // old behavior (same id kept) rather than blocking /clear itself.
+    const old_session_id = try allocator.dupe(u8, runtime.session_id);
+    defer allocator.free(old_session_id);
+    if (runtime.store.regenerateSessionForClear(runtime.session_id, &runtime.snapshot, "cleared via /clear")) |new_id| {
+        runtime.allocator.free(runtime.session_id);
+        runtime.session_id = new_id;
+    } else |_| {}
+
     runtime.history.clearInMemory();
     // Phase 10 Task 5 (memory-01): reset the turn-end extraction cursor so a
     // cleared conversation starts a fresh extraction window (matches the
@@ -6349,10 +6422,19 @@ fn handleClearConversation(allocator: std.mem.Allocator, runtime: *AgentRuntime)
         std.Io.File.stdout().writeStreamingAll(rt.io, format_mod.clearTerminalSequence()) catch {};
     }
 
+    if (std.mem.eql(u8, old_session_id, runtime.session_id)) {
+        // regenerateSessionForClear failed; fall back to the pre-08 message
+        // rather than claiming a new session that was never actually minted.
+        return std.fmt.allocPrint(
+            allocator,
+            "cleared {d} in-memory turn(s); session {s} on disk is untouched",
+            .{ cleared_count, runtime.session_id },
+        );
+    }
     return std.fmt.allocPrint(
         allocator,
-        "cleared {d} in-memory turn(s); session {s} on disk is untouched",
-        .{ cleared_count, runtime.session_id },
+        "cleared {d} in-memory turn(s); started new session {s} (previous session {s} is still on disk, resumable with /resume {s})",
+        .{ cleared_count, runtime.session_id, old_session_id, old_session_id },
     );
 }
 
@@ -8979,6 +9061,106 @@ test "/rewind conversation-only leaves the working tree untouched" {
     const final = try std.Io.Dir.cwd().readFileAlloc(@import("zcode_runtime").io, sentinel, allocator, .limited(1024));
     defer allocator.free(final);
     try testing.expectEqualStrings("keep me\n", final);
+}
+
+test "sessions-storage-08: /clear regenerates the session id, leaving the old session resumable on disk" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const old_session_id = try allocator.dupe(u8, runtime.session_id);
+    defer allocator.free(old_session_id);
+
+    try runtime.history.append(runtime.session_id, .user, "before /clear");
+    try runtime.history.append(runtime.session_id, .assistant, "ack");
+    try testing.expectEqual(@as(usize, 2), runtime.history.len());
+
+    const msg = try handleClearConversation(allocator, runtime);
+    defer allocator.free(msg);
+
+    // A brand-new session id was minted; the message names both.
+    try testing.expect(!std.mem.eql(u8, old_session_id, runtime.session_id));
+    try testing.expect(std.mem.indexOf(u8, msg, old_session_id) != null);
+    try testing.expect(std.mem.indexOf(u8, msg, runtime.session_id) != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "started new session") != null);
+
+    // In-memory history is empty (the usual /clear effect).
+    try testing.expectEqual(@as(usize, 0), runtime.history.len());
+
+    // The OLD session's two turns are exactly as they were -- /clear never
+    // interleaves pre- and post-clear turns into one .jsonl file.
+    var loaded_old = try runtime.store.load(old_session_id);
+    defer loaded_old.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), loaded_old.history.len);
+    try testing.expectEqualStrings("before /clear", loaded_old.history[0].content);
+
+    // The new session traces back to the old one via the parent sidecar.
+    const parent = (try runtime.store.readParentSessionId(runtime.session_id)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(parent);
+    try testing.expectEqualStrings(old_session_id, parent);
+}
+
+test "sessions-storage-09: /fork copies the conversation into a NEW session and leaves the current one untouched" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const original_session_id = try allocator.dupe(u8, runtime.session_id);
+    defer allocator.free(original_session_id);
+
+    try runtime.history.append(runtime.session_id, .user, "first turn");
+    try runtime.history.append(runtime.session_id, .assistant, "first reply");
+    try testing.expectEqual(@as(usize, 2), runtime.history.len());
+
+    const msg = try handleForkSession(allocator, runtime, "continue the refactor");
+    defer allocator.free(msg);
+
+    // Unlike /branch, /fork never touches the LIVE runtime: same id, same
+    // in-memory history, exactly as it was before the command ran.
+    try testing.expectEqualStrings(original_session_id, runtime.session_id);
+    try testing.expectEqual(@as(usize, 2), runtime.history.len());
+
+    // The message names a genuinely different session id.
+    try testing.expect(std.mem.indexOf(u8, msg, original_session_id) != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "continue the refactor") != null);
+
+    // The ORIGINAL session's own file is untouched (still exactly its 2 turns).
+    var loaded_original = try runtime.store.load(original_session_id);
+    defer loaded_original.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), loaded_original.history.len);
+
+    // Find the new session id: it's the one that isn't the original, listed
+    // by the store.
+    const entries = try runtime.store.list();
+    defer runtime.store.freeSessionEntries(entries);
+    var new_id: ?[]const u8 = null;
+    for (entries) |e| {
+        if (!std.mem.eql(u8, e.id, original_session_id)) new_id = e.id;
+    }
+    const forked_id = new_id orelse return error.TestUnexpectedResult;
+
+    // The fork carries a COPY of the 2 prior turns PLUS the queued prompt
+    // as a 3rd turn.
+    var loaded_fork = try runtime.store.load(forked_id);
+    defer loaded_fork.deinit(allocator);
+    try testing.expectEqual(@as(usize, 3), loaded_fork.history.len);
+    try testing.expectEqualStrings("first turn", loaded_fork.history[0].content);
+    try testing.expectEqualStrings("first reply", loaded_fork.history[1].content);
+    try testing.expectEqualStrings("continue the refactor", loaded_fork.history[2].content);
 }
 
 test "__sessions_overlay_data includes message_count for the session switcher (sessions-storage-05)" {

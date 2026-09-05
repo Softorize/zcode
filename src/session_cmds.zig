@@ -36,8 +36,13 @@ const coordinator_mode = @import("core/coordinator_mode.zig");
 
 // --- Session lifecycle commands ---
 
-pub fn cmdSessionList(allocator: std.mem.Allocator, store: *session_store.Store, writer: anytype) !void {
-    const sessions = try store.list();
+pub fn cmdSessionList(allocator: std.mem.Allocator, store: *session_store.Store, cwd: []const u8, all_projects: bool, writer: anytype) !void {
+    // sessions-storage-02/04: default to the CURRENT project's sessions
+    // (mirroring the reference resume picker's same-project default);
+    // `--all-projects`/`-a` shows every project bucket plus the legacy flat
+    // directory instead.
+    store.active_cwd = cwd;
+    const sessions = if (all_projects) try store.listAllProjects() else try store.listForActiveProject();
     defer store.freeSessionEntries(sessions);
 
     if (sessions.len == 0) {
@@ -106,6 +111,17 @@ pub fn cmdSessionList(allocator: std.mem.Allocator, store: *session_store.Store,
         if (branch.len > 0) {
             try writer.print("\tbranch={s}", .{branch});
         }
+        // sessions-storage-04: cross-project hint, only shown in the
+        // --all-projects view (the default view is already same-project, so
+        // every entry there trivially matches `cwd`). Mirrors the reference
+        // resume picker tagging out-of-project entries before showing them.
+        if (all_projects) {
+            if (entry.origin_cwd) |origin| {
+                if (!std.mem.eql(u8, origin, cwd)) {
+                    try writer.print("\tfrom={s}", .{origin});
+                }
+            }
+        }
         try writer.writeAll("\n");
     }
 }
@@ -125,12 +141,19 @@ pub fn cmdSessionResume(
     strict: bool,
     yolo_mode: bool,
     initial_agent: ?[]const u8,
+    all_projects: bool,
+    fork_session: bool,
 ) !void {
+    // sessions-storage-02/04: resolve everything below (the no-arg listing,
+    // the fuzzy fallback, and the eventual resume itself) against the
+    // current project's bucket by default.
+    store.active_cwd = cwd;
+
     // No argument: print the session list with a resume hint. The CLI does
     // not host the interactive picker (that lives in the REPL); listing the
     // ids is the most useful no-arg behavior here.
     const arg = subject orelse {
-        try cmdSessionList(allocator, store, writer);
+        try cmdSessionList(allocator, store, cwd, all_projects, writer);
         try writer.writeAll("\nUse `zcode session resume <id-or-term>` to resume one.\n");
         return;
     };
@@ -141,15 +164,18 @@ pub fn cmdSessionResume(
     var resolved_owned: ?[]u8 = null;
     defer if (resolved_owned) |r| allocator.free(r);
     const session_id: []const u8 = blk: {
-        // Exact-id fast path: a valid, existing session file resumes directly.
+        // Exact-id fast path: a valid, existing session file resumes directly
+        // (sessionPath's cross-project scan already finds one that lives in
+        // a different project's bucket, regardless of `all_projects`).
         if (store.sessionPath(arg)) |p| {
             defer allocator.free(p);
             const exists = if (std.Io.Dir.cwd().access(rt.io, p, .{})) |_| true else |_| false;
             if (exists) break :blk arg;
         } else |_| {}
 
-        // Fuzzy fallback over the session list (id + label).
-        const entries = try store.list();
+        // Fuzzy fallback over the session list (id + label): same-project by
+        // default, every project's bucket under --all-projects.
+        const entries = if (all_projects) try store.listAllProjects() else try store.listForActiveProject();
         defer store.freeSessionEntries(entries);
 
         const candidates = try allocator.alloc(session_search.Candidate, entries.len);
@@ -207,10 +233,16 @@ pub fn cmdSessionResume(
 
     try writer.print("resumed session {s}\n", .{session_id});
 
+    // sessions-storage-04: cross-project resume warning.
+    try warnIfCrossProjectResume(store, session_id, cwd, writer);
+
     // Coordinator-mode reconciliation (remote-server-01): if the session was
     // saved running in a different mode than the live env gate, flip the env to
     // match the resumed session and surface a one-line warning. A missing
     // sidecar (pre-feature / never-coordinator session) reconciles to "normal".
+    // Checked against the ORIGINAL session id -- a --fork-session copy below
+    // does not carry sidecars (only the conversation itself), so this must
+    // read the mode of the session actually being continued.
     {
         const stored_mode = store.readMode(session_id) catch null;
         defer if (stored_mode) |m| allocator.free(m);
@@ -220,7 +252,64 @@ pub fn cmdSessionResume(
         }
     }
 
-    return session_mgmt.resumeSessionInteractive(allocator, cwd, cfg, policy, audit, store, mcp, browser, session_id, null, writer, auto_approve_high, strict, yolo_mode, initial_agent);
+    // sessions-storage-12: `--fork-session` branches into a NEW session id
+    // before the runtime is built (see the doc comment on
+    // session_mgmt.HeadlessCaps) instead of mutating the resumed session's
+    // own transcript -- the original stays exactly as it was.
+    const effective_session_id = try resolveForkTarget(allocator, store, session_id, fork_session, writer);
+    defer allocator.free(effective_session_id);
+
+    return session_mgmt.resumeSessionInteractive(allocator, cwd, cfg, policy, audit, store, mcp, browser, effective_session_id, null, writer, auto_approve_high, strict, yolo_mode, initial_agent);
+}
+
+/// sessions-storage-04: print a one-line warning when `session_id`'s
+/// recorded origin cwd differs from the directory it is being resumed from
+/// -- mirrors the reference's `checkCrossProjectResume`, which warns before
+/// entering a session that did not start in the current directory. Silent
+/// when the origin is unknown (a legacy session, or one that was never
+/// written to with a known cwd) or matches `cwd`. Exposed separately from
+/// `cmdSessionResume` so it is testable without entering the interactive
+/// REPL loop that command hands off to.
+pub fn warnIfCrossProjectResume(
+    store: *session_store.Store,
+    session_id: []const u8,
+    cwd: []const u8,
+    writer: anytype,
+) !void {
+    const origin = store.readOrigin(session_id) catch null;
+    defer if (origin) |o| store.allocator.free(o);
+    const o = origin orelse return;
+    if (cwd.len == 0 or o.len == 0 or std.mem.eql(u8, o, cwd)) return;
+    try writer.print(
+        "note: session {s} was started from a different project ({s}); resuming it from {s}.\n",
+        .{ session_id, o, cwd },
+    );
+}
+
+/// sessions-storage-12: resolve a `--fork-session` request against an
+/// already-resolved `session_id`. When `fork_session` is true, copies the
+/// session into a NEW id (via `session_bundles.forkSession`) -- leaving
+/// `session_id`'s own `.jsonl` completely untouched -- and returns that new
+/// id; otherwise returns an owned copy of `session_id` unchanged. Exposed
+/// separately from `cmdSessionResume`/`cmdSessionContinue` so the fork
+/// behavior is testable without entering the interactive REPL loop those
+/// commands hand off to. Caller owns the result.
+pub fn resolveForkTarget(
+    allocator: std.mem.Allocator,
+    store: *session_store.Store,
+    session_id: []const u8,
+    fork_session: bool,
+    writer: anytype,
+) ![]u8 {
+    if (!fork_session) return allocator.dupe(u8, session_id);
+
+    var forked = try session_bundles.forkSession(allocator, store, session_id, null);
+    defer forked.deinit(allocator);
+    try writer.print(
+        "--fork-session: forked session {s} into new session {s}; the original is untouched.\n",
+        .{ forked.source_session_id, forked.session_id },
+    );
+    return allocator.dupe(u8, forked.session_id);
 }
 
 pub fn cmdSessionContinue(
@@ -238,8 +327,14 @@ pub fn cmdSessionContinue(
     strict: bool,
     yolo_mode: bool,
     initial_agent: ?[]const u8,
+    all_projects: bool,
+    fork_session: bool,
 ) !void {
-    const sessions = try store.list();
+    // sessions-storage-02: `--continue` picks up the most recent session in
+    // the CURRENT project by default (matching --resume's default); pass
+    // --all-projects to consider every project's most recent session.
+    store.active_cwd = cwd;
+    const sessions = if (all_projects) try store.listAllProjects() else try store.listForActiveProject();
     defer store.freeSessionEntries(sessions);
 
     if (sessions.len == 0) {
@@ -249,7 +344,12 @@ pub fn cmdSessionContinue(
 
     const latest_id = sessions[0].id;
     try writer.print("resuming session {s}\n", .{latest_id});
-    return session_mgmt.resumeSessionInteractive(allocator, cwd, cfg, policy, audit, store, mcp, browser, latest_id, initial_prompt, writer, auto_approve_high, strict, yolo_mode, initial_agent);
+
+    // sessions-storage-12: see the identical comment in cmdSessionResume.
+    const effective_session_id = try resolveForkTarget(allocator, store, latest_id, fork_session, writer);
+    defer allocator.free(effective_session_id);
+
+    return session_mgmt.resumeSessionInteractive(allocator, cwd, cfg, policy, audit, store, mcp, browser, effective_session_id, initial_prompt, writer, auto_approve_high, strict, yolo_mode, initial_agent);
 }
 
 /// Render `session_id` for display in an error message. Replaces
@@ -947,6 +1047,158 @@ test "formatDisplaySessionId escapes control chars and truncates" {
     defer alloc.free(trunc);
     try testing.expect(std.mem.indexOf(u8, trunc, "...(300 chars total)") != null);
     try testing.expect(trunc.len < 120);
+}
+
+// ── sessions-storage-02/04/12: project-aware listing, cross-project hints,
+//    and --fork-session ────────────────────────────────────────────────
+
+test "warnIfCrossProjectResume warns only when origin differs from cwd" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+    const cwd_a = try std.fs.path.join(testing.allocator, &.{ root, "proj-a" });
+    defer testing.allocator.free(cwd_a);
+    const cwd_b = try std.fs.path.join(testing.allocator, &.{ root, "proj-b" });
+    defer testing.allocator.free(cwd_b);
+
+    var store = try session_store.Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    store.active_cwd = cwd_a;
+    try store.appendTurn("sess-from-a", .user, "hi", "");
+
+    // Resuming from the SAME project: silent.
+    {
+        var out = std_io.StringBuilder.init(testing.allocator);
+        defer out.deinit();
+        try warnIfCrossProjectResume(&store, "sess-from-a", cwd_a, out.writer());
+        try testing.expectEqualStrings("", out.items());
+    }
+
+    // Resuming the SAME session from a DIFFERENT project: warns, naming
+    // both the origin and the current directory.
+    {
+        var out = std_io.StringBuilder.init(testing.allocator);
+        defer out.deinit();
+        try warnIfCrossProjectResume(&store, "sess-from-a", cwd_b, out.writer());
+        try testing.expect(std.mem.indexOf(u8, out.items(), cwd_a) != null);
+        try testing.expect(std.mem.indexOf(u8, out.items(), cwd_b) != null);
+    }
+
+    // A legacy session with no recorded origin: silent, never a false warning.
+    {
+        store.active_cwd = "";
+        try store.appendTurn("sess-legacy", .user, "hi", "");
+        var out = std_io.StringBuilder.init(testing.allocator);
+        defer out.deinit();
+        try warnIfCrossProjectResume(&store, "sess-legacy", cwd_b, out.writer());
+        try testing.expectEqualStrings("", out.items());
+    }
+}
+
+test "resolveForkTarget without fork_session returns the same id, untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try session_store.Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    try store.appendTurn("sess-a", .user, "hello", "");
+
+    var out = std_io.StringBuilder.init(testing.allocator);
+    defer out.deinit();
+
+    const result = try resolveForkTarget(testing.allocator, &store, "sess-a", false, out.writer());
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("sess-a", result);
+    // No fork message printed when nothing was forked.
+    try testing.expectEqualStrings("", out.items());
+}
+
+test "resolveForkTarget with fork_session copies into a NEW session, original untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try session_store.Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+    try store.appendTurn("sess-a", .user, "turn one", "");
+    try store.appendTurn("sess-a", .assistant, "turn two", "");
+
+    var out = std_io.StringBuilder.init(testing.allocator);
+    defer out.deinit();
+
+    const new_id = try resolveForkTarget(testing.allocator, &store, "sess-a", true, out.writer());
+    defer testing.allocator.free(new_id);
+    try testing.expect(!std.mem.eql(u8, new_id, "sess-a"));
+    try testing.expect(std.mem.indexOf(u8, out.items(), "sess-a") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items(), new_id) != null);
+
+    // The original is untouched: still exactly its own 2 turns.
+    var orig = try store.load("sess-a");
+    defer orig.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), orig.history.len);
+
+    // The fork carries a COPY of the same 2 turns.
+    var forked = try store.load(new_id);
+    defer forked.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), forked.history.len);
+    try testing.expectEqualStrings("turn one", forked.history[0].content);
+    try testing.expectEqualStrings("turn two", forked.history[1].content);
+}
+
+test "cmdSessionList defaults to the current project and tags cross-project entries under --all-projects" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+    const sessions_dir = try std.fs.path.join(testing.allocator, &.{ root, "sessions" });
+    defer testing.allocator.free(sessions_dir);
+    const cwd_a = try std.fs.path.join(testing.allocator, &.{ root, "proj-a" });
+    defer testing.allocator.free(cwd_a);
+    const cwd_b = try std.fs.path.join(testing.allocator, &.{ root, "proj-b" });
+    defer testing.allocator.free(cwd_b);
+
+    var store = try session_store.Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    store.active_cwd = cwd_a;
+    try store.appendTurn("sess-from-a", .user, "hi from a", "");
+    store.active_cwd = cwd_b;
+    try store.appendTurn("sess-from-b", .user, "hi from b", "");
+
+    // Default (no --all-projects) view from A only sees A's session.
+    {
+        var out = std_io.StringBuilder.init(testing.allocator);
+        defer out.deinit();
+        try cmdSessionList(testing.allocator, &store, cwd_a, false, out.writer());
+        try testing.expect(std.mem.indexOf(u8, out.items(), "sess-from-a") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items(), "sess-from-b") == null);
+    }
+
+    // --all-projects from A sees both, and tags B's entry with its origin.
+    {
+        var out = std_io.StringBuilder.init(testing.allocator);
+        defer out.deinit();
+        try cmdSessionList(testing.allocator, &store, cwd_a, true, out.writer());
+        try testing.expect(std.mem.indexOf(u8, out.items(), "sess-from-a") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items(), "sess-from-b") != null);
+        const b_line_start = std.mem.indexOf(u8, out.items(), "sess-from-b").?;
+        const b_line_end = std.mem.indexOfScalarPos(u8, out.items(), b_line_start, '\n') orelse out.items().len;
+        const b_line = out.items()[b_line_start..b_line_end];
+        try testing.expect(std.mem.indexOf(u8, b_line, "from=") != null);
+        try testing.expect(std.mem.indexOf(u8, b_line, cwd_b) != null);
+        // A's own entry is never tagged with itself as "from=".
+        const a_line_start = std.mem.indexOf(u8, out.items(), "sess-from-a").?;
+        const a_line_end = std.mem.indexOfScalarPos(u8, out.items(), a_line_start, '\n') orelse out.items().len;
+        const a_line = out.items()[a_line_start..a_line_end];
+        try testing.expect(std.mem.indexOf(u8, a_line, "from=") == null);
+    }
 }
 
 // --- Marketplace commands ---

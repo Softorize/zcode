@@ -154,7 +154,11 @@ const sessions = [_]HelpEntry{
     .{ .usage = "/session checkpoints", .desc = "List checkpoints for the current session" },
     .{ .usage = "/session restore [name]", .desc = "Restore a checkpoint and switch sessions" },
     .{ .usage = "/session fork [name]", .desc = "Fork the current session" },
-    .{ .usage = "/branch [name]", .desc = "Fork the current conversation at this point (alias /fork)" },
+    .{ .usage = "/branch [name]", .desc = "Create a branch of the current conversation at this point" },
+    // sessions-storage-09: /fork is its OWN 2.1.261 command, distinct from
+    // /branch (it copies into a new background session and keeps working
+    // here; /branch switches the current session in place).
+    .{ .usage = "/fork [prompt]", .desc = "Copy this conversation into a new background session and keep working here" },
 };
 
 const agents_and_skills = [_]HelpEntry{

@@ -242,6 +242,14 @@ pub fn runInteractive(
     initial_agent: ?[]const u8,
     session_name: ?[]const u8,
 ) !void {
+    // sessions-storage-02/04: every session this process mints from here on
+    // lands under `<zcode_home>/projects/<slug(cwd)>/` instead of the flat
+    // legacy directory, and the store's cross-directory-resume/origin-cwd
+    // machinery keys off this. sessions-storage-03/12: a `--session-id
+    // <uuid>` pin is one-shot -- consume it right before the runtime mints
+    // the id (AgentRuntime.init calls store.createSessionId()).
+    store.active_cwd = cwd;
+    if (cfg.session_id.len > 0) store.pinNextSessionId(cfg.session_id) catch {};
     var runtime = try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, true, auto_approve_high, strict, yolo_mode);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
@@ -388,6 +396,11 @@ pub fn runKairosTurn(
     prompt: []const u8,
     approval_handler: ?agent_runtime.ApprovalHandler,
 ) ![]u8 {
+    // sessions-storage-02: shard KAIROS turns into the same per-project
+    // bucket a normal session from this cwd would use. Unlike the CLI entry
+    // points above, a KAIROS turn never carries a `--session-id` pin, so
+    // cfg.session_id is deliberately not consumed here.
+    store.active_cwd = cwd;
     var runtime = try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, false, false, false, false);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
@@ -422,6 +435,9 @@ pub fn runOneShot(
     yolo_mode: bool,
     initial_agent: ?[]const u8,
 ) !agent_runtime.OneShotOutput {
+    // sessions-storage-02/03/12: see the identical comment in runInteractive.
+    store.active_cwd = cwd;
+    if (cfg.session_id.len > 0) store.pinNextSessionId(cfg.session_id) catch {};
     var runtime = try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, false, auto_approve_high, strict, yolo_mode);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
@@ -521,6 +537,9 @@ pub fn runHeadlessResult(
     initial_agent: ?[]const u8,
     caps: HeadlessCaps,
 ) !sdk_output.Result {
+    // sessions-storage-02/03/12: see the identical comment in runInteractive.
+    store.active_cwd = cwd;
+    if (cfg.session_id.len > 0) store.pinNextSessionId(cfg.session_id) catch {};
     var runtime = try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, false, auto_approve_high, strict, yolo_mode);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
@@ -597,12 +616,83 @@ pub fn runHeadlessResult(
     };
 }
 
-/// Free the allocator-owned fields of a result returned by runHeadlessResult.
+/// Free the allocator-owned fields of a result returned by runHeadlessResult
+/// or runHeadlessResumeResult (same output shape).
 pub fn freeHeadlessResult(allocator: std.mem.Allocator, result: *sdk_output.Result) void {
     allocator.free(result.session_id);
     allocator.free(result.result_text);
     allocator.free(result.model);
     if (result.structured_output_json.len > 0) allocator.free(result.structured_output_json);
+}
+
+/// sessions-storage-09/12: the headless analogue of `resumeSessionInteractive`
+/// -- load an EXISTING session's history and answer exactly one more prompt
+/// against it non-interactively, the same way `runHeadlessResult` does for a
+/// brand-new session. `resumeSessionInteractive` opens the interactive REPL
+/// (blocking on stdin), which is wrong for a detached/background caller that
+/// never provides one; this is what `/fork`'s background continuation uses
+/// to actually answer the queued prompt on the forked session, and is the
+/// same shape a future `--resume <id> --print "<prompt>"` CLI route would
+/// need. Caller owns the returned result's allocations (free via
+/// freeHeadlessResult).
+pub fn runHeadlessResumeResult(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    cfg: *const config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    prompt: []const u8,
+    auto_approve_high: bool,
+    strict: bool,
+    yolo_mode: bool,
+) !sdk_output.Result {
+    store.active_cwd = cwd;
+
+    var loaded = try store.load(session_id);
+    defer loaded.deinit(allocator);
+
+    var runtime = try AgentRuntime.initFromSession(allocator, cwd, cfg, policy, audit, store, mcp, browser, &loaded, false, auto_approve_high, strict, yolo_mode);
+    defer runtime.deinit();
+    prompt_sections.setGlobal(&runtime.prompt_sections_registry);
+
+    try runPluginEventSilent(allocator, .{
+        .event = .session_start,
+        .cwd = cwd,
+    });
+
+    var result = try runtime.handlePromptDetailed(prompt);
+    defer result.deinit(allocator);
+
+    const usage = blk: {
+        runtime.token_status_lock.lock(rt.io) catch {};
+        defer runtime.token_status_lock.unlock(rt.io);
+        break :blk sdk_output.Usage{
+            .input_tokens = runtime.token_status.total_input_tokens,
+            .output_tokens = runtime.token_status.total_output_tokens,
+        };
+    };
+    const est_cost = cost_mod.estimateCost(
+        runtime.active_provider,
+        runtime.active_model,
+        usage.input_tokens,
+        usage.output_tokens,
+    );
+
+    return .{
+        .subtype = .success,
+        .session_id = try allocator.dupe(u8, runtime.session_id),
+        .result_text = try allocator.dupe(u8, result.final_text),
+        .num_turns = result.rounds,
+        .total_cost_usd = est_cost,
+        .usage = usage,
+        .model = try allocator.dupe(u8, runtime.active_model),
+        .stop_reason = "end_turn",
+        .structured_output_json = "",
+    };
 }
 
 pub fn cmdPromptInspect(
@@ -660,12 +750,30 @@ pub fn resumeSessionInteractive(
     yolo_mode: bool,
     initial_agent: ?[]const u8,
 ) !void {
+    // sessions-storage-02/04: resolve/write this resumed session's turns
+    // through the same per-project bucket a fresh session from this cwd
+    // would use (sessionPath's cross-project scan already finds a session
+    // that actually lives in a DIFFERENT project's bucket, so this is safe
+    // even when resuming across directories).
+    store.active_cwd = cwd;
+
     var loaded = try store.load(session_id);
     defer loaded.deinit(allocator);
 
     var runtime = try AgentRuntime.initFromSession(allocator, cwd, cfg, policy, audit, store, mcp, browser, &loaded, true, auto_approve_high, strict, yolo_mode);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
+
+    // phase-26 daemon-background: register a RESUMED session the same way
+    // runInteractive registers a fresh one, so `zcode ps`/`attach` can see
+    // and reattach to it too -- previously only brand-new sessions showed
+    // up in the live-process registry at all.
+    session_registry.register(allocator, .{
+        .session_id = runtime.session_id,
+        .cwd = cwd,
+        .name = null,
+    }) catch {};
+    defer session_registry.unregister(allocator);
 
     try runPluginEvent(allocator, writer, .{
         .event = .session_start,
@@ -871,6 +979,54 @@ test "sdk-headless-14: --max-turns 1 against a multi-round mock prompt yields er
     try testing_alloc.expectEqualStrings("max_turns", result.stop_reason);
     // num_turns reached the cap.
     try testing_alloc.expect(result.num_turns >= 1);
+}
+
+// ── sessions-storage-09/12: headless (non-interactive) resume ─────────────
+
+test "runHeadlessResumeResult answers one more turn on an EXISTING session without opening the REPL" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing_alloc.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try HeadlessCapsHarness.init(alloc, root);
+    defer h.deinit();
+
+    // Seed an existing session with one prior turn, mirroring what
+    // `/fork`'s background continuation (or a real headless `--resume`)
+    // would find already on disk.
+    try h.store.appendTurn("resume-headless-test", .user, "earlier turn", "");
+
+    var result = try runHeadlessResumeResult(
+        alloc,
+        h.cwd,
+        &h.cfg,
+        &h.policy,
+        &h.audit,
+        &h.store,
+        &h.mcp,
+        null,
+        "resume-headless-test",
+        "one more turn",
+        true, // auto_approve_high
+        false, // strict
+        true, // yolo_mode
+    );
+    defer freeHeadlessResult(alloc, &result);
+
+    try testing_alloc.expectEqual(sdk_output.ResultSubtype.success, result.subtype);
+    try testing_alloc.expectEqualStrings("resume-headless-test", result.session_id);
+
+    // The new prompt (and the model's reply) were appended to the SAME
+    // session file -- the prior turn survives untouched, it is not replaced
+    // or interactively re-read from stdin.
+    var loaded = try h.store.load("resume-headless-test");
+    defer loaded.deinit(alloc);
+    try testing_alloc.expect(loaded.history.len >= 3); // prior + new user + assistant reply
+    try testing_alloc.expectEqualStrings("earlier turn", loaded.history[0].content);
 }
 
 test "sdk-headless-14: --json-schema sets pending_response_schema and surfaces structured_output" {
