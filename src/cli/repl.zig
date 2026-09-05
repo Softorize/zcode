@@ -200,7 +200,24 @@ pub const Options = struct {
     focus_mode: bool = false,
     ui_density: UiDensity = .full,
     ui_leader_key: []const u8 = "ctrl+x",
-    show_top_bar: bool = true,
+    /// r3-chrome-02: the persistent top-of-screen status bar ("zcode
+    /// \xe2\x88\x99 exec full \xe2\x88\x99 repo ... \xe2\x88\x99 model ...")
+    /// is legacy zcode chrome the 2.1.261 reference does not have (its
+    /// composer + footer are the only persistent chrome). Defaults to
+    /// false so a fresh session opens on the condensed startup banner
+    /// instead; `ui_show_top_bar = true` in config restores it.
+    show_top_bar: bool = false,
+    /// r3-chrome-01: renders the pre-2.1.261-parity welcome surface (a
+    /// bordered "terminal workbench" card plus a "Quick reference" tips
+    /// list) instead of the condensed glyph + version/model/cwd header.
+    /// Sourced from config `ui_legacy_banner` (default false).
+    legacy_banner: bool = false,
+    /// r3-chrome-03/04: renders the pre-2.1.261-parity composer border
+    /// labels ("ask zcode ...", "Enter submit ...") and the two-row
+    /// "actions ..." / "\xe2\x97\x8f ready ..." footer instead of the
+    /// reference's plain rules and single "? for shortcuts" + mode-chip
+    /// line. Sourced from config `ui_legacy_footer` (default false).
+    legacy_footer: bool = false,
     shortcuts_panel_enabled: bool = true,
     shortcuts_panel_visible: bool = false,
     vim_mode_enabled: bool = false,
@@ -5566,10 +5583,79 @@ fn ingestTaskNotifications(
     }
 }
 
+/// r3-chrome-01: the default 2.1.261-style startup header for the
+/// fullscreen transcript -- edualc src/components/LogoV2/CondensedLogo.tsx,
+/// the layout the reference renders whenever there is nothing more urgent
+/// to say (`!hasReleaseNotes && !showOnboarding`): the three-row mascot
+/// glyph (figures.CONDENSED_LOGO_ROWS) beside "zcode vX", "<model> \xc2\xb7
+/// <provider>", and the cwd -- no card border, no "Quick reference" tips
+/// list. The project-onboarding "/init" nudge survives as a single dim
+/// line beneath the header instead of the legacy card's whole "Quick
+/// reference" section. `options.legacy_banner` (config `ui_legacy_banner`,
+/// default false) opts back into `appendWelcomeBannerLegacy` below for
+/// anyone who preferred the old card.
+fn appendWelcomeBanner(allocator: std.mem.Allocator, transcript: *UiTranscript, options: Options) !void {
+    if (options.legacy_banner) return appendWelcomeBannerLegacy(allocator, transcript, options);
+
+    const color = shouldUseColor(options);
+    const cols = repl_spinner_mod.terminalCols();
+    const lines = try repl_render_mod.buildCondensedHeaderLines(
+        allocator,
+        options.app_version,
+        options.status_model,
+        options.status_provider,
+        options.status_workspace,
+        cols,
+    );
+    defer for (lines) |line| allocator.free(line);
+
+    try transcript.appendLine(allocator, "");
+    // Row 0 ("zcode vX") reads as the product identity and is bolded, the
+    // same way the reference bolds "Claude Code" in its first info line;
+    // rows 1-2 (model/provider, cwd) are dimmed secondary detail.
+    const row_is_bold = [3]bool{ true, false, false };
+    for (0..3) |i| {
+        const glyph_row = figures.CONDENSED_LOGO_ROWS[i];
+        const rendered = if (color)
+            try std.fmt.allocPrint(allocator, "  {s}{s}{s}  {s}{s}{s}", .{
+                repl_markdown_mod.brandAccentAnsi(options),
+                glyph_row,
+                ANSI_RESET,
+                if (row_is_bold[i]) ANSI_BOLD else ANSI_DIM,
+                lines[i],
+                ANSI_RESET,
+            })
+        else
+            try std.fmt.allocPrint(allocator, "  {s}  {s}", .{ glyph_row, lines[i] });
+        defer allocator.free(rendered);
+        try transcript.appendLine(allocator, rendered);
+    }
+
+    // Same shouldShowProjectOnboarding gate as the legacy card: the nudge
+    // graduates after 4 views or once onboarding is marked complete.
+    if (options.status_workspace.len > 0 and onboarding_mod.shouldShowProjectOnboarding(allocator, options.status_workspace)) {
+        onboarding_mod.incrementSeenCount(allocator, options.status_workspace);
+        const nudge = if (color)
+            try std.fmt.allocPrint(allocator, "  {s}" ++ figures.ARROW_HOOK ++ "{s} {s}run /init to create ZCODE.md for this workspace{s}", .{
+                repl_markdown_mod.brandAccentAnsi(options), ANSI_RESET, ANSI_DIM, ANSI_RESET,
+            })
+        else
+            try allocator.dupe(u8, "  " ++ figures.ARROW_HOOK ++ " run /init to create ZCODE.md for this workspace");
+        defer allocator.free(nudge);
+        try transcript.appendLine(allocator, nudge);
+    }
+
+    try transcript.appendLine(allocator, "");
+}
+
 /// Render the launch dashboard into the fullscreen transcript. It follows
 /// modern TUI practice: a compact identity card, explicit context chips,
 /// and task-oriented commands instead of a long static help paragraph.
-fn appendWelcomeBanner(allocator: std.mem.Allocator, transcript: *UiTranscript, options: Options) !void {
+///
+/// r3-chrome-01: kept as an opt-in (`options.legacy_banner` /
+/// config `ui_legacy_banner = true`) alternative to the condensed
+/// `appendWelcomeBanner` above, which is now the 2.1.261-parity default.
+fn appendWelcomeBannerLegacy(allocator: std.mem.Allocator, transcript: *UiTranscript, options: Options) !void {
     const color = shouldUseColor(options);
     try transcript.appendLine(allocator, "");
 
@@ -5834,13 +5920,69 @@ fn writeWelcomeHeaderCommand(writer: anytype, color: bool, options: Options, com
     }
 }
 
+/// r3-chrome-01: the non-fullscreen / piped-output twin of the condensed
+/// `appendWelcomeBanner` above -- same three-row glyph + info-line layout,
+/// same single-line onboarding nudge, no card border or "Quick reference"
+/// list. `options.legacy_banner` opts back into `writeWelcomeHeaderLegacy`.
+fn writeWelcomeHeader(allocator: std.mem.Allocator, writer: anytype, options: Options) !void {
+    if (options.legacy_banner) return writeWelcomeHeaderLegacy(allocator, writer, options);
+
+    const color = shouldUseColor(options);
+    const cols = repl_spinner_mod.terminalCols();
+    const lines = try repl_render_mod.buildCondensedHeaderLines(
+        allocator,
+        options.app_version,
+        options.status_model,
+        options.status_provider,
+        options.status_workspace,
+        cols,
+    );
+    defer for (lines) |line| allocator.free(line);
+
+    try writer.writeAll("\n");
+    const row_is_bold = [3]bool{ true, false, false };
+    for (0..3) |i| {
+        const glyph_row = figures.CONDENSED_LOGO_ROWS[i];
+        if (color) {
+            try writer.print("  {s}{s}{s}  {s}{s}{s}\n", .{
+                repl_markdown_mod.brandAccentAnsi(options),
+                glyph_row,
+                ANSI_RESET,
+                if (row_is_bold[i]) ANSI_BOLD else ANSI_DIM,
+                lines[i],
+                ANSI_RESET,
+            });
+        } else {
+            try writer.print("  {s}  {s}\n", .{ glyph_row, lines[i] });
+        }
+    }
+
+    const needs_instruction_file = options.status_workspace.len > 0 and
+        onboarding_mod.shouldShowProjectOnboarding(allocator, options.status_workspace);
+    if (needs_instruction_file) {
+        onboarding_mod.incrementSeenCount(allocator, options.status_workspace);
+        if (color) {
+            try writer.print("  {s}" ++ figures.ARROW_HOOK ++ "{s} {s}run /init to create ZCODE.md for this workspace{s}\n", .{
+                repl_markdown_mod.brandAccentAnsi(options), ANSI_RESET, ANSI_DIM, ANSI_RESET,
+            });
+        } else {
+            try writer.writeAll("  " ++ figures.ARROW_HOOK ++ " run /init to create ZCODE.md for this workspace\n");
+        }
+    }
+    try writer.writeAll("\n");
+}
+
 /// Write the welcome header for the non-fullscreen / piped-output path.
 /// repl-ux-10: previously a plain 4-line dump with none of the fullscreen
 /// banner's card border, "Quick reference" section, or git-history `Try
 /// "..."` tip; now ports that same structure so every real terminal
 /// session (including one downgraded from fullscreen, e.g. a small
 /// terminal) sees a consistent welcome surface.
-fn writeWelcomeHeader(allocator: std.mem.Allocator, writer: anytype, options: Options) !void {
+///
+/// r3-chrome-01: kept as an opt-in (`options.legacy_banner` / config
+/// `ui_legacy_banner = true`) alternative to the condensed
+/// `writeWelcomeHeader` above, which is now the 2.1.261-parity default.
+fn writeWelcomeHeaderLegacy(allocator: std.mem.Allocator, writer: anytype, options: Options) !void {
     const color = shouldUseColor(options);
     // Same shouldShowProjectOnboarding gate as the fullscreen banner: the
     // nudge graduates after 4 views or once onboarding is marked complete.
@@ -9520,6 +9662,7 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
 }
 
 const testing = std.testing;
+const test_helpers = @import("../core/test_helpers.zig");
 
 test "autoModeConfigWrites make_default persists opt-in and default mode" {
     // ui-dialogs-03: the accept-default branch must both mark the opt-in as seen
@@ -9640,7 +9783,7 @@ test "deriveThinkingTopicTitle maps common progress text" {
     try testing.expectEqualStrings("Calling Model", topic);
 }
 
-test "writeWelcomeHeader (non-fullscreen path) matches the fullscreen banner's card border and Quick reference section" {
+test "writeWelcomeHeader (legacy_banner=true) matches the fullscreen banner's card border and Quick reference section" {
     var buf = std_io.StringBuilder.init(testing.allocator);
     defer buf.deinit();
 
@@ -9654,6 +9797,7 @@ test "writeWelcomeHeader (non-fullscreen path) matches the fullscreen banner's c
         .status_workspace = "",
         .status_approval_mode = "tiered-auto",
         .color_enabled = false,
+        .legacy_banner = true,
     };
     try writeWelcomeHeader(testing.allocator, buf.writer(), options);
 
@@ -9662,6 +9806,54 @@ test "writeWelcomeHeader (non-fullscreen path) matches the fullscreen banner's c
     try testing.expect(std.mem.indexOf(u8, out, "Quick reference") != null);
     try testing.expect(std.mem.indexOf(u8, out, "type") != null);
     try testing.expect(std.mem.indexOf(u8, out, "@file") != null);
+}
+
+test "writeWelcomeHeader (default) shows the condensed glyph header and no terminal-workbench card" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = Options{
+        .app_version = "0.12.50",
+        .status_provider = "mock",
+        .status_model = "mock-agent",
+        .status_workspace = "",
+        .status_approval_mode = "tiered-auto",
+        .color_enabled = false,
+    };
+    try writeWelcomeHeader(testing.allocator, buf.writer(), options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "zcode v0.12.50") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mock-agent \xc2\xb7 mock") != null);
+    // The mascot glyph's five-wide filled body row.
+    try testing.expect(std.mem.indexOf(u8, out, figures.CONDENSED_LOGO_ROWS[1]) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "terminal workbench") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Quick reference") == null);
+}
+
+test "writeWelcomeHeader (default) shows a one-line /init nudge instead of the legacy Quick-reference card" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const options = Options{
+        .app_version = "0.12.50",
+        .status_provider = "mock",
+        .status_model = "mock-agent",
+        .status_workspace = cwd,
+        .status_approval_mode = "tiered-auto",
+        .color_enabled = false,
+    };
+    try writeWelcomeHeader(testing.allocator, buf.writer(), options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "run /init to create ZCODE.md") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Quick reference") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "terminal workbench") == null);
 }
 
 test "trust gate copy matches the reference's Quick-safety-check framing and I-trust-this-folder option" {

@@ -7,6 +7,7 @@ const repl_attachments = @import("repl_attachments.zig");
 const repl_help = @import("repl_help.zig");
 const repl_footer = @import("repl_footer.zig");
 const figures = @import("../core/figures.zig");
+const format_mod = @import("../core/format.zig");
 const ui_theme = @import("../core/ui_theme.zig");
 const sandbox_mod = @import("../core/sandbox.zig");
 const terminal_caps = @import("../core/terminal_caps.zig");
@@ -1014,8 +1015,77 @@ fn renderContextLowWarning(writer: anytype, used_cols: *usize, cols: usize, opti
     _ = try writeFooterSegment(writer, used_cols, cols, warning, .danger, options);
 }
 
+/// r3-chrome-04: the reference default footer (edualc
+/// PromptInputFooterLeftSide.tsx:411, "? for shortcuts" -- hidden only
+/// when a custom `statusLine` command is configured, which zcode does
+/// not yet plumb here) paired with the persistent permission-mode chip
+/// from PromptInputFooter, right-aligned on the same row. The context-low
+/// warning and the queued-message notice keep the same priority they had
+/// in the legacy multi-segment footer: both are more urgent than the
+/// static "? for shortcuts" hint, so they replace it on the left when
+/// present.
+fn renderDefaultFooterLine(writer: anytype, options: anytype, cols: usize) !void {
+    if (cols == 0) return;
+
+    var warning_buf: [80]u8 = undefined;
+    const warning = computeContextLowWarning(&warning_buf, options);
+    const left_text: []const u8 = if (warning.len > 0)
+        warning
+    else if (@hasField(@TypeOf(options), "queued_prompt_notice") and options.queued_prompt_notice.len > 0)
+        options.queued_prompt_notice
+    else
+        "? for shortcuts";
+    const left_tone: FooterSegmentTone = if (warning.len > 0) .danger else .dim;
+
+    var chip_buf: [48]u8 = undefined;
+    const chip = if (@hasField(@TypeOf(options), "live_permission_mode"))
+        permissionModeChipText(&chip_buf, options.live_permission_mode)
+    else
+        "";
+    const chip_tone: FooterSegmentTone = if (@hasField(@TypeOf(options), "live_permission_mode"))
+        permissionModeChipTone(options.live_permission_mode)
+    else
+        .plain;
+
+    // Reserve room for the chip (plus one gap column) before deciding how
+    // much of the left text fits, so a long context-low warning never
+    // shoves the mode chip off the edge of a narrow terminal.
+    const reserved = if (chip.len > 0 and chip.len + 1 < cols) chip.len + 1 else 0;
+    const left_budget = if (cols > reserved) cols - reserved else 0;
+    const left_shown_len = @min(left_text.len, left_budget);
+    const left_shown = left_text[0..left_shown_len];
+
+    var used_cols: usize = 0;
+    if (left_shown.len > 0) {
+        _ = try writeFooterSegment(writer, &used_cols, cols, left_shown, left_tone, options);
+    }
+
+    if (chip.len > 0) {
+        const pad: usize = if (cols > used_cols + chip.len)
+            cols - used_cols - chip.len
+        else if (used_cols < cols)
+            @as(usize, 1)
+        else
+            @as(usize, 0);
+        var i: usize = 0;
+        while (i < pad) : (i += 1) try writer.writeByte(' ');
+        var chip_used: usize = 0;
+        _ = try writeFooterSegment(writer, &chip_used, chip.len, chip, chip_tone, options);
+    }
+}
+
 fn renderPromptFooter(writer: anytype, options: anytype, mode: anytype, cols: usize, input_text: []const u8) !void {
     if (cols == 0) return;
+
+    // r3-chrome-04: the reference's single-line default footer replaces
+    // this whole multi-segment "actions" bar (and renderStatusLine's
+    // "ready" row below it). `legacy_footer` is a new field on the real
+    // Options struct (default false); anonymous option literals from
+    // older tests that don't declare it fall through to the untouched
+    // legacy path below via `!@hasField`.
+    if (@hasField(@TypeOf(options), "legacy_footer") and !options.legacy_footer) {
+        return renderDefaultFooterLine(writer, options, cols);
+    }
 
     var used_cols: usize = 0;
 
@@ -1625,6 +1695,13 @@ fn renderTopContextBar(writer: anytype, options: anytype, mode: anytype, cols: u
 }
 
 pub fn renderStatusLine(writer: anytype, options: anytype, mode: anytype, offset: usize, max_off: usize, hint: []const u8, cols: usize) !void {
+    // r3-chrome-04: this whole "\xe2\x97\x8f ready \xe2\x88\x99 zcode vX
+    // \xe2\x88\x99 \xe2\x96\xb6 execution \xe2\x88\x99 cwd \xe2\x88\x99 model"
+    // row is legacy chrome -- the reference has no second footer row, only
+    // renderPromptFooter's single "? for shortcuts" + mode-chip line above.
+    // See that function's matching guard for the new default.
+    if (@hasField(@TypeOf(options), "legacy_footer") and !options.legacy_footer) return;
+
     const use_color = repl_markdown.shouldUseColor(options);
     const ident_result = if (options.status_identity_provider) |provider|
         provider.get(provider.ctx)
@@ -1946,6 +2023,46 @@ fn clipEndInto(out: []u8, text: []const u8, max_len: usize) []const u8 {
     return out[0..safe_max];
 }
 
+/// r3-chrome-01: the three text lines shown beside `figures.CONDENSED_LOGO_ROWS`
+/// in the 2.1.261-style condensed startup banner -- "<product> v<version>",
+/// "<model> \xc2\xb7 <provider>", and the cwd. Ported from edualc's
+/// CondensedLogo.tsx + logoV2Utils.formatModelAndBilling: `cols` bounds the
+/// available text width the same way the reference derives `textWidth` as
+/// `max(columns - 15, 20)` (15 cells reserved for the glyph column + gap),
+/// and the model/provider pairing degrades to a single truncated string
+/// instead of the reference's two-line split when it doesn't fit (zcode's
+/// banner is a fixed three-row layout; see the r3a-repl-chrome package notes
+/// for the rationale). Reuses the existing `format.truncatePathMiddle` for
+/// the cwd line so long paths keep their leading and trailing segments
+/// rather than losing the project directory name to a plain end-clip.
+///
+/// Caller owns the three returned slices (free each with `allocator.free`).
+pub fn buildCondensedHeaderLines(
+    allocator: std.mem.Allocator,
+    app_version: []const u8,
+    model: []const u8,
+    provider: []const u8,
+    cwd: []const u8,
+    cols: usize,
+) ![3][]u8 {
+    const text_width: usize = if (cols > 15) cols - 15 else 20;
+
+    var version_raw_buf: [96]u8 = undefined;
+    const version_raw = std.fmt.bufPrint(&version_raw_buf, "zcode v{s}", .{app_version}) catch "zcode";
+    var version_clip_buf: [96]u8 = undefined;
+    const line0 = try allocator.dupe(u8, clipEndInto(&version_clip_buf, version_raw, @max(text_width, 6)));
+
+    var combined_buf: [192]u8 = undefined;
+    const combined = std.fmt.bufPrint(&combined_buf, "{s} \xc2\xb7 {s}", .{ model, provider }) catch model;
+    var combined_clip_buf: [192]u8 = undefined;
+    const line1 = try allocator.dupe(u8, clipEndInto(&combined_clip_buf, combined, @max(text_width, 10)));
+
+    var cwd_buf: [768]u8 = undefined;
+    const line2 = try allocator.dupe(u8, format_mod.truncatePathMiddle(&cwd_buf, cwd, @max(text_width, 10)));
+
+    return .{ line0, line1, line2 };
+}
+
 fn buildTokenStatusVariants(options: anytype, wide_out: []u8, compact_out: []u8, minimal_out: []u8) TokenStatusVariants {
     const provider = options.status_metrics_provider orelse return .{};
     const metrics = provider.get(provider.ctx);
@@ -2170,16 +2287,30 @@ fn renderComposerBorder(writer: anytype, cols: usize, top: bool, mode: anytype, 
     const left = if (top) repl_markdown.BOX_TL else repl_markdown.BOX_BL;
     const right = if (top) repl_markdown.BOX_TR else repl_markdown.BOX_BR;
 
+    // r3-chrome-03: the reference's PromptInput border (edualc
+    // PromptInput.tsx:2291, `borderStyle="round" borderLeft={false}
+    // borderRight={false} borderBottom`) carries no title and no keyboard
+    // hints -- it is a plain top rule and a plain bottom rule around the
+    // "> " prompt, with the mode/permission indicator and hint text living
+    // in the footer row below instead (renderPromptFooter). `legacy_footer`
+    // (default false on the real Options struct; absent -- and therefore
+    // also legacy -- on the many anonymous option literals throughout this
+    // file's older tests) opts back into zcode's previous embedded-label
+    // borders for anyone who preferred that density.
+    const use_legacy_labels = !@hasField(@TypeOf(options), "legacy_footer") or options.legacy_footer;
+
     var label_buf: [160]u8 = undefined;
     const mode_word = shortModeLabel(mode);
-    const label = if (top)
+    const label = if (!use_legacy_labels)
+        ""
+    else if (top)
         std.fmt.bufPrint(&label_buf, " ask zcode  {s} ", .{mode_word}) catch " ask zcode "
     else if (@hasField(@TypeOf(options), "ui_leader_key"))
         std.fmt.bufPrint(&label_buf, " Enter submit  Shift+Enter newline  ? shortcuts  {s} h palette ", .{options.ui_leader_key}) catch " Enter submit "
     else
         " Enter submit  Shift+Enter newline  ? shortcuts ";
 
-    const show_label = cols > label.len + 4;
+    const show_label = label.len > 0 and cols > label.len + 4;
     const label_cols = if (show_label) label.len else 0;
     const fill_cols = cols - 2 - label_cols;
     const label_pad: usize = @min(@as(usize, 2), fill_cols);
@@ -3723,6 +3854,169 @@ test "assistant transcript block suppresses inner spacing" {
         .transcript_line_spacing = @as(usize, 1),
     };
     try testing.expectEqual(@as(usize, 4), transcriptVisualRows(&transcript, 80, options));
+}
+
+test "buildCondensedHeaderLines formats the product/version, model/provider, and cwd lines" {
+    const lines = try buildCondensedHeaderLines(testing.allocator, "0.12.50", "mock-agent", "mock", "/Users/zero/projects/zcode", 120);
+    defer for (lines) |line| testing.allocator.free(line);
+
+    try testing.expectEqualStrings("zcode v0.12.50", lines[0]);
+    try testing.expectEqualStrings("mock-agent \xc2\xb7 mock", lines[1]);
+    try testing.expectEqualStrings("/Users/zero/projects/zcode", lines[2]);
+}
+
+test "buildCondensedHeaderLines truncates the model/provider line to the available width" {
+    const lines = try buildCondensedHeaderLines(testing.allocator, "0.12.50", "a-very-long-model-identifier-that-does-not-fit", "some-provider", "/tmp", 30);
+    defer for (lines) |line| testing.allocator.free(line);
+
+    // text_width = max(30-15, 20) = 20; the combined "model · provider"
+    // string is far longer than that, so it must have been clipped.
+    try testing.expect(lines[1].len <= 20);
+    try testing.expect(std.mem.endsWith(u8, lines[1], "..."));
+}
+
+test "buildCondensedHeaderLines middle-truncates a long cwd, keeping the leading and trailing segments" {
+    const lines = try buildCondensedHeaderLines(testing.allocator, "0.12.50", "m", "p", "/Users/zero/projects/very/deeply/nested/workspace/zcode", 40);
+    defer for (lines) |line| testing.allocator.free(line);
+
+    try testing.expect(lines[2].len < "/Users/zero/projects/very/deeply/nested/workspace/zcode".len);
+    try testing.expect(std.mem.startsWith(u8, lines[2], "/Users"));
+    try testing.expect(std.mem.endsWith(u8, lines[2], "zcode"));
+}
+
+test "renderComposerBorder (default) draws a plain rule with no title or hint text" {
+    var top_buf = std_io.StringBuilder.init(testing.allocator);
+    defer top_buf.deinit();
+    var bottom_buf = std_io.StringBuilder.init(testing.allocator);
+    defer bottom_buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+        .ui_leader_key = @as([]const u8, "ctrl+x"),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderComposerBorder(top_buf.writer(), 60, true, TestMode.execution, options);
+    try renderComposerBorder(bottom_buf.writer(), 60, false, TestMode.execution, options);
+
+    try testing.expect(std.mem.indexOf(u8, top_buf.items(), "ask zcode") == null);
+    try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), "Enter submit") == null);
+    try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), "? shortcuts") == null);
+}
+
+test "renderComposerBorder (legacy_footer=true) keeps the embedded title and hint text" {
+    var top_buf = std_io.StringBuilder.init(testing.allocator);
+    defer top_buf.deinit();
+
+    const options = .{
+        .legacy_footer = true,
+        .color_enabled = false,
+        .ui_leader_key = @as([]const u8, "ctrl+x"),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderComposerBorder(top_buf.writer(), 60, true, TestMode.execution, options);
+
+    try testing.expect(std.mem.indexOf(u8, top_buf.items(), "ask zcode") != null);
+}
+
+test "renderPromptFooter (default) shows only the shortcuts hint, not the legacy actions row" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+        .live_permission_mode = permission_decision.Mode.default,
+        .queued_prompt_notice = @as([]const u8, ""),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderPromptFooter(buf.writer(), options, TestMode.execution, 160, "a draft the user is typing");
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "? for shortcuts") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "actions") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "draft") == null);
+}
+
+test "renderPromptFooter (default) right-aligns the permission-mode chip" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+        .live_permission_mode = permission_decision.Mode.acceptEdits,
+        .queued_prompt_notice = @as([]const u8, ""),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    const cols: usize = 60;
+    try renderPromptFooter(buf.writer(), options, TestMode.execution, cols, "");
+
+    const out = buf.items();
+    const chip = "\xe2\x8f\xb5\xe2\x8f\xb5 accept edits on";
+    try testing.expect(std.mem.indexOf(u8, out, "? for shortcuts") != null);
+    const chip_at = std.mem.indexOf(u8, out, chip) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(cols, chip_at + chip.len);
+}
+
+test "renderPromptFooter (legacy_footer=true) preserves the old actions row" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = true,
+        .yolo_mode = false,
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_safety = true,
+        .color_enabled = false,
+        .live_permission_mode = permission_decision.Mode.default,
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderPromptFooter(buf.writer(), options, TestMode.execution, 160, "");
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "actions") != null);
+}
+
+test "renderStatusLine is a no-op by default (folded into renderPromptFooter)" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{ .legacy_footer = false };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderStatusLine(buf.writer(), options, TestMode.execution, 0, 0, "", 80);
+    try testing.expectEqual(@as(usize, 0), buf.items().len);
+}
+
+test "renderStatusLine (legacy_footer=true) keeps rendering the old ready/version row" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = true,
+        .color_enabled = false,
+        .status_provider = @as([]const u8, "mock"),
+        .status_model = @as([]const u8, "mock-agent"),
+        .status_workspace = @as([]const u8, ""),
+        .status_branch = @as([]const u8, ""),
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_workspace = false,
+        .status_show_model = true,
+        .status_show_safety = false,
+        .status_show_tokens = false,
+        .status_show_hint = false,
+        .show_scroll_hint = false,
+        .app_version = @as([]const u8, "test"),
+        .status_identity_provider = null,
+        .status_dynamic_provider = null,
+        .status_circuit_state = @as([]const u8, ""),
+        .status_agent_name = @as([]const u8, ""),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderStatusLine(buf.writer(), options, TestMode.execution, 0, 0, "", 120);
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "ready") != null);
 }
 
 test "assistant transcript block wraps to inner width" {

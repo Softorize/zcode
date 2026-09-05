@@ -888,6 +888,10 @@ pub fn applyKeyValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8
         try cfg.setOwnedString(allocator, &cfg.ui_leader_key, value);
     } else if (std.mem.eql(u8, key, "ui_show_top_bar")) {
         cfg.ui_show_top_bar = parseBool(value);
+    } else if (std.mem.eql(u8, key, "ui_legacy_banner")) {
+        cfg.ui_legacy_banner = parseBool(value);
+    } else if (std.mem.eql(u8, key, "ui_legacy_footer")) {
+        cfg.ui_legacy_footer = parseBool(value);
     } else if (std.mem.eql(u8, key, "ui_show_shortcuts_panel")) {
         cfg.ui_show_shortcuts_panel = parseBool(value);
     } else if (std.mem.eql(u8, key, "ui_prompt_label")) {
@@ -1677,6 +1681,27 @@ test "applyCliOverrides sets output style" {
 
     try applyCliOverrides(allocator, &cfg, &opts);
     try testing.expectEqualStrings("learning", cfg.output_style);
+}
+
+test "r3-chrome: the top status bar and legacy chrome flags default off, and each parses independently" {
+    const allocator = testing.allocator;
+    var cfg = try Config.init(allocator);
+    defer cfg.deinit(allocator);
+
+    // r3-chrome-01/02/03/04: 2.1.261 parity flips the pre-parity zcode
+    // chrome (top status bar, bordered welcome card, two-row footer) off
+    // by default; these three config keys opt back into it.
+    try testing.expect(!cfg.ui_show_top_bar);
+    try testing.expect(!cfg.ui_legacy_banner);
+    try testing.expect(!cfg.ui_legacy_footer);
+
+    try mergeLine(allocator, &cfg, "ui_show_top_bar = true");
+    try mergeLine(allocator, &cfg, "ui_legacy_banner = true");
+    try mergeLine(allocator, &cfg, "ui_legacy_footer = true");
+
+    try testing.expect(cfg.ui_show_top_bar);
+    try testing.expect(cfg.ui_legacy_banner);
+    try testing.expect(cfg.ui_legacy_footer);
 }
 
 test "merge ui and runtime behavior fields" {
