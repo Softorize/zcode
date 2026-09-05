@@ -39,13 +39,46 @@ pub const Option = struct {
     preview: ?[]const u8 = null,
 };
 
+/// tools-22: a question is either an ordinary multiple-choice `.choice`
+/// (the default -- requires MIN_OPTIONS usable options), an open-ended
+/// `.text` (a text box, no options), or a bounded `.number` (min/max,
+/// optionally step/defaultValue/unit). Mirrors the reference's
+/// `"kind": "text" | "number"` extension -- omitting `kind` means `.choice`.
+pub const QuestionKind = enum {
+    choice,
+    text,
+    number,
+
+    pub fn parse(raw: ?[]const u8) QuestionKind {
+        const s = raw orelse return .choice;
+        if (std.ascii.eqlIgnoreCase(s, "text")) return .text;
+        if (std.ascii.eqlIgnoreCase(s, "number")) return .number;
+        return .choice;
+    }
+};
+
+/// tools-22: bounds for a `.number`-kind question. All fields optional per
+/// the reference ("min"/"max" (optionally "step", "defaultValue", "unit")").
+pub const NumberBounds = struct {
+    min: ?f64 = null,
+    max: ?f64 = null,
+    step: ?f64 = null,
+    default_value: ?f64 = null,
+    unit: []const u8 = "",
+};
+
 /// One question with its header chip, options, and multi-select flag.
 pub const Question = struct {
     question: []const u8,
     /// <= 12-char chip label. Empty when the model omitted it.
     header: []const u8 = "",
     multi_select: bool = false,
+    kind: QuestionKind = .choice,
+    /// Populated for `.choice` only; empty (zero-length, allocator-owned)
+    /// slice for `.text`/`.number`.
     options: []Option,
+    /// Populated for `.number` only; default value otherwise.
+    number: NumberBounds = .{},
 };
 
 /// A parsed AskUserQuestion payload: 1-4 questions plus the owning allocator so
@@ -65,6 +98,7 @@ pub const Questions = struct {
                 if (opt.preview) |p| a.free(p);
             }
             a.free(q.options);
+            a.free(q.number.unit);
         }
         a.free(self.items);
     }
@@ -140,9 +174,13 @@ fn parseQuestionsArray(allocator: std.mem.Allocator, raw_items: []const std.json
         const q_text = stringField(obj, "question") orelse continue;
         const header_raw = stringField(obj, "header") orelse "";
         const multi = boolField(obj, "multiSelect");
+        // tools-22: `kind` selects choice (default) / text / number. Only
+        // `.choice` requires >= MIN_OPTIONS -- an open-ended `.text` or
+        // bounded `.number` question has no `options` array at all.
+        const kind = QuestionKind.parse(stringField(obj, "kind"));
 
-        const options = try parseOptions(allocator, obj);
-        if (options.len < MIN_OPTIONS) {
+        const options = if (kind == .choice) try parseOptions(allocator, obj) else try allocator.alloc(Option, 0);
+        if (kind == .choice and options.len < MIN_OPTIONS) {
             freeOptions(allocator, options);
             // Surface a clear error so the model retries with >= 2 options,
             // mirroring the reference's `options.min(2)` validation.
@@ -150,11 +188,22 @@ fn parseQuestionsArray(allocator: std.mem.Allocator, raw_items: []const std.json
         }
         errdefer freeOptions(allocator, options);
 
+        const number: NumberBounds = if (kind == .number) .{
+            .min = numberField(obj, "min"),
+            .max = numberField(obj, "max"),
+            .step = numberField(obj, "step"),
+            .default_value = numberField(obj, "defaultValue"),
+            .unit = try allocator.dupe(u8, stringField(obj, "unit") orelse ""),
+        } else .{ .unit = try allocator.dupe(u8, "") };
+        errdefer allocator.free(number.unit);
+
         const question = Question{
             .question = try allocator.dupe(u8, q_text),
             .header = try dupTruncatedHeader(allocator, header_raw),
             .multi_select = multi,
+            .kind = kind,
             .options = options,
+            .number = number,
         };
         try out.append(question);
     }
@@ -248,6 +297,12 @@ fn parseLegacyQuestion(allocator: std.mem.Allocator, root: std.json.ObjectMap, q
         .header = try allocator.dupe(u8, ""),
         .multi_select = false,
         .options = options,
+        // tools-22: `number.unit` must always be a heap-owned dupe (even
+        // empty), matching `header`'s established treatment above -- the
+        // struct-level default (`= .{}`, a static "" literal) is never
+        // safe to pass through `Questions.deinit`'s unconditional
+        // `allocator.free(q.number.unit)`.
+        .number = .{ .unit = try allocator.dupe(u8, "") },
     };
     return .{ .items = items, .allocator = allocator };
 }
@@ -368,6 +423,18 @@ fn boolField(obj: std.json.ObjectMap, key: []const u8) bool {
     return false;
 }
 
+/// tools-22: extract a numeric field (`min`/`max`/`step`/`defaultValue`) as
+/// f64, accepting either a JSON number or integer.
+fn numberField(obj: std.json.ObjectMap, key: []const u8) ?f64 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch null,
+        else => null,
+    };
+}
+
 /// Dupe a header truncated to MAX_HEADER_LEN characters (byte-truncation is
 /// safe here: headers are short ASCII chips in practice; we avoid splitting a
 /// trailing multi-byte sequence by clamping to the last whole UTF-8 boundary).
@@ -396,6 +463,7 @@ fn freeQuestion(allocator: std.mem.Allocator, q: Question) void {
     allocator.free(q.question);
     allocator.free(q.header);
     freeOptions(allocator, q.options);
+    allocator.free(q.number.unit);
 }
 
 // --- tests ---
@@ -543,4 +611,46 @@ test "parseQuestions tolerates plain-string options under rich schema" {
     try testing.expectEqual(@as(usize, 3), qs.items[0].options.len);
     try testing.expectEqualStrings("a", qs.items[0].options[0].label);
     try testing.expectEqualStrings("", qs.items[0].options[0].description);
+}
+
+test "tools-22: kind=text question has no options and skips the min-options check" {
+    const input =
+        \\{"questions":[{"question":"What should the commit message say?","kind":"text"}]}
+    ;
+    var qs = try parseQuestions(testing.allocator, input);
+    defer qs.deinit();
+    try testing.expectEqual(@as(usize, 1), qs.items.len);
+    try testing.expectEqual(QuestionKind.text, qs.items[0].kind);
+    try testing.expectEqual(@as(usize, 0), qs.items[0].options.len);
+}
+
+test "tools-22: kind=number question carries min/max/step/defaultValue/unit" {
+    const input =
+        \\{"questions":[{"question":"How many retries?","kind":"number","min":1,"max":10,"step":1,"defaultValue":3,"unit":"attempts"}]}
+    ;
+    var qs = try parseQuestions(testing.allocator, input);
+    defer qs.deinit();
+    try testing.expectEqual(@as(usize, 1), qs.items.len);
+    const q = qs.items[0];
+    try testing.expectEqual(QuestionKind.number, q.kind);
+    try testing.expectEqual(@as(usize, 0), q.options.len);
+    try testing.expectEqual(@as(f64, 1), q.number.min.?);
+    try testing.expectEqual(@as(f64, 10), q.number.max.?);
+    try testing.expectEqual(@as(f64, 1), q.number.step.?);
+    try testing.expectEqual(@as(f64, 3), q.number.default_value.?);
+    try testing.expectEqualStrings("attempts", q.number.unit);
+}
+
+test "tools-22: omitting kind still defaults to choice and enforces min options" {
+    const input =
+        \\{"questions":[{"question":"q","options":[{"label":"only"}]}]}
+    ;
+    try testing.expectError(error.TooFewOptions, parseQuestions(testing.allocator, input));
+}
+
+test "tools-22: legacy question+choices payload defaults to choice kind with an owned empty unit" {
+    var qs = try parseQuestions(testing.allocator, "{\"question\":\"Pick\",\"choices\":[\"yes\",\"no\"]}");
+    defer qs.deinit();
+    try testing.expectEqual(QuestionKind.choice, qs.items[0].kind);
+    try testing.expectEqualStrings("", qs.items[0].number.unit);
 }
