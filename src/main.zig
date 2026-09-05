@@ -250,6 +250,7 @@ comptime {
     _ = @import("core/cc_stub_commands.zig");
     _ = @import("core/parity_command_coverage.zig");
     _ = @import("core/parity_tool_coverage.zig");
+    _ = @import("core/command_list_format.zig");
     _ = @import("core/wire_protocol.zig");
     _ = @import("core/retry_policy.zig");
     _ = @import("core/token_count.zig");
@@ -885,6 +886,15 @@ pub fn main(init: std.process.Init) !void {
     // this package's contract is only that the flag parses and the value
     // reaches `cfg` unmutated for that package to consume.
     try applyCliFlagCarrierFields(allocator, &loaded_cfg.config, &opts);
+    // cli-flags-missed-115: `applyCliFlagCarrierFields` above OR's the CLI
+    // flag INTO `cfg.verbose` (config -> cfg is a one-way carry by design),
+    // but every actual verbosity gate in the codebase reads `opts.verbose`
+    // directly, not `cfg.verbose` -- so a `verbose = true` config.toml
+    // default with no `--verbose` flag on the command line previously had
+    // zero effect anywhere. Carry the merged value back so `--verbose`
+    // genuinely "overrides" (i.e. is layered over) the config default, per
+    // the reference's own help text for this flag.
+    opts.verbose = loaded_cfg.config.verbose;
 
     // cli-flags-21/22/23: session-scoped overrides that are fully owned by
     // this package (they layer on top of already-implemented engines --
@@ -1835,6 +1845,16 @@ fn runHeadlessDispatch(
         std.process.exit(2);
     };
 
+    // headless-sdk-14: --forward-subagent-text requires --print and
+    // --output-format=stream-json, matching the reference's own gate.
+    // zcode's `run`/`exec` subcommands are documented print-equivalent
+    // headless entry points (they set opts.headless the same way --print
+    // does -- see this function's own doc comment), so either satisfies the
+    // "requires --print" half of the gate.
+    sdk_output.validateForwardSubagentTextGate(opts.print or opts.headless, transport.output_format, opts.forward_subagent_text) catch {
+        std.process.exit(2);
+    };
+
     const rc = sdk_headless.RunContext{
         .allocator = allocator,
         .cwd = cwd,
@@ -1855,6 +1875,7 @@ fn runHeadlessDispatch(
             .max_thinking_tokens = opts.max_thinking_tokens,
             .session_id_override = opts.session_id_override,
             .no_session_persistence = opts.no_session_persistence,
+            .forward_subagent_text = opts.forward_subagent_text,
         },
     };
 

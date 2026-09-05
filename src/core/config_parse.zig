@@ -1017,6 +1017,14 @@ pub fn applyKeyValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8
         try cfg.setOwnedString(allocator, &cfg.spinner_tips_custom, value);
     } else if (std.mem.eql(u8, key, "spinner_tips_exclude_default")) {
         cfg.spinner_tips_exclude_default = parseBool(value);
+    } else if (std.mem.eql(u8, key, "verbose")) {
+        // cli-flags-missed-115: `--verbose` "Override verbose mode setting
+        // from config" -- this is that config-level default. `Config.verbose`
+        // already exists and main.zig already ORs `opts.verbose` into it
+        // post-load; this branch was the missing half: a config.toml
+        // `verbose = true` line previously hit the `error.UnknownConfigKey`
+        // fallback below instead of ever reaching `cfg.verbose`.
+        cfg.verbose = parseBool(value);
     } else if (std.mem.eql(u8, key, "reasoning_effort") or
         std.mem.eql(u8, key, "effort_level"))
     {
@@ -1727,6 +1735,18 @@ test "merge ui and runtime behavior fields" {
     try testing.expect(!cfg.control_plane_managed_settings_verify_hash);
     try testing.expect(cfg.update_require_signature);
     try testing.expectEqualStrings("1.2.3", cfg.update_pinned_version);
+}
+
+test "cli-flags-missed-115: verbose is a recognized config.toml key, not error.UnknownConfigKey" {
+    var cfg = try Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+    try testing.expect(!cfg.verbose);
+
+    try mergeLine(testing.allocator, &cfg, "verbose = true");
+    try testing.expect(cfg.verbose);
+
+    try mergeLine(testing.allocator, &cfg, "verbose = false");
+    try testing.expect(!cfg.verbose);
 }
 
 test "merge auto-dream settings" {

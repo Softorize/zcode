@@ -490,7 +490,14 @@ const BuiltinAgentTemplate = struct {
 
 const builtin_agent_templates = [_]BuiltinAgentTemplate{
     .{
-        .name = "explore",
+        // tools-23: reference-exact casing (cc_system_prompt_2.1.261.md
+        // "### Agent": "Built-in agent types: claude (catch-all),
+        // claude-code-guide, Explore (read-only search agent),
+        // general-purpose, Plan (software architect), statusline-setup.").
+        // findByName/upsert compare case-insensitively, so a model (or a
+        // user's existing scripts/tests) spelling this "explore" still
+        // resolves to the same entry.
+        .name = "Explore",
         .description = "Read-only codebase investigation. Use for: finding patterns across files, tracing call chains, gathering evidence. Do NOT use for: making changes, running tests, or tasks requiring mutation.",
         .system_prompt =
         \\You are the explore specialist.
@@ -502,7 +509,8 @@ const builtin_agent_templates = [_]BuiltinAgentTemplate{
         .tools = &.{ "Read", "file_read", "Glob", "Grep", "GitDiff", "GitLog", "git_status", "WebFetch", "WebSearch", "JsonQuery", "TodoRead" },
     },
     .{
-        .name = "plan",
+        // tools-23: reference-exact casing, see the "Explore" note above.
+        .name = "Plan",
         .description = "Planning specialist for design and implementation strategy. Use for: breaking tasks into steps, identifying risks, creating checklists. Do NOT use for: executing code changes or running tests.",
         .system_prompt =
         \\You are the plan specialist.
@@ -512,6 +520,56 @@ const builtin_agent_templates = [_]BuiltinAgentTemplate{
         ,
         .mode = .planning,
         .tools = &.{ "Read", "file_read", "Glob", "Grep", "GitDiff", "GitLog", "git_status", "TodoRead", "TodoWrite" },
+    },
+    .{
+        // tools-23: the reference's default agent, used whenever
+        // subagent_type is omitted or set to an unrecognized custom name is
+        // NOT what happens here (an unrecognized name is still reported as
+        // "agent not found" -- see agent_history.activateAgentByNameImpl);
+        // this entry only covers the *explicit* `subagent_type:
+        // "general-purpose"` spelling and gives it an unrestricted tool
+        // allowlist (the reference's general-purpose agent has full tool
+        // access, matching the omitted-subagent_type default of "no agent
+        // restriction applied" already implemented at the AgentRun call
+        // site).
+        .name = "general-purpose",
+        .description = "General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. When you are searching for a keyword or file and are not confident that you will find the right match in the first few tries, use this agent to perform the search for you.",
+        .system_prompt =
+        \\You are a general-purpose agent. You have the full tool set available.
+        \\Investigate thoroughly, then take whatever concrete action the task calls for -- read, search, edit, run commands, or verify -- rather than stopping at a plan.
+        \\Report back with grounded findings and, when you changed anything, exactly what changed.
+        ,
+        .mode = .inherit,
+        .tools = &.{"*"},
+    },
+    .{
+        // tools-23: reference description verbatim except the product name
+        // (zcode never claims to be Claude Code -- see repo-wide rule).
+        .name = "statusline-setup",
+        .description = "Use this agent to configure the user's zcode status line setting.",
+        .system_prompt =
+        \\You are the statusline-setup specialist.
+        \\Configure the user's zcode status line: read their shell prompt/PS1 configuration if referenced, then write the equivalent `statusline` setting into `.zcode/settings.json` (or `~/.zcode/settings.json` for a user-wide default).
+        \\At the end of your response, tell the user that the "statusline-setup" agent must be used for further status line changes, and that they can ask again any time.
+        ,
+        .mode = .execution,
+        .tools = &.{ "Read", "file_read", "Write", "file_write", "Edit", "file_edit", "Bash", "shell", "Config" },
+    },
+    .{
+        // tools-23: claude-code-guide -> renamed zcode-guide per package
+        // notes (zcode must never claim to be Claude Code/Anthropic).
+        // Reference description trimmed to zcode's own surface (no Claude
+        // Agent SDK / Claude API / Claude Tag / claude-tag equivalents to
+        // point at).
+        .name = "zcode-guide",
+        .description = "Use this agent when the user asks questions (\"Can zcode...\", \"Does zcode...\", \"How do I...\") about zcode itself: CLI flags, slash commands, hooks, permissions, MCP servers, settings, config-directory layout, or keyboard shortcuts.",
+        .system_prompt =
+        \\You are the zcode guide agent. Your primary responsibility is helping users understand and use zcode effectively.
+        \\Ground every answer in this repository's actual behavior: read the relevant source (src/cli/args.zig for flags, src/repl_commands.zig for slash commands, src/core/config.zig for settings) or run `zcode --help` / `zcode <subcommand> --help` rather than guessing.
+        \\Prefer read-only tools. Do not mutate files or propose speculative answers.
+        ,
+        .mode = .execution,
+        .tools = &.{ "Read", "file_read", "Glob", "Grep", "GitDiff", "GitLog", "git_status", "WebFetch", "Bash", "shell" },
     },
     .{
         .name = "verify",
@@ -1285,6 +1343,70 @@ test "findByName resolves builtin agents" {
     try testing.expectEqual(agent.mode, .execution);
     try testing.expect(allowsTool(&agent, "Read"));
     try testing.expect(!allowsTool(&agent, "Write"));
+}
+
+test "tools-23: reference built-in agent types resolve case-insensitively" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    // "Explore"/"Plan" are the reference-exact display names; lowercase
+    // spellings (what a model or an old zcode transcript might send) still
+    // resolve to the same entry via case-insensitive lookup.
+    {
+        var agent = (try findByName(testing.allocator, cwd, "Explore")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expectEqualStrings("Explore", agent.name);
+    }
+    {
+        var agent = (try findByName(testing.allocator, cwd, "explore")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expectEqualStrings("Explore", agent.name);
+    }
+    {
+        var agent = (try findByName(testing.allocator, cwd, "plan")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expectEqualStrings("Plan", agent.name);
+    }
+}
+
+test "tools-23: general-purpose builtin has an unrestricted tool allowlist" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    var agent = (try findByName(testing.allocator, cwd, "general-purpose")) orelse return error.MissingBuiltinAgent;
+    defer agent.deinit(testing.allocator);
+
+    try testing.expectEqual(agent.scope, .builtin);
+    try testing.expect(allowsTool(&agent, "Read"));
+    try testing.expect(allowsTool(&agent, "Write"));
+    try testing.expect(allowsTool(&agent, "Bash"));
+}
+
+test "tools-23: statusline-setup and zcode-guide builtins resolve" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    {
+        var agent = (try findByName(testing.allocator, cwd, "statusline-setup")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expect(allowsTool(&agent, "Write"));
+        try testing.expect(!allowsTool(&agent, "GitCommit"));
+    }
+    {
+        // Renamed from the reference's "claude-code-guide" -- zcode never
+        // claims to be Claude Code.
+        var agent = (try findByName(testing.allocator, cwd, "zcode-guide")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expect(allowsTool(&agent, "Read"));
+        try testing.expect(!allowsTool(&agent, "Write"));
+        try testing.expect((try findByName(testing.allocator, cwd, "claude-code-guide")) == null);
+    }
 }
 
 // ── Task 17.4: plugin-provided agents (plugins-04) ────────────────

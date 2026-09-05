@@ -183,10 +183,20 @@ pub const TurnResult = struct {
     /// Why the turn ended. Defaults to `.completed` so existing struct
     /// literals that omit it keep the prior (normal-completion) meaning.
     terminal_reason: TerminalReason = .completed,
+    /// headless-sdk-missed-184: the extended-thinking text for the round
+    /// that produced `final_text`, when the model returned one and
+    /// `cfg.ui_thinking_summary` is on. Null on every early-return path
+    /// above (interrupted/cancelled/hook-blocked turns never had a model
+    /// round at all) and whenever the final round's history entry doesn't
+    /// exactly match `final_text` (a later synthetic message replaced it) --
+    /// never a fabricated/guessed thinking block, only ever the real
+    /// `response.reasoning_text` already captured in `self.history`.
+    final_thinking: ?[]u8 = null,
 
     pub fn deinit(self: *TurnResult, allocator: std.mem.Allocator) void {
         allocator.free(self.final_text);
         allocator.free(self.preprocessor_summary);
+        if (self.final_thinking) |t| allocator.free(t);
         for (self.tool_traces) |*t| t.deinit(allocator);
         allocator.free(self.tool_traces);
     }
@@ -3426,7 +3436,32 @@ pub const AgentRuntime = struct {
             .strict_violation = strict_violation_any,
             .preprocessor_summary = pp_summary,
             .terminal_reason = terminal_reason,
+            .final_thinking = self.thinkingForFinalText(final_text),
         };
+    }
+
+    /// headless-sdk-missed-184: recover the extended-thinking text behind
+    /// `final_text`, if any. `appendHistoryTurnWithThinking` records the
+    /// model's `reasoning_text` alongside its answer turn-by-turn as the
+    /// round loop runs (ui-render-04), so the most recent assistant turn
+    /// whose `content` matches `final_text` byte-for-byte carries the exact
+    /// thinking block that produced it -- not a guess, and not present at
+    /// all on the many early-return paths above (hook-blocked, interrupted,
+    /// cancelled) that never appended a matching turn to begin with.
+    fn thinkingForFinalText(self: *AgentRuntime, final_text: []const u8) ?[]u8 {
+        const view = self.history.view();
+        var i: usize = view.len;
+        while (i > 0) {
+            i -= 1;
+            if (view[i].role != .assistant) continue;
+            if (view[i].thinking) |th| {
+                if (std.mem.eql(u8, view[i].content, final_text)) {
+                    return self.allocator.dupe(u8, th) catch null;
+                }
+            }
+            break;
+        }
+        return null;
     }
 
     // --- Delegating methods to sub-modules ---
@@ -4043,6 +4078,18 @@ pub const AgentRuntime = struct {
             const requested = std.mem.trim(u8, agent_name, " \t\r\n");
             if (self.permission_rules.isAgentDenied(self.cwd, requested)) {
                 return std.fmt.allocPrint(self.allocator, "agent type '{s}' is denied by a permission rule", .{requested});
+            }
+            // tools-23: `subagent_type: "fork"` is a spawn MODE, not a
+            // registered agent spec -- reference: "\"fork\" forks yourself
+            // (the fork inherits your full conversation context and always
+            // runs on your model -- a `model` override is ignored); any
+            // other type -- or omitting it -- starts a fresh agent
+            // (general-purpose by default)." Intercept it here, before the
+            // normal foreground/background branch below, since a fork is
+            // unconditionally a background spawn regardless of
+            // `run_in_background`.
+            if (parse_helpers.eqlIgnoreCase(requested, "fork")) {
+                return spawnForkAgent(self, config);
             }
         }
 
@@ -5936,6 +5983,58 @@ pub const AgentRuntime = struct {
         self.suppress_compact_warning = true;
     }
 
+    /// tools-23: `subagent_type: "fork"`. Reference: "\"fork\" forks
+    /// yourself (the fork inherits your full conversation context and
+    /// always runs on your model -- a `model` override is ignored)." zcode
+    /// has no in-process conversation-context clone (the background spawn
+    /// path always constructs a brand-new `AgentRuntime` on its own thread),
+    /// so the fork's "full conversation context" is reproduced by rendering
+    /// the caller's own turn-by-turn transcript into a text block and
+    /// seeding the child's prompt with it -- the child genuinely sees every
+    /// prior turn, just as plain text context rather than replayed
+    /// structured history entries.
+    fn spawnForkAgent(self: *AgentRuntime, config: @import("tools/agent.zig").AgentRunConfig) anyerror![]u8 {
+        const seeded_prompt = try buildForkSeededPrompt(self.allocator, self.history.view(), config.prompt);
+        defer self.allocator.free(seeded_prompt);
+
+        // "always runs on your model -- a model override is ignored": pin to
+        // the CALLER's current active provider/model regardless of any
+        // `model` argument the tool call carried alongside subagent_type.
+        const pinned_model = try pinnedForkModel(self.allocator, self.active_provider, self.active_model);
+        defer self.allocator.free(pinned_model);
+
+        var forked = config;
+        forked.prompt = seeded_prompt;
+        forked.agent = null; // "fork" is a spawn mode, not a registered agent spec
+        forked.model = pinned_model;
+        forked.run_in_background = true; // a fork always runs in the background
+
+        return self.spawnBackgroundAgent(forked);
+    }
+
+    /// Render `history` as a flat `role: content` transcript and seed it
+    /// ahead of `original_prompt`, for `spawnForkAgent`. Pure/allocator-only
+    /// so it is unit-testable without spinning up a real AgentRuntime or
+    /// background thread.
+    fn buildForkSeededPrompt(allocator: std.mem.Allocator, history: []const types.HistoryTurn, original_prompt: []const u8) ![]u8 {
+        var out = std_io.StringBuilder.init(allocator);
+        errdefer out.deinit();
+        try out.writer().writeAll("[forked from parent session -- full conversation context below]\n");
+        for (history) |turn| {
+            try out.writer().print("{s}: {s}\n", .{ @tagName(turn.role), turn.content });
+        }
+        try out.writer().writeAll("[end of forked context]\n\n[/forked context -- your new instruction from the parent follows]\n");
+        try out.writer().writeAll(original_prompt);
+        return out.toOwnedSlice();
+    }
+
+    /// `provider/model` pin string for `spawnForkAgent`'s AgentRunConfig.model
+    /// override -- the slash form `applyModelOverride`/the background-thread
+    /// spawn path already understand.
+    fn pinnedForkModel(allocator: std.mem.Allocator, provider: []const u8, model: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ provider, model });
+    }
+
     fn spawnBackgroundAgent(self: *AgentRuntime, config: @import("tools/agent.zig").AgentRunConfig) ![]u8 {
         // swarm-tasks-11: resolve the background agent's working directory from
         // its isolation/cwd before duping the prompt, so a worktree notice can
@@ -6421,6 +6520,105 @@ test "background agent task field parser extracts task id" {
         "status=pending\n";
     try testing.expectEqualStrings("task-123", AgentRuntime.extractTaskField(text, "id").?);
     try testing.expect(AgentRuntime.extractTaskField(text, "missing") == null);
+}
+
+test "tools-23: fork seeds the child's prompt with the parent's full transcript" {
+    const alloc = testing.allocator;
+    const history = [_]types.HistoryTurn{
+        .{ .role = .user, .content = "investigate the auth bug", .timestamp = 0 },
+        .{ .role = .assistant, .content = "found it in login.zig:42", .timestamp = 0 },
+    };
+    const seeded = try AgentRuntime.buildForkSeededPrompt(alloc, &history, "now fix it");
+    defer alloc.free(seeded);
+
+    // Every prior turn is visible to the fork, in order, with its role.
+    const user_idx = std.mem.indexOf(u8, seeded, "user: investigate the auth bug").?;
+    const assistant_idx = std.mem.indexOf(u8, seeded, "assistant: found it in login.zig:42").?;
+    try testing.expect(user_idx < assistant_idx);
+    // The parent's new instruction is appended after the forked context.
+    const prompt_idx = std.mem.indexOf(u8, seeded, "now fix it").?;
+    try testing.expect(assistant_idx < prompt_idx);
+}
+
+test "tools-23: fork pins to the caller's own provider/model" {
+    const alloc = testing.allocator;
+    const pinned = try AgentRuntime.pinnedForkModel(alloc, "anthropic", "claude-opus-4-6");
+    defer alloc.free(pinned);
+    try testing.expectEqualStrings("anthropic/claude-opus-4-6", pinned);
+}
+
+test "tools-23: AgentRun subagent_type=fork always spawns in background even when run_in_background is unset" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit(); // joins the background thread this test spawns before tearing down
+
+    // Pin the parent onto the network-free mock provider so the spawned
+    // fork's real handlePrompt round-trip in its background thread cannot
+    // reach out to a real model API during `zig build test`.
+    try h.runtime.applyModelOverride("mock/mock-agent");
+    try testing.expectEqualStrings("mock", h.runtime.active_provider);
+
+    const config = @import("tools/agent.zig").AgentRunConfig{
+        .prompt = "continue the investigation",
+        .agent = "fork",
+        // A model override alongside subagent_type="fork" must be ignored --
+        // reference: "always runs on your model -- a model override is
+        // ignored". If this leaked through, the child would try to talk to
+        // a real (non-mock) provider/model and the background thread would
+        // report failure instead of a clean spawn.
+        .model = "anthropic/claude-not-a-real-model",
+        .run_in_background = false,
+    };
+
+    const result = try AgentRuntime.spawnChildAgent(@ptrCast(&h.runtime), config);
+    defer alloc.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "background_agent_id=") != null);
+}
+
+test "headless-sdk-missed-184: thinkingForFinalText recovers the real reasoning_text behind the final answer" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    try h.runtime.appendHistoryTurnWithThinking(.assistant, "42 is the answer", "the user asked for the answer; I recalled it directly");
+
+    // Matches the turn that produced it -> the exact reasoning_text comes back.
+    {
+        const got = h.runtime.thinkingForFinalText("42 is the answer");
+        try testing.expect(got != null);
+        defer alloc.free(got.?);
+        try testing.expectEqualStrings("the user asked for the answer; I recalled it directly", got.?);
+    }
+
+    // A later synthetic message ("Interrupted by user.") that never went
+    // through appendHistoryTurnWithThinking must NOT borrow the previous
+    // round's thinking block -- no match, no fabrication.
+    {
+        const got = h.runtime.thinkingForFinalText("Interrupted by user.");
+        try testing.expect(got == null);
+    }
+
+    // A turn appended with no thinking (the common case: extended thinking
+    // off, or cfg.ui_thinking_summary disabled) yields no block either.
+    try h.runtime.appendHistoryTurn(.assistant, "a plain answer with no thinking");
+    {
+        const got = h.runtime.thinkingForFinalText("a plain answer with no thinking");
+        try testing.expect(got == null);
+    }
 }
 
 test "denialOutcomeFor maps trace outcomes to denial tracking actions" {

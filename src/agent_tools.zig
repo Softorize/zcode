@@ -197,6 +197,21 @@ pub fn canonicalToolNameForArgs(name: []const u8, args: []const u8) []const u8 {
         if (hasAnyArg(args, &.{ "path", "file_path" })) return "Edit";
     }
 
+    // tools-01: the reference's LEGACY_TOOL_NAME_ALIASES table maps the
+    // deprecated model-facing name "Task" onto the Agent/subagent-launcher
+    // tool, NOT onto zcode's own unrelated "Task" CRUD tool (create/get/
+    // update/list/stop/output/run/poll/claim task tracking). Per package
+    // notes (do not rename zcode's CRUD Task tool -- too disruptive, and no
+    // live permission-rule bug depends on it, see tools-01 corrected_change):
+    // a "Task" call is routed to Agent only when its arguments are
+    // Agent-shaped (carries `prompt`, `subagent_type`, or `description`, none
+    // of which the CRUD tool's own schema declares); a plain CRUD-shaped call
+    // (action=create/get/update/..., or the legacy `id`/`title` fields)
+    // keeps going to the CRUD handler exactly as before.
+    if (matchesToolName(name, &.{ "Task", "task" })) {
+        if (hasAnyArg(args, &.{ "prompt", "subagent_type", "description" })) return "Agent";
+    }
+
     return name;
 }
 
@@ -4649,6 +4664,21 @@ test "tool name canonicalization repairs common model aliases" {
     try testing.expectEqualStrings("TaskUpdate", canonicalToolNameForArgs("Update", "id=task-1,status=completed"));
     try testing.expectEqualStrings("Edit", canonicalToolNameForArgs("Update", "path=src/main.zig,old_string=a,new_string=b"));
     try testing.expectEqualStrings("Write", canonicalToolNameForArgs("Update", "path=README.md,content=body"));
+}
+
+test "tools-01: a Task call with Agent-shaped args routes to Agent, a CRUD-shaped call does not" {
+    // Reference-exact behavior: "Task" is the deprecated legacy alias FOR
+    // the Agent/subagent-launcher tool. zcode also has an unrelated
+    // pre-existing "Task" CRUD tool (create/get/update/list/stop/output/
+    // run/poll/claim) that the package notes say NOT to rename. Instead the
+    // args shape decides where a "Task" call goes.
+    try testing.expectEqualStrings("Agent", canonicalToolNameForArgs("Task", "prompt=investigate the auth bug,subagent_type=explore"));
+    try testing.expectEqualStrings("Agent", canonicalToolNameForArgs("task", "prompt=do the thing"));
+    try testing.expectEqualStrings("Agent", canonicalToolNameForArgs("Task", "prompt=do it,description=short label"));
+    // A plain CRUD-shaped call (the tool's own advertised fields) is left
+    // alone and still reaches the CRUD handler.
+    try testing.expectEqualStrings("Task", canonicalToolNameForArgs("Task", "action=create,title=Fix bug,summary=details"));
+    try testing.expectEqualStrings("Task", canonicalToolNameForArgs("Task", "action=list"));
 }
 
 test "concrete action tool classification recognizes edit write and execution tools" {

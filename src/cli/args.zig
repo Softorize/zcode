@@ -297,6 +297,23 @@ pub const CliOptions = struct {
     /// SDKUserMessage as a `user` NDJSON line on stdout for ack. Only honored
     /// under the headless gate and with `--output-format stream-json`.
     replay_user_messages: bool = false,
+    /// headless-sdk-14: `--forward-subagent-text` forwards a subagent's own
+    /// (real, not fabricated) prompt and final text as extra `user`/
+    /// `assistant` NDJSON lines with `parent_tool_use_id` set to the
+    /// spawning Agent tool_use id, instead of only the collapsed
+    /// tool_result summary. Only valid with `--print` and `--output-format
+    /// stream-json` -- validated in sdk/output.zig's
+    /// validateForwardSubagentTextGate, matching the reference's own gate.
+    forward_subagent_text: bool = false,
+    /// headless-sdk-missed-185: `--enable-auth-status` (hidden -- the
+    /// reference declares it `.hideHelp()`, so it is intentionally omitted
+    /// from printUsage below). Enables `auth_status` SDK messages in SDK
+    /// mode; the message serializer (sdk/output.serializeAuthStatus) is
+    /// wired, but no call site inside `zcode login`/`zcode mcp auth login`
+    /// emits stream-json today -- parsing the flag is the honest, scoped
+    /// slice this package owns (the login-flow emission point belongs to
+    /// whichever package owns those command handlers).
+    enable_auth_status: bool = false,
     no_color: bool = false,
     no_fullscreen: bool = false,
     no_spinner: bool = false,
@@ -879,6 +896,18 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
                 // Bool flag; implies the headless gate.
                 options.replay_user_messages = true;
                 options.headless = true;
+            } else if (std.mem.eql(u8, arg, "--forward-subagent-text")) {
+                // headless-sdk-14: bool flag; implies the headless gate. The
+                // --print/--output-format=stream-json requirement is
+                // validated once the full argv is parsed (main.zig calls
+                // sdk_output.validateForwardSubagentTextGate), matching how
+                // stream-json's own --verbose requirement is enforced.
+                options.forward_subagent_text = true;
+                options.headless = true;
+            } else if (std.mem.eql(u8, arg, "--enable-auth-status")) {
+                // headless-sdk-missed-185: hidden flag, deliberately not in
+                // printUsage (reference: `.hideHelp()`).
+                options.enable_auth_status = true;
             } else if (std.mem.eql(u8, arg, "--no-color")) {
                 options.no_color = true;
             } else if (std.mem.eql(u8, arg, "--no-fullscreen")) {
@@ -2768,6 +2797,7 @@ pub fn printUsage(writer: anytype) !void {
         \\      --include-partial-messages  Emit per-chunk stream_event messages (stream-json; headless)
         \\      --include-hook-events       Emit hook-lifecycle system events (stream-json; headless)
         \\      --replay-user-messages      Re-emit accepted user messages on stdout (stream-json; headless)
+        \\      --forward-subagent-text     Forward subagent text and thinking blocks as assistant/user messages with parent_tool_use_id set (only works with --print and --output-format=stream-json)
         \\  -V, --version                   Print version and exit
         \\      --no-color                  Disable ANSI colors (also honors the NO_COLOR env var)
         \\      --no-fullscreen
@@ -3686,6 +3716,30 @@ test "sdk-headless-12: --replay-user-messages sets the flag and headless gate" {
 
     try testing.expect(opts.replay_user_messages);
     try testing.expect(opts.headless);
+}
+
+test "headless-sdk-14: --forward-subagent-text sets the flag and headless gate" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--print", "--output-format", "stream-json", "--forward-subagent-text", "hi" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+
+    try testing.expect(opts.forward_subagent_text);
+    try testing.expect(opts.headless);
+}
+
+test "headless-sdk-missed-185: --enable-auth-status parses and stays out of --help" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--print", "--enable-auth-status", "hi" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+
+    try testing.expect(opts.enable_auth_status);
+
+    var buf = std_io.StringBuilder.init(allocator);
+    defer buf.deinit();
+    try printUsage(buf.writer());
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "--enable-auth-status") == null);
 }
 
 test "sdk-headless-12: the three flags compose in one invocation" {
