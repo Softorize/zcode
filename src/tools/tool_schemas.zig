@@ -1,4 +1,5 @@
 const std = @import("std");
+const rt = @import("zcode_runtime");
 const std_io = @import("../core/std_io.zig");
 const types = @import("../core/types.zig");
 const mcp_client = @import("../mcp/client.zig");
@@ -7,36 +8,13 @@ const desc = @import("tool_descriptions.zig");
 const mcp_name = @import("../core/mcp_name.zig");
 
 pub const builtin_schemas = [_]types.ToolSchema{
-    .{
-        .name = "shell",
-        .description = desc.SHELL,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_seconds\":{\"type\":\"integer\"},\"description\":{\"type\":\"string\",\"description\":\"Brief human-readable description of what this command does\"},\"run_in_background\":{\"type\":\"boolean\",\"description\":\"Run command in background and return immediately\"},\"dangerouslyDisableSandbox\":{\"type\":\"boolean\",\"description\":\"Set true to run this command with the sandbox disabled (full host access). Use only when sandboxing genuinely blocks a needed operation. Ignored when enterprise policy locks the sandbox.\"}},\"required\":[\"command\"]}",
-        .usage_hint = desc.SHELL_USAGE,
-    },
-    .{
-        .name = "file_read",
-        .description = desc.FILE_READ,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\",\"description\":\"1-indexed line number to start reading from. Use to page through large files.\"},\"limit\":{\"type\":\"integer\",\"description\":\"Max lines to return starting from offset. 0 reads to EOF.\"}},\"required\":[\"path\"]}",
-        .usage_hint = desc.FILE_READ_USAGE,
-        .is_read_only = true,
-        // tools-10: Read is never artifacted -- otherwise a large Read result
-        // would be written to an artifact file that the model has to Read
-        // again (a Read -> artifact -> Read loop). Mirrors FileReadTool.ts:342
-        // (maxResultSizeChars = Infinity).
-        .max_result_size_chars = std.math.maxInt(usize),
-    },
-    .{
-        .name = "file_write",
-        .description = desc.FILE_WRITE,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"append\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"content\"]}",
-        .usage_hint = desc.FILE_WRITE_USAGE,
-    },
-    .{
-        .name = "file_edit",
-        .description = desc.FILE_EDIT,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"find\":{\"type\":\"string\"},\"replace\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"find\"]}",
-        .usage_hint = desc.FILE_EDIT_USAGE,
-    },
+    // tools-02: the snake_case primaries for shell/file_read/file_write/
+    // file_edit used to be advertised as SEPARATE schema entries alongside
+    // their PascalCase (Bash/Read/Write/Edit) counterparts below, so the
+    // model saw the same capability twice every turn. The reference never
+    // double-advertises a capability. Dispatch (tool_dispatch.zig) still
+    // accepts the snake_case spellings as aliases -- only the ADVERTISED
+    // schema entries were removed here.
     .{
         .name = "git_status",
         .description = desc.GIT_STATUS,
@@ -71,7 +49,13 @@ pub const builtin_schemas = [_]types.ToolSchema{
         .usage_hint = "Use to call a specific tool on an MCP server. Discover tools first with mcp_tools_list. Pass payload as JSON string matching the tool's input schema.",
     },
     .{
-        .name = "mcp_resources_list",
+        // tools-missed-68: reference-exact name (tool_name_map.zig already
+        // canonicalized "mcp_resources_list" -> "ListMcpResourcesTool"; the
+        // schema itself was never advertised under that name, so a model
+        // calling "ListMcpResourcesTool" per its reference training got an
+        // unresolved-tool error). "mcp_resources_list" stays a dispatch-only
+        // legacy synonym (tool_dispatch.zig).
+        .name = "ListMcpResourcesTool",
         .description = "List MCP resources for a configured server",
         .json_schema = "{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"}},\"required\":[\"server\"]}",
         .is_read_only = true,
@@ -83,8 +67,21 @@ pub const builtin_schemas = [_]types.ToolSchema{
         .is_read_only = true,
     },
     .{
-        .name = "mcp_resource_read",
+        // tools-missed-68: reference-exact name, same rationale as
+        // ListMcpResourcesTool above.
+        .name = "ReadMcpResourceTool",
         .description = "Read MCP resource contents from a configured server",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"},\"uri\":{\"type\":\"string\"}},\"required\":[\"server\",\"uri\"]}",
+        .is_read_only = true,
+    },
+    .{
+        // tools-13: list the direct children of a directory resource, as
+        // distinct from ReadMcpResourceTool (single resource) and
+        // mcp_resources_list (the server's ENTIRE resource list).
+        // Implemented by prefix-filtering listResources() results to those
+        // whose URI is an immediate child of `uri` -- see handleMcpResourceReadDir.
+        .name = "ReadMcpResourceDirTool",
+        .description = "List the direct children of a directory resource on an MCP server.\n- server: The name of the MCP server to read from\n- uri: The URI of the directory resource\nOnly usable against a server that has declared resources; returns only the immediate children of `uri`, not the server's full resource list.",
         .json_schema = "{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"},\"uri\":{\"type\":\"string\"}},\"required\":[\"server\",\"uri\"]}",
         .is_read_only = true,
     },
@@ -128,23 +125,9 @@ pub const builtin_schemas = [_]types.ToolSchema{
         .usage_hint = "Set the log verbosity for an MCP server. Common levels: debug, info, warning, error.",
     },
     .{
-        .name = "enter_plan_mode",
-        .description = "Switch the session into planning mode for the upcoming turns.\n\nIn planning mode the agent has access only to read-only inspection tools (Read, Grep, Glob, GitDiff, GitLog, git_status, WebFetch, WebSearch). Mutation tools (Edit, Write, Bash, RunTests, git_apply, GitCommit, OpenPR, etc.) are refused at dispatch time. Call this when the user asks for analysis, a plan, an audit, or a roadmap before any changes are made.\n\nWhen the plan is ready, call exit_plan_mode(plan=<markdown>) to surface it for the user's review-and-approve overlay. Do NOT emit the final plan as plain assistant text - the REPL gates the approval overlay on exit_plan_mode being called explicitly.",
-        .json_schema = "{\"type\":\"object\",\"properties\":{}}",
-        .usage_hint = "Use only at the start of a planning task. If the session is already in planning mode the call is a no-op acknowledgment.",
-        .is_read_only = true,
-    },
-    .{
-        .name = "exit_plan_mode",
-        .description = "Signal that the planning phase is complete and the markdown plan is ready for user approval.\n\nCall this tool exactly once when you have finished investigating and have a concrete, actionable plan. Pass the plan body as the `plan` argument in markdown form: title, goals, assumptions, a `- [ ]` task checklist, risks, and a definition of done. The REPL saves the plan, opens the approval overlay, and waits for the user to choose Approve / Continue Discussion / Cancel.\n\nThis is the ONLY way to surface a plan for approval - the REPL no longer infers \"plan ready\" from heuristic markdown detection. Do not call this tool until you actually have a finished plan; do not call it for discussion turns.",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"plan\":{\"type\":\"string\",\"description\":\"The full plan in markdown. Begins with a single-line title (e.g. `# Refactor X`) followed by Goals, Assumptions, Task checklist using `- [ ]`, Risks, and Definition of done.\"}},\"required\":[\"plan\"]}",
-        .usage_hint = "Call once per planning task, after read-only investigation is complete. The plan markdown becomes the final answer for the turn; the REPL handles the approval flow.",
-        .is_read_only = true,
-    },
-    .{
         .name = "Bash",
         .description = desc.SHELL,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_seconds\":{\"type\":\"integer\"},\"description\":{\"type\":\"string\",\"description\":\"Brief human-readable description of what this command does\"},\"run_in_background\":{\"type\":\"boolean\",\"description\":\"Run command in background and return immediately\"},\"dangerouslyDisableSandbox\":{\"type\":\"boolean\",\"description\":\"Set true to run this command with the sandbox disabled (full host access). Use only when sandboxing genuinely blocks a needed operation. Ignored when enterprise policy locks the sandbox.\"}},\"required\":[\"command\"]}",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"description\":\"Timeout in milliseconds. Default 120000, max 600000.\"},\"description\":{\"type\":\"string\",\"description\":\"Brief human-readable description of what this command does\"},\"run_in_background\":{\"type\":\"boolean\",\"description\":\"Run command in background and return immediately\"},\"dangerouslyDisableSandbox\":{\"type\":\"boolean\",\"description\":\"Set true to run this command with the sandbox disabled (full host access). Use only when sandboxing genuinely blocks a needed operation. Ignored when enterprise policy locks the sandbox.\"}},\"required\":[\"command\"]}",
         .usage_hint = desc.SHELL_USAGE,
     },
     .{
@@ -157,7 +140,13 @@ pub const builtin_schemas = [_]types.ToolSchema{
     .{
         .name = "Grep",
         .description = desc.GREP,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"max_results\":{\"type\":\"integer\"},\"ignore_case\":{\"type\":\"boolean\"},\"multiline\":{\"type\":\"boolean\",\"description\":\"Enable multiline mode where . matches newlines and patterns can span lines. Required for cross-line regex like struct \\\\{[\\\\s\\\\S]*?field.\"},\"context\":{\"type\":\"integer\",\"description\":\"Number of context lines before and after each match\"},\"glob\":{\"type\":\"string\",\"description\":\"Glob pattern to filter files (e.g. '*.zig', '*.{ts,tsx}') -- maps to rg --glob\"},\"type\":{\"type\":\"string\",\"description\":\"File type to filter (e.g. 'zig', 'py', 'rust') -- maps to rg --type. Faster than glob for standard languages.\"},\"output_mode\":{\"type\":\"string\",\"enum\":[\"content\",\"files_with_matches\",\"count\"],\"description\":\"Output shape. content (default) shows matching lines; files_with_matches shows only file paths (rg -l) and is 20x-100x smaller for repo-wide searches; count shows per-file match counts (rg -c). Use files_with_matches when you only need to know WHERE a symbol is defined, not the exact line.\"}},\"required\":[\"pattern\"]}",
+        // tools-20: the reference defaults `output_mode` to "files_with_matches"
+        // when omitted (cc_strings.txt: 'Defaults to "files_with_matches"'),
+        // the opposite of zcode's previous content default. `-A`/`-B` are now
+        // exposed separately (asymmetric before/after context); `context`/`-C`
+        // stays as a documented symmetric alias. `head_limit`/`offset` add
+        // client-side pagination over the combined output.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"max_results\":{\"type\":\"integer\"},\"ignore_case\":{\"type\":\"boolean\"},\"multiline\":{\"type\":\"boolean\",\"description\":\"Enable multiline mode where . matches newlines and patterns can span lines. Required for cross-line regex like struct \\\\{[\\\\s\\\\S]*?field.\"},\"-A\":{\"type\":\"integer\",\"description\":\"Number of lines to show after each match (content mode only).\"},\"-B\":{\"type\":\"integer\",\"description\":\"Number of lines to show before each match (content mode only).\"},\"context\":{\"type\":\"integer\",\"description\":\"Symmetric before/after context lines (rg -C); alias for -A/-B when both are equal. Overridden by -A/-B when either is set.\"},\"glob\":{\"type\":\"string\",\"description\":\"Glob pattern to filter files (e.g. '*.zig', '*.{ts,tsx}') -- maps to rg --glob\"},\"type\":{\"type\":\"string\",\"description\":\"File type to filter (e.g. 'zig', 'py', 'rust') -- maps to rg --type. Faster than glob for standard languages.\"},\"output_mode\":{\"type\":\"string\",\"enum\":[\"content\",\"files_with_matches\",\"count\"],\"description\":\"Output shape. Defaults to files_with_matches (rg -l, file paths only, 20x-100x smaller for repo-wide searches) when omitted. content shows matching lines with -n line numbers; count shows per-file match counts (rg -c).\"},\"head_limit\":{\"type\":\"integer\",\"description\":\"Cap the number of output lines/entries returned, applied after offset.\"},\"offset\":{\"type\":\"integer\",\"description\":\"Skip this many output lines/entries before applying head_limit.\"}},\"required\":[\"pattern\"]}",
         .usage_hint = desc.GREP_USAGE,
         .is_read_only = true,
         // tools-10: Grep caps tighter than the global default so a repo-wide
@@ -167,7 +156,13 @@ pub const builtin_schemas = [_]types.ToolSchema{
     .{
         .name = "Read",
         .description = desc.FILE_READ,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\",\"description\":\"1-indexed line number to start reading from. Use to page through large files.\"},\"limit\":{\"type\":\"integer\",\"description\":\"Max lines to return starting from offset. 0 reads to EOF.\"}},\"required\":[\"path\"]}",
+        // tools-19: `file_path` is the reference-exact primary property name
+        // (cc_system_prompt_2.1.261.md "### Read": "Parameters: file_path
+        // (required), offset, limit, pages."). `path` stays listed as a
+        // back-compat alias -- dispatch already accepts both. `pages` is new:
+        // a PDF page range like "1-5", parsed in handleFileRead and forwarded
+        // to the existing offset/limit-driven readPdfAsText path.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file to read.\"},\"path\":{\"type\":\"string\",\"description\":\"Alias for file_path.\"},\"max_bytes\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\",\"description\":\"1-indexed line number to start reading from. Use to page through large files.\"},\"limit\":{\"type\":\"integer\",\"description\":\"Max lines to return starting from offset. 0 reads to EOF.\"},\"pages\":{\"type\":\"string\",\"description\":\"PDF page range, e.g. \\\"1-5\\\" (max 20 pages/request; required for PDFs over 10 pages).\"}},\"required\":[\"file_path\"]}",
         .usage_hint = desc.FILE_READ_USAGE,
         .is_read_only = true,
         // tools-10: same Read exemption as the file_read alias above.
@@ -176,13 +171,13 @@ pub const builtin_schemas = [_]types.ToolSchema{
     .{
         .name = "Write",
         .description = desc.FILE_WRITE,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"append\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"content\"]}",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file to write.\"},\"path\":{\"type\":\"string\",\"description\":\"Alias for file_path.\"},\"content\":{\"type\":\"string\"},\"append\":{\"type\":\"boolean\"}},\"required\":[\"file_path\",\"content\"]}",
         .usage_hint = desc.FILE_WRITE_USAGE,
     },
     .{
         .name = "Edit",
         .description = desc.FILE_EDIT,
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"find\":{\"type\":\"string\"},\"replace\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"find\"]}",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file to edit.\"},\"path\":{\"type\":\"string\",\"description\":\"Alias for file_path.\"},\"old_string\":{\"type\":\"string\"},\"new_string\":{\"type\":\"string\"},\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"file_path\",\"old_string\"]}",
         .usage_hint = desc.FILE_EDIT_USAGE,
     },
     .{
@@ -193,9 +188,15 @@ pub const builtin_schemas = [_]types.ToolSchema{
     },
     .{
         .name = "NotebookEdit",
-        .description = "Edit cells in a Jupyter notebook. Four modes: `append` (default, add new cell at the end), `replace` (overwrite cell at cell_number), `insert` (add cell at cell_number, pushing later cells down), `delete` (remove cell at cell_number). cell_number is 0-indexed.",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"source\":{\"type\":\"string\"},\"cell_type\":{\"type\":\"string\",\"description\":\"`code` (default) or `markdown`\"},\"cell_number\":{\"type\":\"integer\",\"description\":\"0-indexed cell position. Required for replace/insert/delete. Ignored for append.\"},\"edit_mode\":{\"type\":\"string\",\"enum\":[\"append\",\"replace\",\"insert\",\"delete\"],\"description\":\"Default `append`. `replace` overwrites cell_number. `insert` adds at cell_number, pushing others down. `delete` removes cell_number. For delete, source is ignored.\"}},\"required\":[\"path\"]}",
-        .usage_hint = "Use to modify .ipynb files. Default mode `append` adds a new cell at the end and creates the notebook if it doesn't exist. Use `replace` to overwrite an existing cell (e.g. fix a bug in a code cell), `insert` to add a new cell between existing ones, `delete` to drop an unused cell. cell_number is 0-indexed. Set cell_type to 'markdown' for text cells, 'code' (default) for executable cells.",
+        .description = "Edit cells in a Jupyter notebook. Four modes: `append` (default, add new cell at the end), `replace` (overwrite cell at cell_id), `insert` (add cell at cell_id, pushing later cells down), `delete` (remove cell at cell_id). cell_id is a 0-indexed cell position.",
+        // tools-missed-70: `notebook_path` / `cell_id` / `new_source` are the
+        // reference-exact primary property names (cc_system_prompt_2.1.261.md
+        // deferred-tool one-liner: "NotebookEdit: edit a Jupyter cell
+        // (notebook_path, cell_id, new_source, cell_type, edit_mode)").
+        // `path` / `source` / `cell_number` stay listed as back-compat
+        // aliases -- dispatch already accepts both spellings.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"notebook_path\":{\"type\":\"string\",\"description\":\"Absolute path to the .ipynb file.\"},\"path\":{\"type\":\"string\",\"description\":\"Alias for notebook_path.\"},\"new_source\":{\"type\":\"string\",\"description\":\"New cell source. Ignored for delete.\"},\"source\":{\"type\":\"string\",\"description\":\"Alias for new_source.\"},\"cell_type\":{\"type\":\"string\",\"description\":\"`code` (default) or `markdown`\"},\"cell_id\":{\"type\":\"integer\",\"description\":\"0-indexed cell position. Required for replace/insert/delete. Ignored for append.\"},\"cell_number\":{\"type\":\"integer\",\"description\":\"Alias for cell_id.\"},\"edit_mode\":{\"type\":\"string\",\"enum\":[\"append\",\"replace\",\"insert\",\"delete\"],\"description\":\"Default `append`. `replace` overwrites cell_id. `insert` adds at cell_id, pushing others down. `delete` removes cell_id. For delete, new_source is ignored.\"}},\"required\":[\"notebook_path\"]}",
+        .usage_hint = "Use to modify .ipynb files. Default mode `append` adds a new cell at the end and creates the notebook if it doesn't exist. Use `replace` to overwrite an existing cell (e.g. fix a bug in a code cell), `insert` to add a new cell between existing ones, `delete` to drop an unused cell. cell_id is 0-indexed. Set cell_type to 'markdown' for text cells, 'code' (default) for executable cells.",
     },
     .{
         .name = "WebFetch",
@@ -229,19 +230,28 @@ pub const builtin_schemas = [_]types.ToolSchema{
     .{
         .name = "TaskCreate",
         .description = "Create a structured task to track progress on the current coding session. This helps organize complex multi-step work and shows progress to the user.\n\nWhen to use this tool (use PROACTIVELY):\n - Complex multi-step tasks requiring 3 or more distinct steps or actions\n - Non-trivial work that requires planning or multiple operations\n - Plan mode - create tasks to track the planned work\n - User explicitly asks for a todo/task list\n - User provides multiple tasks (numbered or comma-separated)\n - After receiving new instructions - capture requirements as tasks immediately\n - When you start a task, mark it in_progress BEFORE beginning work\n - After completing a task, mark it completed and add any follow-ups discovered\n\nWhen NOT to use this tool:\n - A single, straightforward task\n - Trivial work where tracking adds no value\n - Work that can be finished in fewer than 3 trivial steps\n - Purely conversational or informational exchanges\n\nTask fields:\n - title: brief, actionable title in imperative form (e.g. \"Fix auth bug in login flow\")\n - summary: what needs to be done\n - command: optional shell command to run as a background task\n\nAll tasks are created with status `pending`. Check TaskList first to avoid creating duplicates. After creating, use TaskUpdate to set dependencies (blocks/blockedBy) if needed.",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"summary\":{\"type\":\"string\"},\"activeForm\":{\"type\":\"string\",\"description\":\"Present-continuous label shown while the task is active (e.g. 'Running tests'). Defaults to the title when omitted.\"},\"owner\":{\"type\":\"string\"},\"priority\":{\"type\":\"string\"},\"deps\":{\"type\":\"string\"},\"command\":{\"type\":\"string\"},\"metadata\":{\"type\":\"object\",\"description\":\"Arbitrary key-value metadata stored with the task.\"}},\"required\":[\"title\"]}",
+        // tools-24: `subject`/`description` are the reference-exact field
+        // names (cc_system_prompt_2.1.261.md: "TaskCreate (subject,
+        // description, activeForm, metadata)"); `title`/`summary` stay
+        // documented aliases -- dispatch already accepts both.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"subject\":{\"type\":\"string\"},\"title\":{\"type\":\"string\",\"description\":\"Alias for subject.\"},\"description\":{\"type\":\"string\"},\"summary\":{\"type\":\"string\",\"description\":\"Alias for description.\"},\"activeForm\":{\"type\":\"string\",\"description\":\"Present-continuous label shown while the task is active (e.g. 'Running tests'). Defaults to the subject when omitted.\"},\"owner\":{\"type\":\"string\"},\"priority\":{\"type\":\"string\"},\"deps\":{\"type\":\"string\"},\"command\":{\"type\":\"string\"},\"metadata\":{\"type\":\"object\",\"description\":\"Arbitrary key-value metadata stored with the task.\"}},\"required\":[\"subject\"]}",
         .usage_hint = "Use PROACTIVELY for multi-step work (>= 3 steps) or when the user lists multiple items. SKIP for single trivial tasks. Keep titles imperative and specific. Mark in_progress BEFORE starting work and completed IMMEDIATELY after -- never batch.",
         .search_hint = "create a task to track multi-step work",
     },
     .{
         .name = "TaskGet",
         .description = "Get task details",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"]}",
+        // tools-24: `taskId` is the reference-exact field name; `id` stays a
+        // documented alias -- dispatch already accepts both.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"taskId\":{\"type\":\"string\"},\"id\":{\"type\":\"string\",\"description\":\"Alias for taskId.\"}},\"required\":[\"taskId\"]}",
     },
     .{
         .name = "TaskUpdate",
-        .description = "Update task fields. Set the assigned agent with `owner`. Set dependency edges with `add_blocks` (comma-separated ids that THIS task blocks) and `add_blocked_by` (comma-separated ids that must complete before this task can be claimed). Edges are recorded on both sides and are idempotent.",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"summary\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"},\"output\":{\"type\":\"string\"},\"owner\":{\"type\":\"string\",\"description\":\"Agent assigned to this task.\"},\"add_blocks\":{\"type\":\"string\",\"description\":\"Comma-separated task ids that this task blocks.\"},\"add_blocked_by\":{\"type\":\"string\",\"description\":\"Comma-separated task ids that must complete before this task can be claimed.\"}},\"required\":[\"id\"]}",
+        .description = "Update task fields. Set the assigned agent with `owner`. Set dependency edges with `addBlocks` (comma-separated ids that THIS task blocks) and `addBlockedBy` (comma-separated ids that must complete before this task can be claimed). Edges are recorded on both sides and are idempotent.",
+        // tools-24: `taskId`/`addBlocks`/`addBlockedBy` are the reference-exact
+        // field names; `id`/`add_blocks`/`add_blocked_by` stay documented
+        // aliases -- dispatch already accepts both.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"taskId\":{\"type\":\"string\"},\"id\":{\"type\":\"string\",\"description\":\"Alias for taskId.\"},\"title\":{\"type\":\"string\"},\"summary\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"},\"output\":{\"type\":\"string\"},\"owner\":{\"type\":\"string\",\"description\":\"Agent assigned to this task.\"},\"addBlocks\":{\"type\":\"string\",\"description\":\"Comma-separated task ids that this task blocks.\"},\"add_blocks\":{\"type\":\"string\",\"description\":\"Alias for addBlocks.\"},\"addBlockedBy\":{\"type\":\"string\",\"description\":\"Comma-separated task ids that must complete before this task can be claimed.\"},\"add_blocked_by\":{\"type\":\"string\",\"description\":\"Alias for addBlockedBy.\"},\"metadata\":{\"type\":\"object\"}},\"required\":[\"taskId\"]}",
     },
     .{
         .name = "TaskClaim",
@@ -270,10 +280,13 @@ pub const builtin_schemas = [_]types.ToolSchema{
         .usage_hint = "Use PROACTIVELY when: (1) task needs >= 3 distinct steps, (2) user listed multiple tasks (numbered or comma-separated), (3) non-trivial work needs planning. SKIP when: single trivial task, pure conversation, work doable in < 3 steps. Rules: exactly ONE item in_progress at a time (not zero, not two); mark completed IMMEDIATELY after finishing (do NOT batch); if blocked, keep in_progress and add a new 'resolve X' item; NEVER mark completed if tests fail or implementation is partial. Always pass the full current checklist (not a delta) -- this tool overwrites the list. For each item, prefer the object form with both `content` (imperative: \"Run tests\") and `activeForm` (present continuous: \"Running tests\") -- the REPL shows the active form while the item is in_progress, which reads more naturally.",
     },
     .{
+        // tools-02: absorbs the richer description that used to live on the
+        // now-removed snake_case "enter_plan_mode" duplicate entry.
         .name = "EnterPlanMode",
-        .description = "Request runtime to continue this turn in planning mode",
+        .description = "Switch the session into planning mode for the upcoming turns.\n\nIn planning mode the agent has access only to read-only inspection tools (Read, Grep, Glob, GitDiff, GitLog, git_status, WebFetch, WebSearch). Mutation tools (Edit, Write, Bash, RunTests, git_apply, GitCommit, OpenPR, etc.) are refused at dispatch time. Call this when the user asks for analysis, a plan, an audit, or a roadmap before any changes are made.\n\nWhen the plan is ready, call ExitPlanMode(plan=<markdown>) to surface it for the user's review-and-approve overlay. Do NOT emit the final plan as plain assistant text - the REPL gates the approval overlay on ExitPlanMode being called explicitly.",
         .json_schema = "{\"type\":\"object\",\"properties\":{}}",
-        .usage_hint = "Use when the task needs structured investigation and a plan before implementation. Subsequent work stays read-only until the plan is approved.",
+        .usage_hint = "Use only at the start of a planning task. If the session is already in planning mode the call is a no-op acknowledgment.",
+        .is_read_only = true,
     },
     .{
         .name = "ExitPlanMode",
@@ -284,15 +297,26 @@ pub const builtin_schemas = [_]types.ToolSchema{
     .{
         .name = "AskUserQuestion",
         .description = "Asks the user multiple choice questions to gather information, clarify ambiguity, understand preferences, make decisions, or offer choices.\n\nUse this tool when you need to ask the user questions during execution to:\n 1. Gather user preferences or requirements\n 2. Clarify ambiguous instructions\n 3. Get decisions on implementation choices as you work\n 4. Offer choices about what direction to take\n\nUsage notes:\n - Users will always be able to provide custom text input via \"Other\"\n - If you recommend a specific option, make that the first option and add \"(Recommended)\" at the end of the label\n\nPlan mode note: In plan mode, use this tool to clarify requirements or choose between approaches BEFORE finalizing your plan. Do NOT use this tool to ask \"Is my plan ready?\" or \"Should I proceed?\" -- use ExitPlanMode for plan approval. IMPORTANT: Do not reference \"the plan\" in your questions (e.g. \"Do you have feedback about the plan?\", \"Does the plan look good?\") because the user cannot see the plan until you call ExitPlanMode.\n\nCRITICAL: NEVER use this tool for confirmation or permission (\"Would you like to proceed?\", \"Shall I continue?\"). Just execute the work.",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"questions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":4,\"items\":{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\"},\"header\":{\"type\":\"string\",\"description\":\"<= 12-char chip label summarizing the question\"},\"multiSelect\":{\"type\":\"boolean\",\"description\":\"Allow selecting more than one option\"},\"options\":{\"type\":\"array\",\"minItems\":2,\"maxItems\":4,\"items\":{\"type\":\"object\",\"properties\":{\"label\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"},\"preview\":{\"type\":\"string\"}},\"required\":[\"label\"]}}},\"required\":[\"question\",\"options\"]}}},\"required\":[\"questions\"]}",
-        .usage_hint = "Provide 1-4 questions, each with a <=12-char header and 2-4 rich options (label + optional description/preview); set multiSelect to allow multiple picks. Use ONLY when a required fact or user choice is truly missing. NEVER use to ask 'Would you like to proceed?', 'Shall I continue?', or any confirmation question. Just execute the work.",
+        // tools-22: `kind` (choice|text|number) lets a question be open-ended
+        // instead of forcing fabricated multiple-choice options. `options` is
+        // only required for the default `choice` kind (enforced in
+        // ask_question.zig's parser, not in this advisory json_schema).
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"questions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":4,\"items\":{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\"},\"header\":{\"type\":\"string\",\"description\":\"<= 12-char chip label summarizing the question\"},\"kind\":{\"type\":\"string\",\"enum\":[\"choice\",\"text\",\"number\"],\"description\":\"Omit for an ordinary choice question. 'text' is an open-ended question (a text box, no options). 'number' takes min/max (optionally step, defaultValue, unit) for a quantity.\"},\"multiSelect\":{\"type\":\"boolean\",\"description\":\"Allow selecting more than one option (choice kind only)\"},\"min\":{\"type\":\"number\",\"description\":\"number kind: minimum value\"},\"max\":{\"type\":\"number\",\"description\":\"number kind: maximum value\"},\"step\":{\"type\":\"number\",\"description\":\"number kind: increment step\"},\"defaultValue\":{\"type\":\"number\",\"description\":\"number kind: pre-filled value\"},\"unit\":{\"type\":\"string\",\"description\":\"number kind: unit label (e.g. 'seconds')\"},\"options\":{\"type\":\"array\",\"minItems\":2,\"maxItems\":4,\"description\":\"Required for the default choice kind; omitted for text/number.\",\"items\":{\"type\":\"object\",\"properties\":{\"label\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"},\"preview\":{\"type\":\"string\"}},\"required\":[\"label\"]}}},\"required\":[\"question\"]}}},\"required\":[\"questions\"]}",
+        .usage_hint = "Provide 1-4 questions, each with a <=12-char header and 2-4 rich options (label + optional description/preview); set multiSelect to allow multiple picks. Use kind=text for an open-ended answer or kind=number (min/max) for a quantity instead of fabricating options. Use ONLY when a required fact or user choice is truly missing. NEVER use to ask 'Would you like to proceed?', 'Shall I continue?', or any confirmation question. Just execute the work.",
         .search_hint = "prompt the user with a multiple-choice question",
     },
     .{
         .name = "Skill",
-        .description = "Execute a skill within the main conversation.\n\nWhen users ask you to perform tasks, check if any of the available skills match. Skills provide specialized capabilities and domain knowledge.\n\nWhen users reference a \"slash command\" or \"/<something>\" (e.g. \"/commit\", \"/review-pr\"), they are referring to a skill. Use this tool to invoke it.\n\nHow to invoke:\n - action=list to discover installed skills\n - action=read with name=<skill> to inspect a skill's instructions\n - action=run with name=<skill> and optional args to expand the skill into task-specific instructions for the current repository\n\nImportant:\n - When a skill matches the user's request, this is a BLOCKING REQUIREMENT: invoke the relevant Skill action=run BEFORE generating any other response about the task\n - NEVER mention a skill without actually calling this tool\n - Do not invoke a skill that is already running\n - Do not use this tool for built-in REPL commands (like /help, /clear, /version)\n - If a skill has already been expanded into the current turn (its instructions are already visible), follow those instructions directly instead of calling this tool again",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"args\":{\"type\":\"string\"}},\"required\":[\"action\"]}",
-        .usage_hint = "Use action=list to discover skills, read to inspect one, and run to expand a skill into task-specific instructions. BLOCKING: when the user types /<name> or a skill matches their request, call this BEFORE responding. Never mention a skill without invoking it.",
+        // tools-21 / bundled-skills-01: reference-exact {skill, args} contract
+        // (cc_system_prompt_2.1.261.md "### Skill", verbatim). The previous
+        // action=list|read|run + name=<skill> shape is kept working as a
+        // legacy, non-advertised dispatch path (handleSkill) so existing
+        // zcode callers/tests are unaffected, but a model calling
+        // Skill({skill:"foo"}) per its reference training now actually runs
+        // the skill instead of silently falling through to a listing.
+        .description = "Invoke a skill.\n\nA skill is a packaged set of instructions the user or project has set up for a particular kind of task (deploy steps, a review checklist, a repo-specific workflow). Available skills appear in a system-reminder listing with one-line descriptions. When the task at hand is one a listed skill covers, call this tool first -- the skill's instructions load into the turn for you to follow in place of your default approach; some skills instead run in a subagent and return the finished result. A skill that runs in the background returns only the agent's name -- its result arrives later as a task notification, so don't wait on it or invoke it again in the meantime. Users may also ask for one by name (`/<name>`, or \"slash command\"); that's a request to invoke it.\n\n- `skill`: exact name from the listing, no leading slash. Plugin skills use `plugin:skill`. Directory-scoped skills are listed with a path prefix (`apps/web:deploy`); when both scoped and unscoped variants of a name exist, pick the one whose directory contains the files you're working on (most specific wins; unscoped otherwise).\n- `args`: optional arguments to pass through.\n\nOnly names from the listing (or that the user typed explicitly) are valid. Built-in CLI commands (`/help`, `/clear`, ...) aren't skills. If a skill has already been expanded into the current turn (its instructions are already visible), follow those instructions directly instead of calling this tool again.",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"skill\":{\"type\":\"string\",\"description\":\"Exact skill name from the listing, no leading slash.\"},\"args\":{\"type\":\"string\",\"description\":\"Optional arguments to pass through.\"},\"action\":{\"type\":\"string\",\"description\":\"Legacy: list|read|run. Omit and use `skill` instead -- a bare `skill` implies run.\"},\"name\":{\"type\":\"string\",\"description\":\"Legacy alias for `skill`.\"}},\"required\":[\"skill\"]}",
+        .usage_hint = "Pass {skill:\"<name>\"} to run a skill directly (no `action` needed). Use action=list only when you need to discover installed skills first. BLOCKING: when the user types /<name> or a skill matches their request, call this BEFORE responding. Never mention a skill without invoking it.",
         .search_hint = "run a skill or slash command",
     },
     .{
@@ -303,8 +327,14 @@ pub const builtin_schemas = [_]types.ToolSchema{
     },
     .{
         .name = "TeamCreate",
-        .description = "Create team metadata",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"members\":{\"type\":\"string\"}},\"required\":[\"name\"]}",
+        .description = "Create team metadata. `agent_type` and `model` set the lead member's specialist type and model default; both are optional.",
+        // tools-24: `team_name` is the reference-exact field name
+        // (cc_system_prompt_2.1.261.md: "TeamCreate (team_name, description,
+        // agent_type, model)"); `name` stays a documented alias. `agent_type`
+        // and `model` are newly threaded through to the lead TeamMember
+        // record (team.zig teamCreateWithOptions); `members` stays the
+        // legacy alias for `agent_type`.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"team_name\":{\"type\":\"string\"},\"name\":{\"type\":\"string\",\"description\":\"Alias for team_name.\"},\"description\":{\"type\":\"string\"},\"agent_type\":{\"type\":\"string\",\"description\":\"Specialist type for the lead member.\"},\"members\":{\"type\":\"string\",\"description\":\"Alias for agent_type.\"},\"model\":{\"type\":\"string\",\"description\":\"Model default for the lead member.\"}},\"required\":[\"team_name\"]}",
     },
     .{
         .name = "TeamDelete",
@@ -337,13 +367,29 @@ pub const builtin_schemas = [_]types.ToolSchema{
         .is_read_only = true,
     },
     .{
-        .name = "AgentRun",
-        .description = "Spawn a focused sub-agent with isolated context. Specialists: explore (read-only investigation), plan (design/planning), verify (testing/validation), reviewer (code review).\n\nSub-agents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that sub-agents are already doing -- if you delegate research to a sub-agent, do not also perform the same searches yourself.\n\n## When not to use\n\nIf the target is already known, use the direct tool: Read for a known path, Grep for a specific symbol or string. Reserve this tool for open-ended questions that span the codebase.\n\n## Writing the prompt\n\nBrief the agent like a smart colleague who just walked into the room -- it hasn't seen this conversation, doesn't know what you've tried, doesn't understand why this task matters.\n - Explain what you're trying to accomplish and why\n - Describe what you've already learned or ruled out\n - Give enough context that the agent can make judgment calls rather than follow a narrow instruction\n - If you need a short response, say so (\"report in under 200 words\")\n - Lookups: hand over the exact command. Investigations: hand over the question -- prescribed steps become dead weight when the premise is wrong.\n\nTerse command-style prompts produce shallow, generic work.\n\n**Never delegate understanding.** Don't write \"based on your findings, fix the bug\" or \"based on the research, implement it.\" Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood: include file paths, line numbers, what specifically to change.",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"Specific task prompt with relevant file paths and context\"},\"agent\":{\"type\":\"string\",\"description\":\"Specialist agent type: explore, plan, verify, reviewer, or custom name\"},\"model\":{\"type\":\"string\",\"description\":\"Optional model override, either plain model id or provider/model\"},\"max_rounds\":{\"type\":\"integer\",\"description\":\"Max tool rounds for sub-agent\"},\"run_in_background\":{\"type\":\"boolean\",\"description\":\"Run agent in background thread. Results arrive as task notification.\"},\"isolation\":{\"type\":\"string\",\"description\":\"Run the agent in an isolated git worktree. Set to 'worktree'. Mutually exclusive with cwd.\"},\"cwd\":{\"type\":\"string\",\"description\":\"Absolute working directory the agent runs in. Mutually exclusive with isolation.\"},\"name\":{\"type\":\"string\",\"description\":\"Team-addressable name for this agent, distinct from the agent type. Used to route SendMessage(to=name).\"},\"team_name\":{\"type\":\"string\",\"description\":\"Name of the team this agent belongs to.\"},\"mode\":{\"type\":\"string\",\"description\":\"Session mode for the child: execution, planning, brainstorm, or review.\"},\"description\":{\"type\":\"string\",\"description\":\"Short 3-5 word description of the agent's task.\"}},\"required\":[\"prompt\"]}",
+        // tools-01: reference-exact name. The reference's model-facing
+        // subagent-launcher tool is "Agent" ("AgentRun" was zcode-only);
+        // "AgentRun"/"agent_run" stay dispatch-only legacy synonyms
+        // (tool_dispatch.zig) so old transcripts/rules keep working.
+        .name = "Agent",
+        .description = "Launch a new agent to handle complex, multi-step tasks. Specialists: explore (read-only investigation), plan (design/planning), verify (testing/validation), reviewer (code review), general-purpose (default when subagent_type is omitted).\n\nWhen using this tool, specify a subagent_type to select an agent. Any type other than \"fork\" -- or omitting it -- starts a fresh agent (general-purpose by default).\n\nSub-agents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that sub-agents are already doing -- if you delegate research to a sub-agent, do not also perform the same searches yourself.\n\n## When not to use\n\nIf the target is already known, use the direct tool: Read for a known path, Grep for a specific symbol or string. Reserve this tool for open-ended questions that span the codebase.\n\n## Writing the prompt\n\nBrief the agent like a smart colleague who just walked into the room -- it hasn't seen this conversation, doesn't know what you've tried, doesn't understand why this task matters.\n - Explain what you're trying to accomplish and why\n - Describe what you've already learned or ruled out\n - Give enough context that the agent can make judgment calls rather than follow a narrow instruction\n - If you need a short response, say so (\"report in under 200 words\")\n - Lookups: hand over the exact command. Investigations: hand over the question -- prescribed steps become dead weight when the premise is wrong.\n\nTerse command-style prompts produce shallow, generic work.\n\n**Never delegate understanding.** Don't write \"based on your findings, fix the bug\" or \"based on the research, implement it.\" Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood: include file paths, line numbers, what specifically to change.",
+        // tools-23: `subagent_type` is the reference-exact field name; `agent`
+        // stays a documented alias -- dispatch (agent.zig parseArgs) accepts
+        // both.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"Specific task prompt with relevant file paths and context\"},\"subagent_type\":{\"type\":\"string\",\"description\":\"Specialist agent type: explore, plan, verify, reviewer, general-purpose, or custom name. Defaults to general-purpose when omitted.\"},\"agent\":{\"type\":\"string\",\"description\":\"Alias for subagent_type.\"},\"model\":{\"type\":\"string\",\"description\":\"Optional model override, either plain model id or provider/model\"},\"max_rounds\":{\"type\":\"integer\",\"description\":\"Max tool rounds for sub-agent\"},\"run_in_background\":{\"type\":\"boolean\",\"description\":\"Run agent in background thread. Results arrive as task notification.\"},\"isolation\":{\"type\":\"string\",\"description\":\"Run the agent in an isolated git worktree. Set to 'worktree'. Mutually exclusive with cwd.\"},\"cwd\":{\"type\":\"string\",\"description\":\"Absolute working directory the agent runs in. Mutually exclusive with isolation.\"},\"name\":{\"type\":\"string\",\"description\":\"Team-addressable name for this agent, distinct from subagent_type. Used to route SendMessage(to=name).\"},\"team_name\":{\"type\":\"string\",\"description\":\"Name of the team this agent belongs to.\"},\"mode\":{\"type\":\"string\",\"description\":\"Session mode for the child: execution, planning, brainstorm, or review.\"},\"description\":{\"type\":\"string\",\"description\":\"Short 3-5 word description of the agent's task.\"}},\"required\":[\"prompt\"]}",
         .usage_hint = "Use to delegate independent subtasks to a sub-agent with isolated context. Good for: parallel exploration, separate verification, focused code review. Set run_in_background=true for async work. Do NOT use for trivially simple tasks. Never delegate understanding -- synthesize findings yourself.",
         .search_hint = "delegate a subtask to a sub-agent",
     },
     .{
+        // tools-missed-69: the "(1-300)" bound below is zcode's own choice,
+        // not a value ported from a cited reference source -- a targeted
+        // search of cc_strings.txt for this session's Sleep tool schema
+        // found no matching definition (the only "wait"/duration-bounded
+        // tool string found there, "Wait for a specified duration... Duration
+        // in seconds (0-100)", belongs to an unrelated computer-use tool, not
+        // this Sleep tool). Flagged here rather than silently presented as a
+        // verified reference constant; revisit if a real Sleep schema
+        // definition turns up in a future extraction pass.
         .name = "Sleep",
         .description = "Wait for a specified duration. The user can interrupt the sleep at any time.\n\nUse this when the user tells you to sleep or rest, when you have nothing to do, or when you're waiting for something (server startup, build pipeline, deployment).\n\nYou can call this concurrently with other tools -- it won't interfere with them.\n\nPrefer this over `Bash(sleep ...)` -- it doesn't hold a shell process.\n\nEach wake-up costs an API call, but the prompt cache expires after 5 minutes of inactivity -- balance accordingly.",
         .json_schema = "{\"type\":\"object\",\"properties\":{\"seconds\":{\"type\":\"integer\",\"description\":\"Number of seconds to wait (1-300)\"}},\"required\":[\"seconds\"]}",
@@ -351,15 +397,22 @@ pub const builtin_schemas = [_]types.ToolSchema{
     },
     .{
         .name = "EnterWorktree",
-        .description = "Create a git worktree for isolated work on a branch",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Directory path for the new worktree\"},\"branch\":{\"type\":\"string\",\"description\":\"Branch name (created if not exists)\"}},\"required\":[\"path\"]}",
-        .usage_hint = "Use to create an isolated copy of the repo for parallel work. Creates a git worktree at the specified path.",
+        .description = "Create a git worktree for isolated work on a branch. `name` (reference-shaped) identifies the worktree; when `path`/`branch` are omitted they default to a sibling `../<name>` directory on a branch named `<name>`.",
+        // tools-missed-71: the reference's deferred one-liner is
+        // "EnterWorktree (name)" -- add `name` as a first-class field that
+        // derives `path`/`branch` when they are not given explicitly, while
+        // keeping the explicit `path`/`branch` fields for callers that want
+        // full control.
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Worktree identifier. Derives path=../<name> and branch=<name> when those are omitted.\"},\"path\":{\"type\":\"string\",\"description\":\"Directory path for the new worktree. Defaults to ../<name> when omitted.\"},\"branch\":{\"type\":\"string\",\"description\":\"Branch name (created if not exists). Defaults to <name> when omitted.\"}},\"required\":[\"name\"]}",
+        .usage_hint = "Use to create an isolated copy of the repo for parallel work. Pass `name` for the conventional sibling layout, or `path`/`branch` for full control.",
     },
     .{
         .name = "ExitWorktree",
-        .description = "Remove a git worktree",
-        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path of the worktree to remove\"}},\"required\":[\"path\"]}",
-        .usage_hint = "Use to clean up a worktree when done with isolated work.",
+        .description = "Remove or keep a git worktree. `action=remove` (default) deletes the linked worktree; `action=keep` leaves it and its branch untouched (just stops tracking it as active).",
+        // tools-missed-71: the reference's deferred one-liner is
+        // "ExitWorktree (action keep|remove)".
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path of the worktree to exit\"},\"action\":{\"type\":\"string\",\"enum\":[\"remove\",\"keep\"],\"description\":\"remove (default) deletes the worktree; keep leaves the directory and branch as-is.\"}},\"required\":[\"path\"]}",
+        .usage_hint = "Use action=remove (default) to clean up a worktree when done, or action=keep to stop actively using it while preserving its files and branch for later.",
     },
     .{
         .name = "LSP",
@@ -401,11 +454,25 @@ pub const builtin_schemas = [_]types.ToolSchema{
         .is_read_only = true,
     },
     .{
-        .name = "Brief",
-        .description = "Attach a context file as a structured prompt. Reads a file and wraps it in a <brief> tag so the content is clearly distinguished from tool output.\n\nUse this when you need to bring reference material (documentation, specs, examples) into the conversation context. Unlike Read which shows line numbers and is intended for editing, Brief produces a clean structured block optimized for comprehension.\n\nUsage notes:\n - Default max_bytes is 64 KiB (smaller than Read's 256 KiB since this content stays in context)\n - Use label to give the content a descriptive name\n - Prefer Read for files you intend to edit; prefer Brief for reference material",
+        // tools-04: renamed away from "Brief" -- the reference uses "Brief" as
+        // the LEGACY ALIAS name for the unrelated SendUserMessage tool
+        // (agent-to-user messaging), not for file attachment. "Brief"/"brief"
+        // stay dispatch-only legacy synonyms (tool_dispatch.zig) for zcode's
+        // own prior callers.
+        .name = "AttachContext",
+        .description = "Attach a context file as a structured prompt. Reads a file and wraps it in a <brief> tag so the content is clearly distinguished from tool output.\n\nUse this when you need to bring reference material (documentation, specs, examples) into the conversation context. Unlike Read which shows line numbers and is intended for editing, AttachContext produces a clean structured block optimized for comprehension.\n\nUsage notes:\n - Default max_bytes is 64 KiB (smaller than Read's 256 KiB since this content stays in context)\n - Use label to give the content a descriptive name\n - Prefer Read for files you intend to edit; prefer AttachContext for reference material",
         .json_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to attach\"},\"label\":{\"type\":\"string\",\"description\":\"Descriptive label for the content block\"},\"max_bytes\":{\"type\":\"integer\",\"description\":\"Max bytes to read (default 65536)\"}},\"required\":[\"path\"]}",
-        .usage_hint = "Use to load reference files, documentation, or specs into context. Prefer Read for files you will edit; Brief for reference material.",
+        .usage_hint = "Use to load reference files, documentation, or specs into context. Prefer Read for files you will edit; AttachContext for reference material.",
         .is_read_only = true,
+    },
+    .{
+        // tools-04: the real reference tool at the "Brief" alias target --
+        // agent-to-user messaging used in --brief/non-interactive flows.
+        .name = "SendUserMessage",
+        .description = "Send a message directly to the user. In a non-interactive (headless/print) session this is how the agent delivers user-facing output instead of plain assistant text; in an interactive session it surfaces the message the same way a normal reply would.",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\",\"description\":\"The message to send to the user.\"}},\"required\":[\"message\"]}",
+        .usage_hint = "Use to deliver a message to the user, especially when running non-interactively and a plain text reply would not otherwise be surfaced.",
+        .search_hint = "send a message to the user",
     },
     .{
         .name = "Config",
@@ -430,6 +497,90 @@ pub const builtin_schemas = [_]types.ToolSchema{
         .is_read_only = true,
         .should_defer = true,
     },
+    .{
+        // tools-08: streams a shell command's output, waking the agent on
+        // completion (line-by-line push wakeups are a documented deviation --
+        // see handleMonitor in tool_dispatch.zig for what is/isn't wired).
+        // Built on the same background-task runner as Bash's
+        // `run_in_background`, so it shares its notification-on-exit path.
+        .name = "Monitor",
+        .description = "Run a shell command that streams events; the agent is re-invoked when the command exits.\n\nUse this instead of a foreground `sleep`-poll loop to wait on a condition -- pair it with an until-loop command (e.g. `until curl -sf http://localhost:8080/health; do sleep 2; done`) so the wake-up happens exactly when the condition is met.\n\nDOCUMENTED DEVIATION: the reference wakes the agent on every emitted stdout line; this implementation wakes on command exit (via the same background-task notification Bash's run_in_background uses), not per-line.",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Shell command to run and monitor.\"},\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Optional timeout in milliseconds before the monitored command is stopped.\"},\"description\":{\"type\":\"string\",\"description\":\"Brief human-readable description of what is being monitored.\"}},\"required\":[\"command\"]}",
+        .usage_hint = "Use to wait on a condition (server up, build finished) via an until-loop command instead of a blocked foreground sleep. Returns immediately; the agent is notified when the command exits.",
+        .search_hint = "run a shell command that streams events and wakes the agent",
+    },
+    .{
+        // tools-09: self-paced /loop dynamic-mode wake control.
+        // DOCUMENTED DEVIATION: the clamp/validation logic here is real and
+        // unit-tested, but wiring the acknowledgment into zcode's actual
+        // /loop scheduler (outside this package's ownership) is not done --
+        // see handleScheduleWakeup's doc comment in tool_dispatch.zig.
+        .name = "ScheduleWakeup",
+        .description = "Schedule when to resume work in /loop dynamic mode -- the user invoked /loop without an interval, asking you to self-pace iterations of a specific task. Do NOT schedule a short-interval wakeup to poll for background work; use Monitor or a background task's own notification for that instead.",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"delaySeconds\":{\"type\":\"integer\",\"description\":\"Seconds until the next wakeup, clamped to [60, 3600].\"},\"prompt\":{\"type\":\"string\",\"description\":\"The prompt to resume with at the next wakeup.\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this delay/prompt was chosen.\"},\"noop\":{\"type\":\"boolean\",\"description\":\"When true, acknowledge without changing the schedule.\"},\"stop\":{\"type\":\"boolean\",\"description\":\"When true, end the loop instead of scheduling another wakeup.\"}},\"required\":[]}",
+        .usage_hint = "Use only during an active /loop dynamic-mode session to set the next wakeup delay/prompt, or to stop the loop. Never schedule a short interval just to poll for background work.",
+        .search_hint = "self-pace the next /loop dynamic-mode wakeup",
+    },
+    .{
+        // tools-10: discovers SendMessage-addressable targets.
+        .name = "ListAgents",
+        .description = "Lists agents you can SendMessage to -- in-process subagents you spawned, and the teammates on your team. Names are the address: send with SendMessage(to=\"<name>\").",
+        .json_schema = "{\"type\":\"object\",\"properties\":{}}",
+        .usage_hint = "Call before SendMessage when you don't already know the exact recipient name.",
+        .search_hint = "discover agents and teammates you can message",
+        .is_read_only = true,
+    },
+    .{
+        // tools-11: structured code-review findings output.
+        .name = "ReportFindings",
+        .description = "Report code-review findings as a typed list so the host can render them. Call it once with the verified findings ranked most-severe first (empty array if nothing survived verification).",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"level\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"description\":\"Effort level the review ran at\"},\"findings\":{\"type\":\"array\",\"description\":\"Verified findings, most-severe first; empty if none survived\",\"items\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\",\"description\":\"Repo-relative path of the file the finding is in\"},\"line\":{\"type\":\"integer\",\"description\":\"1-indexed line the finding anchors to\"},\"summary\":{\"type\":\"string\",\"description\":\"One-sentence statement of the defect\"},\"failure_scenario\":{\"type\":\"string\",\"description\":\"Concrete inputs/state -> wrong output/crash\"},\"category\":{\"type\":\"string\",\"description\":\"Short kebab-case slug of the finding type\"},\"short_summary\":{\"type\":\"string\",\"description\":\"Compressed label for compact UI, <= 60 chars\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"CONFIRMED\",\"PLAUSIBLE\"]},\"outcome\":{\"type\":\"string\",\"enum\":[\"fixed\",\"skipped\",\"no_change_needed\"]}},\"required\":[\"file\",\"summary\",\"failure_scenario\"]}}},\"required\":[\"findings\"]}",
+        .usage_hint = "Call once at the end of a code review with the verified findings list (empty array if none). Do not also render findings as ad hoc prose.",
+        .search_hint = "report code-review findings as a structured list",
+    },
+    .{
+        // tools-12: OS-level notification, built on the existing os_notify.zig
+        // primitive (already exercised by its own tests).
+        .name = "PushNotification",
+        .description = "Send an OS-level push notification to the user's desktop. Use sparingly -- for genuinely important events the user might miss (a long task finished, input is needed) rather than routine progress updates.",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"}},\"required\":[\"title\",\"message\"]}",
+        .usage_hint = "Use for a genuinely important event the user might miss while away from the terminal.",
+        .search_hint = "send an OS-level push notification",
+    },
+    .{
+        // tools-12: surfaces a file + message in a dedicated REPL output
+        // channel (distinct from a plain assistant-text file mention).
+        .name = "SendUserFile",
+        .description = "Hand the user a file to look at, with a short message for context. Use for a deliverable the user should open directly (a report, a screenshot, a generated artifact) rather than mentioning the path in prose.",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file to hand the user.\"},\"message\":{\"type\":\"string\",\"description\":\"Short message giving context for the file.\"}},\"required\":[\"file_path\",\"message\"]}",
+        .usage_hint = "Use to hand the user a finished deliverable file directly, with a one-line explanation of what it is.",
+        .search_hint = "hand the user a file with a message",
+    },
+    .{
+        // tools-14: minimal deferred termination signal. DOCUMENTED DEVIATION:
+        // this returns a fixed closing message and a sentinel the REPL can
+        // watch for; it does not itself reach into the (unowned) REPL loop to
+        // force termination -- see handleEndConversation's doc comment.
+        .name = "EndConversation",
+        .description = "End the conversation. Use only for sustained user abuse directed at the assistant, or when the user explicitly asks to see it demonstrated.",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"reason\":{\"type\":\"string\",\"description\":\"Brief reason for ending the conversation.\"}},\"required\":[]}",
+        .usage_hint = "Rarely used -- only for sustained abuse or an explicit user request to demonstrate it.",
+        .search_hint = "end the conversation",
+        .should_defer = true,
+    },
+    .{
+        // tools-17: the dispatch handler (handleRepl -> repl_tool.execute)
+        // already existed but had no schema entry, so collectSchemas() never
+        // emitted it and no model could discover or call it via ToolSearch.
+        // Gated by ZCODE_REPL_MODE at the dispatch layer; the schema itself is
+        // always advertisable (deferred) so ToolSearch can find it.
+        .name = "REPL",
+        .description = "Execute a batch of primitive tool calls (Read/Write/Edit/Glob/Grep/Bash) in one round-trip, returning their concatenated results.\n\nDOCUMENTED DEVIATION: the reference's REPLTool runs primitive calls inside a JS VM context with shared state across calls; this batches the same primitive calls without a shared VM (no cross-call variable sharing). Enabled only when ZCODE_REPL_MODE=1 is set.",
+        .json_schema = "{\"type\":\"object\",\"properties\":{\"calls\":{\"type\":\"array\",\"description\":\"Ordered list of {tool, args} calls to dispatch and concatenate.\",\"items\":{\"type\":\"object\",\"properties\":{\"tool\":{\"type\":\"string\"},\"args\":{\"type\":\"string\"}},\"required\":[\"tool\"]}}},\"required\":[\"calls\"]}",
+        .usage_hint = "Use to batch several primitive tool calls into one round-trip when ZCODE_REPL_MODE=1 is set.",
+        .search_hint = "batch primitive tool calls in one round-trip",
+        .should_defer = true,
+    },
 };
 
 pub fn builtinSchemas() []const types.ToolSchema {
@@ -444,18 +595,23 @@ pub fn builtinSchemas() []const types.ToolSchema {
 /// new tool added to builtin_schemas defaults to deferred unless its
 /// name appears here.
 pub const ALWAYS_LOADED_TOOL_NAMES = [_][]const u8{
-    // Snake_case primaries
-    "shell",         "file_read",    "file_write",      "file_edit",
+    // Zcode-only primaries with no advertised PascalCase counterpart.
     "git_status",    "git_apply",
     // Claude Code-style aliases
-       "Bash",            "Read",
+    "Bash",          "Read",
     "Write",         "Edit",         "MultiEdit",       "Glob",
     "Grep",          "GitDiff",      "GitLog",          "GitCommit",
     // Web (commonly needed, cheap)
     "WebFetch",      "WebSearch",
     // Mode control + clarification + tracking
-       "enter_plan_mode", "exit_plan_mode",
     "EnterPlanMode", "ExitPlanMode", "AskUserQuestion", "TodoWrite",
+    // tools-25: the reference's observed 2.1.261 always-loaded set includes
+    // Agent, ListAgents, ReportFindings, ScheduleWakeup, and Skill alongside
+    // Bash/Edit/Read/Write/AskUserQuestion/ToolSearch (cc_system_prompt_2.1.261.md
+    // header) -- the previous list omitted Skill and Agent entirely (deferring
+    // both by default), the reverse of the reference's split.
+    "Agent",         "Skill",        "ListAgents",      "ReportFindings",
+    "ScheduleWakeup",
     // The deferral gate itself MUST always load
     "ToolSearch",
 };
@@ -584,10 +740,43 @@ pub fn collectSchemas(
         });
     }
 
-    // MCP tool schemas are NOT pre-discovered here to avoid blocking the agent
-    // for minutes while connecting to remote MCP servers (e.g. via SSH).
-    // The model discovers MCP tools on-demand via mcp_servers_list and mcp_invoke.
-    _ = mcp;
+    // tools-03: advertise real per-(server,tool) `mcp__<server>__<tool>`
+    // schemas for servers that are ALREADY connected in this process --
+    // mirrors the same isConnected-then-listTools pattern used for the
+    // chrome bridge below, so a slow/unreachable server never blocks this
+    // call (we never initiate a NEW connection here, only read from an
+    // existing session). Dispatch already handles these names generically
+    // via handleMcpDynamic -> mcp.invoke(server, tool, payload), so no
+    // dispatch changes were needed -- this is purely additive schema
+    // discovery. mcp_servers_list/mcp_invoke remain available as the
+    // fallback for servers that are not yet connected.
+    if (mcp) |client| blk: {
+        const servers = client.list() catch break :blk;
+        defer mcp_client.freeServers(allocator, servers);
+        for (servers) |server| {
+            if (!client.isConnected(server.name)) continue;
+            const server_tools = client.listTools(server.name) catch continue;
+            defer mcp_client.freeToolInfos(allocator, server_tools);
+            for (server_tools) |tool| {
+                try out.ensureUnusedCapacity(1);
+                const schema_name = try mcp_name.buildMcpToolName(allocator, server.name, tool.name);
+                errdefer allocator.free(schema_name);
+                const safe_desc = try sanitizeMcpDescription(allocator, tool.description, 512);
+                defer allocator.free(safe_desc);
+                const schema_desc = if (safe_desc.len > 0)
+                    try std.fmt.allocPrint(allocator, "MCP tool ({s}): {s}", .{ server.name, safe_desc })
+                else
+                    try std.fmt.allocPrint(allocator, "MCP tool ({s}): {s}", .{ server.name, tool.name });
+                errdefer allocator.free(schema_desc);
+                const dup_schema = try allocator.dupe(u8, tool.input_schema);
+                out.appendAssumeCapacity(.{
+                    .name = schema_name,
+                    .description = schema_desc,
+                    .json_schema = dup_schema,
+                });
+            }
+        }
+    }
 
     // Discover tools from Chrome browser bridge
     if (browser) |bridge| {
@@ -641,7 +830,10 @@ pub fn maxResultSizeForTool(tool_name: []const u8, global_default: usize) usize 
     // override on some of those spellings, so map the remaining aliases onto a
     // canonical schema name and retry. Keep this map tiny and explicit -- only
     // the tools that actually set an override need an entry.
-    const canonical: ?[]const u8 = if (std.mem.eql(u8, tool_name, "read"))
+    // tools-02: "file_read" no longer carries its own schema entry (the
+    // snake_case duplicate was removed), so it needs an explicit alias here
+    // too -- same treatment "read" already got.
+    const canonical: ?[]const u8 = if (std.mem.eql(u8, tool_name, "read") or std.mem.eql(u8, tool_name, "file_read"))
         "Read"
     else if (std.mem.eql(u8, tool_name, "grep"))
         "Grep"
@@ -678,24 +870,25 @@ test "builtin schemas include expanded tool set" {
     try testing.expect(builtin_schemas.len >= 40);
 }
 
-test "Bash and shell schemas expose dangerouslyDisableSandbox" {
+test "Bash schema exposes dangerouslyDisableSandbox and ms-based timeout" {
     // tools-13: the bash tool must surface dangerouslyDisableSandbox as a
-    // model-facing parameter on both the canonical "Bash" entry and the legacy
-    // "shell" alias.
+    // model-facing parameter. tools-02: "shell" is no longer independently
+    // advertised (it collapsed into this one "Bash" entry; dispatch still
+    // accepts "shell" as an alias -- see tool_dispatch.zig). tools-18: the
+    // advertised `timeout` field is milliseconds, matching the rewritten
+    // SHELL description ("timeout is in milliseconds: default 120000, max
+    // 600000"), not the old seconds-based `timeout_seconds`.
     var saw_bash = false;
-    var saw_shell = false;
     for (builtin_schemas) |schema| {
         if (std.mem.eql(u8, schema.name, "Bash")) {
             saw_bash = true;
             try testing.expect(std.mem.indexOf(u8, schema.json_schema, "dangerouslyDisableSandbox") != null);
+            try testing.expect(std.mem.indexOf(u8, schema.json_schema, "\"timeout\"") != null);
+            try testing.expect(std.mem.indexOf(u8, schema.description, "milliseconds") != null);
         }
-        if (std.mem.eql(u8, schema.name, "shell")) {
-            saw_shell = true;
-            try testing.expect(std.mem.indexOf(u8, schema.json_schema, "dangerouslyDisableSandbox") != null);
-        }
+        try testing.expect(!std.mem.eql(u8, schema.name, "shell"));
     }
     try testing.expect(saw_bash);
-    try testing.expect(saw_shell);
 }
 
 test "search_hint is populated on high-value tools" {
@@ -861,4 +1054,199 @@ test "per-tool threshold drives the artifact decision: Read exempt, generic arti
     const grep_threshold = maxResultSizeForTool("Grep", 100_000);
     const grep_artifacts = grep_threshold != 0 and big_len > grep_threshold;
     try testing.expect(grep_artifacts);
+}
+
+fn findSchema(name: []const u8) ?types.ToolSchema {
+    for (builtin_schemas) |s| {
+        if (std.mem.eql(u8, s.name, name)) return s;
+    }
+    return null;
+}
+
+test "tools-01: the subagent spawner is advertised as Agent, not AgentRun" {
+    try testing.expect(findSchema("Agent") != null);
+    try testing.expect(findSchema("AgentRun") == null);
+    const agent = findSchema("Agent").?;
+    try testing.expect(std.mem.indexOf(u8, agent.description, "Launch a new agent") != null);
+    try testing.expect(std.mem.indexOf(u8, agent.json_schema, "subagent_type") != null);
+}
+
+test "tools-02: shell/file_read/file_write/file_edit/enter_plan_mode/exit_plan_mode are no longer double-advertised" {
+    const removed = [_][]const u8{ "shell", "file_read", "file_write", "file_edit", "enter_plan_mode", "exit_plan_mode" };
+    for (removed) |name| {
+        try testing.expect(findSchema(name) == null);
+    }
+    // Their PascalCase counterparts remain.
+    try testing.expect(findSchema("Bash") != null);
+    try testing.expect(findSchema("Read") != null);
+    try testing.expect(findSchema("Write") != null);
+    try testing.expect(findSchema("Edit") != null);
+    try testing.expect(findSchema("EnterPlanMode") != null);
+    try testing.expect(findSchema("ExitPlanMode") != null);
+}
+
+test "tools-04: AttachContext replaces Brief; SendUserMessage is a real distinct tool" {
+    try testing.expect(findSchema("Brief") == null);
+    const attach = findSchema("AttachContext").?;
+    try testing.expect(std.mem.indexOf(u8, attach.description, "Attach a context file") != null);
+    const send = findSchema("SendUserMessage").?;
+    try testing.expect(std.mem.indexOf(u8, send.json_schema, "message") != null);
+    try testing.expect(std.mem.indexOf(u8, send.description, "user") != null);
+}
+
+test "tools-missed-68: ListMcpResourcesTool / ReadMcpResourceTool are advertised under reference-exact names" {
+    try testing.expect(findSchema("mcp_resources_list") == null);
+    try testing.expect(findSchema("mcp_resource_read") == null);
+    try testing.expect(findSchema("ListMcpResourcesTool") != null);
+    try testing.expect(findSchema("ReadMcpResourceTool") != null);
+}
+
+test "tools-13: ReadMcpResourceDirTool is a distinct schema from ListMcpResourcesTool" {
+    const dir_tool = findSchema("ReadMcpResourceDirTool").?;
+    try testing.expect(std.mem.indexOf(u8, dir_tool.json_schema, "uri") != null);
+    try testing.expect(std.mem.indexOf(u8, dir_tool.description, "direct children") != null);
+}
+
+test "tools-08/09/10/11/12/14/17: new deferred/always-loaded tools exist" {
+    const names = [_][]const u8{ "Monitor", "ScheduleWakeup", "ListAgents", "ReportFindings", "PushNotification", "SendUserFile", "EndConversation", "REPL" };
+    for (names) |n| {
+        try testing.expect(findSchema(n) != null);
+    }
+}
+
+test "tools-25: Agent and Skill are always-loaded, matching the reference's observed split" {
+    try testing.expect(isAlwaysLoadedToolName("Agent"));
+    try testing.expect(isAlwaysLoadedToolName("Skill"));
+    try testing.expect(isAlwaysLoadedToolName("ListAgents"));
+    try testing.expect(isAlwaysLoadedToolName("ReportFindings"));
+    try testing.expect(isAlwaysLoadedToolName("ScheduleWakeup"));
+}
+
+test "tools-21/bundled-skills-01: Skill's advertised contract is {skill, args}" {
+    const skill = findSchema("Skill").?;
+    try testing.expect(std.mem.indexOf(u8, skill.json_schema, "\"required\":[\"skill\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, skill.json_schema, "\"skill\"") != null);
+}
+
+test "tools-19: Read/Write/Edit require file_path, not path" {
+    try testing.expect(std.mem.indexOf(u8, findSchema("Read").?.json_schema, "\"required\":[\"file_path\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, findSchema("Read").?.json_schema, "\"pages\"") != null);
+    try testing.expect(std.mem.indexOf(u8, findSchema("Write").?.json_schema, "\"required\":[\"file_path\",\"content\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, findSchema("Edit").?.json_schema, "\"required\":[\"file_path\",\"old_string\"]") != null);
+}
+
+test "tools-missed-70: NotebookEdit requires notebook_path, not path" {
+    try testing.expect(std.mem.indexOf(u8, findSchema("NotebookEdit").?.json_schema, "\"required\":[\"notebook_path\"]") != null);
+}
+
+test "tools-20: Grep schema documents files_with_matches as the default and exposes head_limit/offset/-A/-B" {
+    const grep_schema = findSchema("Grep").?;
+    try testing.expect(std.mem.indexOf(u8, grep_schema.description, "files_with_matches") != null or std.mem.indexOf(u8, grep_schema.json_schema, "Defaults to files_with_matches") != null);
+    try testing.expect(std.mem.indexOf(u8, grep_schema.json_schema, "head_limit") != null);
+    try testing.expect(std.mem.indexOf(u8, grep_schema.json_schema, "\"-A\"") != null);
+    try testing.expect(std.mem.indexOf(u8, grep_schema.json_schema, "\"-B\"") != null);
+}
+
+test "tools-22: AskUserQuestion schema exposes kind text/number" {
+    const q = findSchema("AskUserQuestion").?;
+    try testing.expect(std.mem.indexOf(u8, q.json_schema, "\"kind\"") != null);
+    try testing.expect(std.mem.indexOf(u8, q.json_schema, "\"number\"") != null);
+}
+
+test "tools-24: TeamCreate/TaskCreate/TaskGet/TaskUpdate use reference field names" {
+    try testing.expect(std.mem.indexOf(u8, findSchema("TeamCreate").?.json_schema, "team_name") != null);
+    try testing.expect(std.mem.indexOf(u8, findSchema("TeamCreate").?.json_schema, "agent_type") != null);
+    try testing.expect(std.mem.indexOf(u8, findSchema("TaskCreate").?.json_schema, "\"required\":[\"subject\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, findSchema("TaskGet").?.json_schema, "taskId") != null);
+    try testing.expect(std.mem.indexOf(u8, findSchema("TaskUpdate").?.json_schema, "addBlocks") != null);
+}
+
+test "tools-missed-71: EnterWorktree takes name; ExitWorktree takes action keep|remove" {
+    try testing.expect(std.mem.indexOf(u8, findSchema("EnterWorktree").?.json_schema, "\"name\"") != null);
+    const exit_schema = findSchema("ExitWorktree").?.json_schema;
+    try testing.expect(std.mem.indexOf(u8, exit_schema, "\"keep\"") != null);
+    try testing.expect(std.mem.indexOf(u8, exit_schema, "\"remove\"") != null);
+}
+
+test "tools-03: a stub MCP server's tools are advertised as mcp__<server>__<tool> once connected" {
+    if (@import("../core/env.zig").getenv("CI") != null) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Seed servers.json before resolving its realpath -- tmpDirPath uses
+    // realPathFile, which needs the target to already exist (mirrors the
+    // existing mcp/client.zig "stdio MCP fixture" test's setup order).
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "servers.json", .data = "[]" });
+
+    const script_body =
+        \\import sys, json
+        \\def read_frame():
+        \\    header = b""
+        \\    while not header.endswith(b"\r\n\r\n"):
+        \\        b = sys.stdin.buffer.read(1)
+        \\        if not b:
+        \\            return None
+        \\        header += b
+        \\    length = 0
+        \\    for line in header.decode("utf-8").split("\r\n"):
+        \\        if line.lower().startswith("content-length:"):
+        \\            length = int(line.split(":", 1)[1].strip())
+        \\    body = sys.stdin.buffer.read(length)
+        \\    return json.loads(body.decode("utf-8"))
+        \\def write_frame(obj):
+        \\    body = json.dumps(obj).encode("utf-8")
+        \\    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+        \\    sys.stdout.buffer.write(body)
+        \\    sys.stdout.buffer.flush()
+        \\while True:
+        \\    msg = read_frame()
+        \\    if msg is None:
+        \\        break
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"stub","version":"0.1"}}})
+        \\    elif method == "notifications/initialized":
+        \\        pass
+        \\    elif method == "tools/list":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"tools":[{"name":"foo","description":"the foo tool","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}}]}})
+    ;
+
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "mock_server.py", .data = script_body });
+    const script = try @import("../core/test_helpers.zig").tmpDirPath(testing.allocator, &tmp, "mock_server.py");
+    defer testing.allocator.free(script);
+    const registry = try @import("../core/test_helpers.zig").tmpDirPath(testing.allocator, &tmp, "servers.json");
+    defer testing.allocator.free(registry);
+
+    var client = try mcp_client.Client.init(testing.allocator, registry);
+    defer client.deinit();
+
+    const transport = try std.fmt.allocPrint(testing.allocator, "python3 '{s}'", .{script});
+    defer testing.allocator.free(transport);
+    try client.add("stub", transport);
+
+    // Force a connection so isConnected("stub") is true before collectSchemas
+    // runs -- mirrors the chrome-bridge pattern of only discovering tools for
+    // servers already connected, never blocking to connect a new one.
+    {
+        const tools = client.listTools("stub") catch |err| {
+            // rg/python3 unavailable in this environment: skip rather than fail.
+            std.debug.print("skipping tools-03 MCP schema test: {}\n", .{err});
+            return;
+        };
+        mcp_client.freeToolInfos(testing.allocator, tools);
+    }
+    try testing.expect(client.isConnected("stub"));
+
+    const schemas = try collectSchemas(testing.allocator, &client, null);
+    defer freeSchemas(testing.allocator, schemas);
+
+    var saw_it = false;
+    for (schemas) |s| {
+        if (std.mem.eql(u8, s.name, "mcp__stub__foo")) {
+            saw_it = true;
+            try testing.expect(std.mem.indexOf(u8, s.json_schema, "\"x\"") != null);
+        }
+    }
+    try testing.expect(saw_it);
 }

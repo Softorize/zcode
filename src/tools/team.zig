@@ -204,6 +204,21 @@ fn freeMember(allocator: std.mem.Allocator, member: TeamMember) void {
 }
 
 pub fn teamCreate(allocator: std.mem.Allocator, cwd: []const u8, name: []const u8, members: []const u8) ![]u8 {
+    return teamCreateWithOptions(allocator, cwd, name, members, "", "");
+}
+
+/// tools-24: reference-shaped TeamCreate (team_name, description, agent_type,
+/// model). `agent_type` is `teamCreate`'s existing `members` parameter under
+/// its reference name; `model` newly threads a model default onto the lead
+/// TeamMember record (previously always "").
+pub fn teamCreateWithOptions(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    name: []const u8,
+    agent_type: []const u8,
+    model: []const u8,
+    description: []const u8,
+) ![]u8 {
     const requested = std.mem.trim(u8, name, " \t\r\n");
     if (!helpers.isSafeIdentifier(requested)) {
         return allocator.dupe(u8, "invalid team name: use letters/numbers/._- only");
@@ -232,16 +247,18 @@ pub fn teamCreate(allocator: std.mem.Allocator, cwd: []const u8, name: []const u
     defer allocator.free(team_path);
 
     // Seed the leader member (swarm-tasks-06): a structured record named
-    // "team-lead", running in the workspace cwd, with no subscriptions yet. The
-    // optional `members` arg carries a free-text agent_type hint (kept for the
-    // dispatch back-compat); empty means an unspecified type.
+    // "team-lead", running in the workspace cwd, with no subscriptions yet.
+    // `agent_type` is a free-text specialist-type hint for the lead
+    // (tools-24 reference field name; the old `members` dispatch spelling
+    // still maps here); `model` is a model default for the lead.
     const now = clock.nowSeconds();
-    const lead_type = std.mem.trim(u8, members, " \t\r\n");
+    const lead_type = std.mem.trim(u8, agent_type, " \t\r\n");
+    const lead_model = std.mem.trim(u8, model, " \t\r\n");
     const lead = TeamMember{
         .agent_id = try allocator.dupe(u8, ""),
         .name = try allocator.dupe(u8, LEAD_MEMBER_NAME),
         .agent_type = try allocator.dupe(u8, lead_type),
-        .model = try allocator.dupe(u8, ""),
+        .model = try allocator.dupe(u8, lead_model),
         .joined_ts = now,
         .tmux_pane_id = try allocator.dupe(u8, ""),
         .backend_type = try allocator.dupe(u8, ""),
@@ -251,7 +268,7 @@ pub fn teamCreate(allocator: std.mem.Allocator, cwd: []const u8, name: []const u
 
     var team_file = TeamFile{
         .name = try allocator.dupe(u8, team_name),
-        .description = try allocator.dupe(u8, ""),
+        .description = try allocator.dupe(u8, description),
         .created_ts = now,
         .lead_agent_id = try allocator.dupe(u8, ""),
         .lead_session_id = try allocator.dupe(u8, ""),

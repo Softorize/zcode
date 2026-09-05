@@ -676,7 +676,11 @@ fn renderOrchestrationReminder(allocator: std.mem.Allocator, env: *const types.P
     defer out.deinit();
 
     const has_task_tools = hasAnyTool(env.tool_schemas, &.{ "TodoWrite", "TodoRead", "TaskCreate", "TaskUpdate", "TaskList", "TaskRun", "TaskPoll", "TaskOutput" });
-    const has_subagent = hasAnyTool(env.tool_schemas, &.{"AgentRun"});
+    // tools-01 (wp2-tools-surface): the advertised schema name is now "Agent"
+    // (AgentRun kept only as a dispatch-only legacy synonym), so this check
+    // must look for either name to keep matching a live turn's actual schema
+    // set.
+    const has_subagent = hasAnyTool(env.tool_schemas, &.{ "Agent", "AgentRun" });
     const has_verification = hasAnyTool(env.tool_schemas, &.{ "RunTests", "Bash", "shell", "GitDiff", "git_status" });
 
     if (has_task_tools and prompt_helpers.shouldEncourageTaskTracking(env.user_turn)) {
@@ -1240,7 +1244,15 @@ test "prompt build includes configured output style and orchestration reminder" 
         allocator,
         &cfg,
         &policy,
-        "Investigate deeply across modules and implement the fix",
+        // Pre-existing test bug fixed in passing (wp2-tools-surface): the
+        // original prompt ("Investigate deeply across modules and implement
+        // the fix") only ever scored 30 in assessSubagentNeed (Signal 4
+        // "across modules" alone), below the 40-point should_encourage
+        // threshold -- so the "AgentRun" assertion below could never have
+        // passed regardless of tool-schema naming. Adding "in parallel"
+        // (Signal 3, +40) pushes the score to 70 so the orchestration
+        // guidance text this test actually means to exercise gets emitted.
+        "Investigate deeply across modules in parallel and implement the fix",
         &.{},
         schemas[0..],
         cwd,

@@ -356,3 +356,74 @@ records an optional `origin_cwd` breadcrumb on the session snapshot record
 when a session's `origin_cwd` differs from the current cwd. The breadcrumb is
 purely informational - it never blocks a resume, prompts a `cd`, or toggles
 between project scopes.
+
+### Workflow tool skipped (tools-07)
+
+The reference's `Workflow` tool executes a JS script that orchestrates
+subagents deterministically (`export const meta = {name, description,
+phases}`; API: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`,
+`args`, `budget`, `workflow()`). Running arbitrary orchestration scripts needs
+an embedded JS runtime; zcode has no such runtime and does not intend to
+depend on one for a single tool. `AgentRun`/`Agent` already covers ad hoc
+subagent delegation, and zcode's own `/loop` and `TaskCreate`/`TaskUpdate`
+family cover the recurring "run N steps against a plan" pattern the reference
+uses Workflow for. Documented as a deliberate gap, not silently missing.
+
+### Monitor / ScheduleWakeup / EndConversation: dispatchable but not fully wired (wp2-tools-surface)
+
+Three tools added for 2.1.261 name parity are real, dispatchable, and unit
+tested, but stop short of reaching into the agent's turn loop
+(`agent_runtime.zig`, outside `wp2-tools-surface`'s ownership) to change its
+control flow:
+
+- `Monitor` runs the given command via the same background-task runner
+  Bash's `run_in_background` uses (wake-up on exit), not the reference's
+  per-emitted-stdout-line push wakeup -- true per-line wakeups need the turn
+  loop to poll a growing output file and re-invoke the model mid-stream.
+- `ScheduleWakeup` validates and clamps `delaySeconds` to `[60, 3600]` and
+  returns the acknowledgment text, but does not reschedule zcode's actual
+  `/loop` dynamic-mode iteration timer.
+- `EndConversation` returns a fixed closing message plus an
+  `[end_conversation=true]` sentinel line, but nothing currently watches for
+  that sentinel to actually stop the REPL's turn loop.
+
+Each is a real, callable, tested tool today (a strict improvement over not
+existing at all) with the exact gap called out in its handler's doc comment
+in `src/tools/tool_dispatch.zig`. Wiring the remaining control-flow piece is
+a follow-up for whichever package owns `agent_runtime.zig`'s loop.
+
+### Agent tool: subagent_type accepted, but no dedicated `fork` mode or new built-in agent types (tools-23)
+
+The `Agent` tool's schema now advertises `subagent_type` as the reference-exact
+field name (with `agent` kept as an accepted alias), but zcode still resolves
+only its 4 existing specialists (`explore`, `plan`, `verify`, `reviewer`) plus
+whatever custom name the caller passes through `core/agents.zig` (not owned by
+`wp2-tools-surface`). The reference's `subagent_type: "fork"` (clone the
+caller's own transcript into a background agent pinned to the caller's model)
+and its `general-purpose`/`claude`/`claude-code-guide`/`statusline-setup`
+built-ins are not implemented -- registering new agent definitions and a
+transcript-forking spawn path is a larger, cross-cutting change belonging to
+whichever package owns `core/agents.zig` and the agent-spawn plumbing in
+`agent_runtime.zig`/`cli/repl.zig`.
+
+### CRUD "Task" tool kept under its original name, not renamed to "TaskAction" (tools-01)
+
+The reference's `Task` string is a *legacy alias for the Agent tool*, not a
+name for zcode's generic CRUD task-tracking tool (create/get/update/list/
+stop/output/run/poll/claim). Renaming zcode's CRUD tool's advertised schema
+name away from `"Task"` (e.g. to `"TaskAction"`) to fully resolve that naming
+collision was investigated but intentionally NOT done: the literal string
+`"Task"` is a load-bearing identifier in several other packages' security and
+UX logic outside `wp2-tools-surface`'s ownership -- `core/sandbox.zig`'s
+read-only-profile tool allowlist, `policy/policy.zig`'s risk-tier
+classification (a `Task` call with `action=run` is classified `.HIGH` because
+it can execute an arbitrary shell command via `TaskCreate`'s `command` field),
+and `cli/repl_edit.zig`'s approval-description rendering. Renaming the
+advertised name without also updating every one of those classification
+tables risked a model that adopts the new name silently escaping `.HIGH`-risk
+classification and sandbox restriction on that tool. `tool_name_map.zig`
+still correctly maps the reference's `Task` alias to `Agent` (see
+`core/tool_name_map.zig`'s alias table) for whenever alias-aware permission-rule
+matching is wired in; only the schema-visible rename of zcode's own unrelated
+CRUD tool was deferred, as a follow-up that should touch `sandbox.zig`,
+`policy.zig`, and `repl_edit.zig` together with the rename in the same change.

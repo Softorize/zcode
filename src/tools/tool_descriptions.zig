@@ -8,32 +8,37 @@
 /// Keep this file the single source of truth: tool_schemas.zig now
 /// references these constants from both the primary and the alias
 /// entries so the two descriptions can't drift.
+// tools-18: rewritten to match Claude Code 2.1.261's Bash tool description
+// verbatim in structure (see scratchpad/cc_system_prompt_2.1.261.md's "###
+// Bash" section) -- milliseconds (not seconds) for timeout, the
+// "Command output is displayed to you, not reliably to the user" caveat, the
+// interactive-flags-unsupported note, the `gh` CLI steer, "branch first if on
+// the default branch", and a Monitor/until-loop pointer instead of the stale
+// TaskPoll reference. Attribution lines are reworded to zcode's own identity
+// (never claim to be Claude Code / Anthropic's product) while keeping the
+// underlying-model co-author line, which is a factual attribution, not a
+// brand claim.
 pub const SHELL =
-    "Executes a given bash command and returns its output.\n" ++
+    "Executes a bash command and returns its output.\n" ++
     "\n" ++
-    "The working directory persists between commands within the project, but shell state does not. A `cd` outside the project's working directories is reset back to the project root after the command runs. The shell environment is initialized from the user's profile (bash or zsh).\n" ++
+    "- Working directory persists between calls, but prefer absolute paths -- `cd` in a compound command can trigger a permission prompt. Shell state (env vars, functions) does not persist; the shell is initialized from the user's profile.\n" ++
+    "- Command output is displayed to you, not reliably to the user.\n" ++
+    "- `timeout` is in milliseconds: default 120000, max 600000.\n" ++
+    "- `run_in_background` runs the command detached: it keeps running across turns and re-invokes you when it exits. No `&` needed. Foreground `sleep` is blocked; use Monitor with an until-loop to wait on a condition.\n" ++
     "\n" ++
-    "IMPORTANT: Avoid using this tool to run `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user:\n" ++
+    "# Git\n" ++
+    "- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\n" ++
+    "- Use the `gh` CLI for GitHub operations (PRs, issues, API).\n" ++
+    "- Commit or push only when the user asks. If on the default branch, branch first.\n" ++
+    "- End git commit messages with:\n" ++
+    "Co-Authored-By: <model name> <noreply@anthropic.com>\n" ++
+    "- End PR bodies with:\n" ++
+    "Generated with zcode\n" ++
     "\n" ++
-    " - File search: Use Glob (NOT find or ls)\n" ++
-    " - Content search: Use Grep (NOT grep or rg)\n" ++
-    " - Read files: Use Read (NOT cat/head/tail)\n" ++
-    " - Edit files: Use Edit (NOT sed/awk)\n" ++
-    " - Write files: Use Write (NOT echo >/cat <<EOF)\n" ++
-    " - Communication: Output text directly (NOT echo/printf)\n" ++
-    "\n" ++
-    "# Instructions\n" ++
-    " - If your command will create new directories or files, first run `ls` to verify the parent directory exists.\n" ++
-    " - Always quote file paths that contain spaces (e.g., cd \"path with spaces/file.txt\").\n" ++
-    " - Prefer absolute paths over `cd`; the working directory persists but `cd` makes session state harder to reason about.\n" ++
-    " - You may specify an optional timeout in seconds (up to 600). Default is 120.\n" ++
-    " - Use `run_in_background` for long-running commands you do not need to block on. Poll with TaskPoll/TaskOutput afterwards.\n" ++
-    " - When issuing multiple independent commands, prefer multiple parallel tool calls in a single response over `&&` chaining.\n" ++
-    " - For git commands: prefer a fresh commit over amending; never skip hooks (--no-verify) unless the user explicitly asked; pause and ask before destructive operations (push --force, reset --hard, checkout --, clean -f).\n" ++
-    " - Do not sleep-loop for status; use `run_in_background` and let the harness notify you on completion.";
+    "Parameters: command (required), description, timeout, run_in_background, dangerouslyDisableSandbox.";
 
 pub const SHELL_USAGE =
-    "Use for non-interactive shell commands not covered by a dedicated tool. Interactive terminals (vim, less, top, ssh, REPLs) belong in `/!`, not Bash. Always quote paths with spaces. Prefer Grep/Glob/Read for file discovery and content search.";
+    "Use for non-interactive shell commands not covered by a dedicated tool. Interactive terminals (vim, less, top, ssh, REPLs) belong in `/!`, not Bash. Always quote paths with spaces. Prefer Grep/Glob/Read for file discovery and content search. `timeout`/`run_in_background` are in milliseconds; a blocked foreground `sleep` means use Monitor with an until-loop instead.";
 
 pub const FILE_READ =
     "Reads a file from the local filesystem. Assume this tool can read any file on the machine; if the user provides a path, trust it.\n" ++
