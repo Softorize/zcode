@@ -47,13 +47,21 @@ pub fn buildPrompt(allocator: std.mem.Allocator, subject: ?[]const u8) ![]u8 {
     return error.InvalidReviewTarget;
 }
 
-/// Build the prompt used by /security-review. Mirrors Claude Code's
+/// Build the prompt formerly used by /security-review. Mirrors Claude Code's
 /// security-review command: drops the model into a senior security
 /// engineer role and asks it to look at the current branch's changes
 /// against origin/HEAD for HIGH-CONFIDENCE vulnerabilities. The
 /// reference builds this as a Markdown template with shell
 /// substitution (`!git diff`); zcode inlines the git commands so the
 /// agent loop runs them as tool calls with its own sandbox policy.
+///
+/// bundled-skills-04: superseded as the live /security-review path -- that
+/// command now routes through the "security-review" bundled skill
+/// (bundled_skills.zig), which adds the phased sub-task methodology, HARD
+/// EXCLUSIONS list, and a real allowed-tools restriction (no Write/Edit) this
+/// single-pass prompt never had. Kept here (unused in production, exercised
+/// only by its own test below) as a smaller alternative for a caller that
+/// wants the simpler prompt without the Skill system.
 pub fn buildSecurityReviewPrompt(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, "You are a senior security engineer conducting a focused security review of the changes on this branch.\n\n" ++
         "First, gather the git context yourself using read-only tools:\n" ++
