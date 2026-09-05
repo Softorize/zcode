@@ -222,6 +222,90 @@ test "runtime: SessionStart additionalContext reaches the session history" {
     h.runtime.maybeFireSessionStart();
 }
 
+test "hooks-permissions-02: Setup additionalContext reaches the session history, fires once" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json",
+        \\{"hooks":{"Setup":[{"matcher":"*","hooks":[{"type":"command","command":"echo '{\"hookSpecificOutput\":{\"additionalContext\":\"SETUP_INJECTED\"}}'"}]}]}}
+    );
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    var h = try Harness.init(alloc, root, cwd);
+    defer h.deinit();
+
+    h.runtime.maybeFireSetup();
+    try testing.expect(h.runtime.setup_fired);
+    try testing.expect(h.historyContains("SETUP_INJECTED"));
+
+    // Once-per-session: a second call is a no-op.
+    h.runtime.maybeFireSetup();
+}
+
+test "hooks-permissions-02: TaskCompleted fires exactly once on the done transition, not on every update" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "task_completed_count.txt" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"TaskCompleted\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"echo x >> '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    const task = @import("../tools/task.zig");
+    const created = try task.taskCreate(alloc, cwd, "swarm-task", "test task", "");
+    defer alloc.free(created);
+
+    // Extract the numeric id from "task created\nid=<N>\n...".
+    const id_line_start = std.mem.indexOf(u8, created, "id=").? + 3;
+    const id_line_end = std.mem.indexOfScalarPos(u8, created, id_line_start, '\n').?;
+    const id = created[id_line_start..id_line_end];
+
+    // First transition into "done": TaskCompleted fires once.
+    const upd1 = try task.taskUpdate(alloc, cwd, id, null, null, "done", null, null);
+    defer alloc.free(upd1);
+    const after_first = std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096)) catch |err| {
+        std.debug.print("TaskCompleted hook did not fire on first done transition: {any}\n", .{err});
+        return error.TaskCompletedHookDidNotRun;
+    };
+    defer alloc.free(after_first);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, after_first, "x\n"));
+
+    // A subsequent update that is STILL done (e.g. editing the summary) does
+    // not re-fire TaskCompleted -- it only fires on the transition.
+    const upd2 = try task.taskUpdate(alloc, cwd, id, null, "revised summary", "done", null, null);
+    defer alloc.free(upd2);
+    const after_second = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(after_second);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, after_second, "x\n"));
+}
+
 test "runtime: UserPromptSubmit exit-2 blocks the prompt with its reason" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});

@@ -418,6 +418,24 @@ pub fn runTaskCreatedHook(
     return .{ .blocked = true, .message = try allocator.dupe(u8, reason) };
 }
 
+/// hooks-permissions-02: fire the `TaskCompleted` lifecycle hook when a task
+/// transitions into a resolved (done/completed) status. Unlike
+/// `runTaskCreatedHook` (which can veto the just-created task, mirroring the
+/// reference's create-then-maybe-delete flow), `TaskCompleted` has no
+/// documented block-and-undo semantics of its own -- the task has already
+/// finished, there is nothing left to unwind -- so this is fire-and-forget:
+/// callers do not act on the result, matching `runSetupHook`/
+/// `runStopFailureHook` below.
+pub fn runTaskCompletedHook(allocator: std.mem.Allocator, cwd: []const u8, task_id: []const u8, task_subject: []const u8) void {
+    var result = run(allocator, .{
+        .event = .task_completed,
+        .cwd = cwd,
+        .task_id = task_id,
+        .task_subject = task_subject,
+    }) catch return;
+    result.deinit(allocator);
+}
+
 pub fn run(allocator: std.mem.Allocator, ctx: HookContext) !HookRunResult {
     const hooks = try list(allocator, ctx.cwd);
     defer freeList(allocator, hooks);

@@ -843,6 +843,12 @@ pub const AgentRuntime = struct {
     ///   - session_end_fired: SessionEnd fires once at deinit; guards a double
     ///     fire if deinit is reached twice.
     session_start_fired: bool = false,
+    /// hooks-permissions-02: Setup fires alongside SessionStart (the
+    /// reference's `ALWAYS_EMITTED_HOOK_EVENTS` groups them as the two
+    /// always-on lifecycle events); this guards its own once-only firing so
+    /// the two stay independently idempotent even if a future caller fires
+    /// them from different points.
+    setup_fired: bool = false,
     session_end_fired: bool = false,
 
     /// Phase 11 Task 6 (sessions-06): set once we have attempted AI-title
@@ -1567,6 +1573,7 @@ pub const AgentRuntime = struct {
         // the last turn so their additionalContext lands before this prompt.
         if (self.depth == 0) {
             self.maybeFireSessionStart();
+            self.maybeFireSetup();
             self.drainAsyncHooks();
         }
 
@@ -5423,6 +5430,20 @@ pub const AgentRuntime = struct {
             .cwd = self.cwd,
             .source = "startup",
         });
+        if (outcome.reason) |r| self.allocator.free(r);
+    }
+
+    /// hooks-permissions-02: fire Setup exactly once, lazily, alongside
+    /// SessionStart (the reference documents both as
+    /// `ALWAYS_EMITTED_HOOK_EVENTS` -- always-on, once-per-session lifecycle
+    /// events). Setup carries no event-specific discriminating field (unlike
+    /// SessionStart's `source`); its stdout is still injected as additional
+    /// context via `fireLifecycleHook`, matching every other lifecycle event.
+    pub fn maybeFireSetup(self: *AgentRuntime) void {
+        if (!hooksLiveEnabled()) return;
+        if (self.setup_fired) return;
+        self.setup_fired = true;
+        const outcome = self.fireLifecycleHook(.{ .event = .setup, .cwd = self.cwd });
         if (outcome.reason) |r| self.allocator.free(r);
     }
 
