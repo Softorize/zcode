@@ -3781,6 +3781,20 @@ pub const AgentRuntime = struct {
         return agent_tools.handleAgentRunTool(self.allocator, self.audit, self.cfg.cloud_telemetry_opt_in, self.cfg.control_plane_url, self.cfg.control_plane_token, name, args, self.depth, self.current_reporter, spawnChildAgent, @ptrCast(self));
     }
 
+    /// commands-25 (`/subtask`): spawn a background sub-agent from a slash
+    /// command rather than a model-invoked AgentRun tool call. Reuses the
+    /// EXACT same spawn path (`spawnChildAgent`) the AgentRun/Task tool uses so
+    /// isolation, worktree handling, and task-registry bookkeeping all match --
+    /// this just bypasses the tool-args string format since the caller already
+    /// has a structured `AgentRunConfig` (there is no model turn to parse args
+    /// out of). Depth/MAX_DEPTH is intentionally NOT re-checked here: `/subtask`
+    /// is refused up front by the caller when `self.depth > 0` (this runtime is
+    /// itself a spawned sub-agent), matching the reference's `isEnabled:()=>!Ci()`
+    /// nesting guard one level earlier than the tool-dispatch depth counter.
+    pub fn spawnSubtaskAgent(self: *AgentRuntime, config: @import("tools/agent.zig").AgentRunConfig) ![]u8 {
+        return spawnChildAgent(@ptrCast(self), config);
+    }
+
     /// swarm-tasks-11: the resolved working directory (and bookkeeping) for a
     /// spawned child agent. `cwd` is always an owned slice the caller frees.
     /// `worktree_path`, when set, is an owned slice the caller removes + frees.

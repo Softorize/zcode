@@ -75,6 +75,7 @@ const model_allowlist = @import("core/model_allowlist.zig");
 const deprecation = @import("core/deprecation.zig");
 const shell_completion = @import("core/shell_completion.zig");
 const session_search = @import("core/session_search.zig");
+const repl_commands_parity = @import("repl_commands_parity.zig");
 
 const AgentRuntime = agent_runtime.AgentRuntime;
 
@@ -2959,6 +2960,13 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         defer allocator.free(derived);
         return @as(?[]u8, try exportSession(allocator, runtime, derived));
     }
+
+    // ── wp1b-commands-new: /background /bg /list-agents /peers /subtask
+    //    /goal /team-onboarding /fewer-permission-prompts /auto-mode-setup
+    //    /bug /import /skill-doctor /reload-skills, plus the __goal_nudge
+    //    end-of-turn sentinel. One dispatch call into a dedicated module so
+    //    this giant switch does not grow further. ──
+    if (try repl_commands_parity.dispatch(allocator, runtime, command)) |out| return @as(?[]u8, out);
 
     // ── Custom command / skill fallthrough (commands-01) ──
     //

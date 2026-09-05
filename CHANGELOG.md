@@ -243,6 +243,17 @@ All notable changes to `zcode` should be documented in this file.
 - Add `/autocompact [auto|<tokens>]` to inspect and override the auto-compact token threshold for the current session without restarting or setting an env var.
 - Add `/scroll-speed [N]`, `/daemon`, `/recap`, `/reload-skills`, `/skill-doctor`, `/explain-usage`, `/debug [issue]`, `/claude-api [subtopic]`, `/loops` + `/loops delete <id>`, and `/pause-memory` (+ `/memory-pause`, `/toggle-memory` aliases) -- 2.1.261 commands zcode was missing, built on existing zcode subsystems (kairos, remote_daemon, skill_usage, cron store) rather than new engines.
 - `/help` (the default catalog) now hides 65 zcode-only commands and non-canonical spellings that have no 2.1.261 counterpart; every one of them still runs when typed directly, and `/help all` lists the full catalog including them.
+- Add `/background` (alias `/bg`): sends the current interactive session to the background (reusing the existing `--bg` detach/spawn/registry machinery) and frees the terminal, matching Claude Code 2.1's command of the same name.
+- Add `/list-agents` (alias `/peers`): lists subagents, teammates, and other zcode sessions you can message, aggregated from the existing task/team/session-registry data sources.
+- Add `/subtask <task>`: spawns a background subagent seeded with a serialization of the current session's conversation history, so it can pick up work with full context; refuses to run from inside an already-spawned subagent to bound nesting.
+- Add `/goal <condition>` / `/goal clear`: sets a durable per-session stop condition that nudges the agent to keep working toward it at the end of every turn (bounded by a safety cap), until the condition is reported met or the goal is cleared.
+- Add `/team-onboarding`: prompts the model to scan the project's zcode/Claude config and write or update a local `ONBOARDING.md` for new teammates.
+- Add `/fewer-permission-prompts`: scans this session's transcript for repeated read-only Bash calls and proposes a `permissions.allow` addition to `.claude/settings.json`, explaining every command it skipped; never touches `permissions.deny`/`permissions.ask` or any other settings field.
+- Add `/auto-mode-setup`: detects the project's build/test toolchain and proposes starter auto-approval rules for `--approval-mode tiered-auto`, applied only after an explicit `/auto-mode-setup confirm`.
+- Add `/bug [report]`: bug-report/share-conversation guidance (GitHub Issues link, version/provider/OS bundle, optional report text) alongside the existing `/share` markdown export.
+- Add `/import <codex|gemini> [--dry-run]` and a shared `core/import_agent_config.zig`: imports a Codex CLI or Gemini CLI project's instructions file and configured MCP servers into `CLAUDE.md` / `.mcp.json`. A top-level `zcode import` CLI subcommand shares the same importer (not yet wired into `cli/args.zig`).
+- Add `/skill-doctor`: lists every loaded skill with its scope, used/unused status (from the existing skill-usage tracker), and an approximate context cost.
+- Add `/reload-skills`: re-scans `.zcode/skills` / `.claude/skills` and reports the current skill listing (skill discovery already re-scans disk on every call, so this is a user-facing confirmation of that).
 
 ## 0.6.30
 

@@ -24,6 +24,7 @@ const std_io = @import("std_io.zig");
 const clock = @import("clock.zig");
 const rng = @import("rng.zig");
 const kairos_lock = @import("kairos_lock.zig");
+const paths = @import("paths.zig");
 const json = std.json;
 
 const BRIEF_FILE = "brief.md";
@@ -171,6 +172,135 @@ pub fn proposalCount(allocator: std.mem.Allocator, cwd: []const u8) usize {
     const list = loadProposals(allocator, path);
     defer freeProposals(allocator, list);
     return list.len;
+}
+
+// ===========================================================================
+// Goal store (commands-34, /goal) — per-session stop condition
+// ===========================================================================
+//
+// `/goal <condition>` persists a durable "keep working until this is true"
+// condition for the CURRENT session, one JSON file per session id under this
+// project's KAIROS dir (`<projectDir>/goals/<session_id>.json`). The REPL
+// nudges the model with it at the end of every turn (see
+// `repl_commands_parity.zig`'s `__goal_nudge` sentinel and its one-line hook
+// in `cli/repl.zig`) until the model reports the condition met, the user runs
+// `/goal clear`, or `checks` hits `GOAL_MAX_CHECKS` (a safety cap against an
+// unbounded auto-continue loop). Same best-effort disk discipline as the
+// brief/proposals stores above: any I/O or parse failure degrades to "no
+// goal" rather than erroring the caller.
+
+/// Safety cap on the number of automatic end-of-turn nudges a single goal can
+/// trigger before it is auto-cleared. Chosen to be generous enough for a real
+/// multi-step task while still bounding a runaway loop.
+pub const GOAL_MAX_CHECKS: u32 = 25;
+
+const GOALS_SUBDIR = "goals";
+
+pub const Goal = struct {
+    condition: []u8,
+    created_ts: i64,
+    checks: u32,
+
+    pub fn deinit(self: *Goal, allocator: std.mem.Allocator) void {
+        allocator.free(self.condition);
+    }
+};
+
+fn goalPath(allocator: std.mem.Allocator, cwd: []const u8, session_id: []const u8) ![]u8 {
+    const dir = try kairos_lock.projectDir(allocator, cwd);
+    defer allocator.free(dir);
+    const goals_dir = try std.fs.path.join(allocator, &.{ dir, GOALS_SUBDIR });
+    defer allocator.free(goals_dir);
+    paths.ensureDir(goals_dir) catch {};
+
+    // Session ids are already filesystem-safe (uuid/hex-ish); sanitize
+    // defensively anyway so a hostile/odd session id can never escape the
+    // goals dir via a path separator.
+    var safe = try allocator.alloc(u8, session_id.len);
+    defer allocator.free(safe);
+    for (session_id, 0..) |c, i| {
+        safe[i] = switch (c) {
+            '/', '\\', 0 => '_',
+            else => c,
+        };
+    }
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{safe});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ goals_dir, file_name });
+}
+
+/// Persist `condition` as the active goal for `session_id`. Overwrites any
+/// prior goal (starts the check counter over at 0).
+pub fn setGoal(allocator: std.mem.Allocator, cwd: []const u8, session_id: []const u8, condition: []const u8) !void {
+    const path = try goalPath(allocator, cwd, session_id);
+    defer allocator.free(path);
+
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    try out.writer().print("{f}", .{std.json.fmt(.{
+        .condition = condition,
+        .created_ts = clock.nowSeconds(),
+        .checks = @as(u32, 0),
+    }, .{})});
+    try writeFileAtomic(allocator, path, out.items());
+}
+
+/// Read the active goal for `session_id`, or null when there is none (or the
+/// file is missing/corrupt). Owned result; free with `Goal.deinit`.
+pub fn getGoal(allocator: std.mem.Allocator, cwd: []const u8, session_id: []const u8) ?Goal {
+    const path = goalPath(allocator, cwd, session_id) catch return null;
+    defer allocator.free(path);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(MAX_FILE_BYTES)) catch return null;
+    defer allocator.free(bytes);
+
+    var parsed = json.parseFromSlice(json.Value, allocator, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+
+    const cond_val = obj.get("condition") orelse return null;
+    if (cond_val != .string) return null;
+    const condition = allocator.dupe(u8, cond_val.string) catch return null;
+
+    const created_ts: i64 = if (obj.get("created_ts")) |v| switch (v) {
+        .integer => |i| i,
+        else => 0,
+    } else 0;
+    const checks: u32 = if (obj.get("checks")) |v| switch (v) {
+        .integer => |i| if (i > 0) @intCast(i) else 0,
+        else => 0,
+    } else 0;
+
+    return .{ .condition = condition, .created_ts = created_ts, .checks = checks };
+}
+
+/// Increment the goal's check counter and persist it. Best-effort: swallows
+/// any I/O error (a failed bump just means the next nudge re-reads the same
+/// count, which is harmless -- it only affects when the safety cap trips).
+pub fn bumpGoalChecks(allocator: std.mem.Allocator, cwd: []const u8, session_id: []const u8) void {
+    var goal = getGoal(allocator, cwd, session_id) orelse return;
+    defer goal.deinit(allocator);
+
+    const path = goalPath(allocator, cwd, session_id) catch return;
+    defer allocator.free(path);
+
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    out.writer().print("{f}", .{json.fmt(.{
+        .condition = goal.condition,
+        .created_ts = goal.created_ts,
+        .checks = goal.checks + 1,
+    }, .{})}) catch return;
+    writeFileAtomic(allocator, path, out.items()) catch {};
+}
+
+/// Remove the active goal for `session_id`. Best-effort; a second call (or
+/// clearing a session with no goal) is a harmless no-op.
+pub fn clearGoal(allocator: std.mem.Allocator, cwd: []const u8, session_id: []const u8) void {
+    const path = goalPath(allocator, cwd, session_id) catch return;
+    defer allocator.free(path);
+    std.Io.Dir.cwd().deleteFile(rt.io, path) catch {};
 }
 
 // ===========================================================================
@@ -423,4 +553,94 @@ test "parse clamps out-of-range created_ts to now" {
     const ONE_HUNDRED_YEARS: i64 = 100 * 365 * 24 * 60 * 60;
     try testing.expect(out[0].created_ts >= now -| ONE_HUNDRED_YEARS);
     try testing.expect(out[0].created_ts <= now +| ONE_HUNDRED_YEARS);
+}
+
+// ===========================================================================
+// Goal store tests (commands-34)
+// ===========================================================================
+
+const test_helpers = @import("test_helpers.zig");
+const env = @import("env.zig");
+
+test "getGoal is null before any /goal is set" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(home);
+    try env.setOverride("HOME", home);
+    defer env.clearOverrides();
+
+    try testing.expect(getGoal(alloc, home, "sess-1") == null);
+}
+
+test "setGoal then getGoal round-trips the condition with checks starting at 0" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(home);
+    try env.setOverride("HOME", home);
+    defer env.clearOverrides();
+
+    try setGoal(alloc, home, "sess-1", "all tests pass");
+
+    var goal = getGoal(alloc, home, "sess-1").?;
+    defer goal.deinit(alloc);
+    try testing.expectEqualStrings("all tests pass", goal.condition);
+    try testing.expectEqual(@as(u32, 0), goal.checks);
+}
+
+test "bumpGoalChecks increments the persisted counter" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(home);
+    try env.setOverride("HOME", home);
+    defer env.clearOverrides();
+
+    try setGoal(alloc, home, "sess-1", "ship the feature");
+    bumpGoalChecks(alloc, home, "sess-1");
+    bumpGoalChecks(alloc, home, "sess-1");
+
+    var goal = getGoal(alloc, home, "sess-1").?;
+    defer goal.deinit(alloc);
+    try testing.expectEqual(@as(u32, 2), goal.checks);
+    try testing.expectEqualStrings("ship the feature", goal.condition);
+}
+
+test "clearGoal removes the goal and is a no-op when called again" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(home);
+    try env.setOverride("HOME", home);
+    defer env.clearOverrides();
+
+    try setGoal(alloc, home, "sess-1", "condition");
+    clearGoal(alloc, home, "sess-1");
+    try testing.expect(getGoal(alloc, home, "sess-1") == null);
+    clearGoal(alloc, home, "sess-1"); // no-op, must not error/panic
+}
+
+test "goals for different sessions in the same project do not collide" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(home);
+    try env.setOverride("HOME", home);
+    defer env.clearOverrides();
+
+    try setGoal(alloc, home, "sess-a", "goal A");
+    try setGoal(alloc, home, "sess-b", "goal B");
+
+    var a = getGoal(alloc, home, "sess-a").?;
+    defer a.deinit(alloc);
+    var b = getGoal(alloc, home, "sess-b").?;
+    defer b.deinit(alloc);
+    try testing.expectEqualStrings("goal A", a.condition);
+    try testing.expectEqualStrings("goal B", b.condition);
 }
