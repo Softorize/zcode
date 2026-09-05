@@ -36,6 +36,8 @@ const remote_daemon = @import("remote_daemon.zig");
 const kairos = @import("kairos.zig");
 const bg_cmds = @import("bg_cmds.zig");
 const tool_dispatch = @import("tools/tool_dispatch.zig");
+const project_purge = @import("cli/project_purge.zig");
+const worktree_launch = @import("cli/worktree_launch.zig");
 
 // Reachable-from-main registry for orphan utility modules so their
 // tests run under `zig build test`. The Zig 0.15 test runner only
@@ -314,6 +316,12 @@ comptime {
     // socket so `tmux kill-server` via Bash cannot touch the user's real
     // session (phase-26 daemon-background-06). Register so its tests run.
     _ = @import("core/tmux_socket.zig");
+    // cli-flags-31: `zcode project purge [path]` -- deletes a project's
+    // `.zcode/` workspace state. Register so its tests run.
+    _ = @import("cli/project_purge.zig");
+    // cli-flags-08: `-w/--worktree`/`--tmux` launch-time git worktree
+    // creation. Register so its tests run.
+    _ = @import("cli/worktree_launch.zig");
 }
 
 fn verboseLogsEnabled(opts: *const cli.CliOptions) bool {
@@ -396,6 +404,61 @@ fn installInterruptHandlers() void {
     // Route to restoreTermAndExit so a Ctrl+\ on a stuck REPL
     // leaves the terminal in a usable state.
     std.posix.sigaction(std.posix.SIG.QUIT, &act, null);
+}
+
+/// wp4-cli-flags: copy the raw value of every CLI-flag-carrier field (see
+/// core/config.zig's field docs) from `opts` into `cfg`, for whichever
+/// parity package (permissions/sessions/sdk) reads it next. Deliberately
+/// does no validation beyond what `args.zig` already did at parse time --
+/// this is a pure carry, not a policy decision.
+fn applyCliFlagCarrierFields(allocator: std.mem.Allocator, cfg: *config_mod.Config, opts: *const cli.CliOptions) !void {
+    if (opts.used_permission_mode_flag) {
+        // approval_mode already carries the (possibly auto->tiered-auto
+        // normalized) value; permission_mode carries the flag's own raw
+        // effect for a package that wants to distinguish "--permission-mode"
+        // from "--approval-mode" specifically.
+        try cfg.setOwnedString(allocator, &cfg.permission_mode, cfg.approval_mode);
+    }
+    if (opts.allowed_tools) |v| try cfg.setOwnedString(allocator, &cfg.allowed_tools, v);
+    if (opts.disallowed_tools) |v| try cfg.setOwnedString(allocator, &cfg.disallowed_tools, v);
+    if (opts.tools_flag) |v| try cfg.setOwnedString(allocator, &cfg.tools_allowlist, v);
+    if (opts.add_dir) |v| try cfg.setOwnedString(allocator, &cfg.additional_directories, v);
+    if (opts.session_id) |v| try cfg.setOwnedString(allocator, &cfg.session_id, v);
+    if (opts.permission_prompts) |v| try cfg.setOwnedString(allocator, &cfg.permission_prompts, v);
+    if (opts.system_prompt) |v| try cfg.setOwnedString(allocator, &cfg.system_prompt_override, v);
+    cfg.no_session_persistence = cfg.no_session_persistence or opts.no_session_persistence;
+    cfg.await_initialize = cfg.await_initialize or opts.await_initialize;
+    cfg.allow_dangerously_skip_permissions = cfg.allow_dangerously_skip_permissions or opts.allow_dangerously_skip_permissions;
+    cfg.verbose = cfg.verbose or opts.verbose;
+    cfg.disable_slash_commands = cfg.disable_slash_commands or opts.disable_slash_commands;
+    cfg.safe_mode = cfg.safe_mode or opts.safe_mode;
+}
+
+/// cli-flags-23: apply `--autocompact <auto|N[k]>` as a process-wide
+/// override via `core/env.zig`'s in-process override map, so
+/// `autocompact_threshold.zig`'s existing `*FromEnv` readers pick it up
+/// with zero changes to that module. "auto" clears any override (an
+/// explicit override map entry set to "" is treated as absent by
+/// `parseUsizeEnv`'s empty-after-trim check). Rejects a value outside
+/// Claude's documented 100k-1M range.
+fn applyAutocompactOverride(raw: []const u8) !void {
+    const env_mod = @import("core/env.zig");
+    if (std.ascii.eqlIgnoreCase(raw, "auto")) {
+        try env_mod.setOverride(@import("core/autocompact_threshold.zig").ENV_AUTO_COMPACT_WINDOW, "");
+        return;
+    }
+    var digits = raw;
+    var multiplier: usize = 1;
+    if (digits.len > 0 and (digits[digits.len - 1] == 'k' or digits[digits.len - 1] == 'K')) {
+        multiplier = 1000;
+        digits = digits[0 .. digits.len - 1];
+    }
+    const value = try std.fmt.parseInt(usize, digits, 10);
+    const tokens = value * multiplier;
+    if (tokens < 100_000 or tokens > 1_000_000) return error.OutOfRange;
+    var buf: [24]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{d}", .{tokens});
+    try env_mod.setOverride(@import("core/autocompact_threshold.zig").ENV_AUTO_COMPACT_WINDOW, s);
 }
 
 /// settings-03 approval gate. Runs the dangerous-key prompt for managed config
@@ -593,6 +656,23 @@ pub fn main(init: std.process.Init) !void {
     if (opts.quiet and opts.log_level == null) {
         log_runtime.setLevelFromString("error") catch {};
     }
+    // cli-flags-14: -d/--debug (and --debug-file, which implies it) enable
+    // debug-level logging, equivalent to --log-level debug, unless an
+    // explicit --log-level already won above. The category filter
+    // (--debug=<filter>/--debug-file's implicit filter) is recorded on
+    // opts.debug_filter but not yet enforced per call-site -- every
+    // std.log call already routes through log_runtime.logFn, which has no
+    // per-call category tag to filter on today; narrowing that is a
+    // follow-on rather than a per-call-site rewrite done here.
+    if (opts.debug and opts.log_level == null) {
+        log_runtime.setLevelFromString("debug") catch {};
+    }
+    if (opts.debug_file) |path| {
+        log_runtime.setOutputFile(path) catch |err| {
+            try std_io.stderrWriter().print("error: --debug-file: cannot open {s} for writing ({s}).\n", .{ path, @errorName(err) });
+            std.process.exit(2);
+        };
+    }
     // Silence the plaintext-api-key warning in machine-readable or
     // explicitly-quiet modes. The warning is security-relevant, so we
     // still emit it by default; operators who asked for --quiet /
@@ -631,6 +711,27 @@ pub fn main(init: std.process.Init) !void {
     if (opts.command == .config_path) {
         try printConfigPaths(allocator, std_io.stdoutWriter());
         return;
+    }
+
+    // cli-flags-08: -w/--worktree creates (or reuses) a git worktree for
+    // this session BEFORE the working directory is resolved, by rewriting
+    // opts.cwd -- resolveWorkingDirectory below then validates/adopts it
+    // exactly like an explicit --cwd, with no other code path changes.
+    if (opts.worktree_requested) {
+        const base_cwd = opts.cwd orelse std.process.currentPathAlloc(rt.io, allocator) catch ".";
+        const wt_path = worktree_launch.resolveWorktreePath(allocator, base_cwd, opts.worktree_name) catch |err| {
+            try std_io.stderrWriter().print(
+                "error: --worktree: could not create/reuse a git worktree in {s} ({s}).\n  - --worktree requires the current directory to be inside a git repository.\n",
+                .{ base_cwd, @errorName(err) },
+            );
+            std.process.exit(2);
+        };
+        opts.cwd = wt_path;
+        if (opts.tmux_mode) |mode| {
+            const session_name = std.fs.path.basename(wt_path);
+            worktree_launch.spawnTmux(allocator, wt_path, session_name);
+            _ = mode; // both "" (bare --tmux) and "classic" degrade to plain tmux (see worktree_launch doc comment)
+        }
     }
 
     const cwd = config_mod.resolveWorkingDirectory(allocator, &opts) catch |err| {
@@ -706,7 +807,7 @@ pub fn main(init: std.process.Init) !void {
                 .{loaded_cfg.config.sandbox},
             ),
             error.InvalidApprovalMode => try stderr.print(
-                "error: invalid --approval-mode '{s}'. Expected one of: tiered-auto, manual, strict.\n",
+                "error: invalid --approval-mode/--permission-mode '{s}'. Expected one of: tiered-auto, manual, strict, acceptEdits, plan, bypassPermissions, dontAsk.\n",
                 .{loaded_cfg.config.approval_mode},
             ),
             error.InvalidProvider => try stderr.print(
@@ -768,6 +869,71 @@ pub fn main(init: std.process.Init) !void {
         }
         std.process.exit(2);
     };
+
+    // wp4-cli-flags: copy every CLI-flag-carrier value into its matching new
+    // Config field (see core/config.zig's field docs). These flags' actual
+    // BEHAVIOR is owned by other parity packages (permissions/sessions/sdk);
+    // this package's contract is only that the flag parses and the value
+    // reaches `cfg` unmutated for that package to consume.
+    try applyCliFlagCarrierFields(allocator, &loaded_cfg.config, &opts);
+
+    // cli-flags-21/22/23: session-scoped overrides that are fully owned by
+    // this package (they layer on top of already-implemented engines --
+    // fallback_model/effort_level/autocompact_threshold -- without touching
+    // config.toml).
+    if (opts.effort) |lvl| {
+        // Already validated/normalized ("xhigh"->"max") at parse time.
+        try loaded_cfg.config.setOwnedString(allocator, &loaded_cfg.config.reasoning_effort, lvl);
+    }
+    if (opts.autocompact) |raw| {
+        applyAutocompactOverride(raw) catch {
+            try std_io.stderrWriter().print(
+                "error: invalid --autocompact '{s}'. Expected \"auto\" or a token count like 200000 or 200k (100k-1M).\n",
+                .{raw},
+            );
+            std.process.exit(2);
+        };
+    }
+    if (opts.agents_json) |raw| {
+        // cli-flags-05: reuse the "spawner sets env, reader reads it"
+        // pattern -- core/agents.zig's list()/findByName() pick this up
+        // via ENV_CLI_AGENTS_JSON with no signature changes at any call
+        // site. Already validated as well-formed JSON at parse time.
+        try @import("core/env.zig").setOverride(@import("core/agents.zig").ENV_CLI_AGENTS_JSON, raw);
+    }
+    if (opts.betas) |raw| {
+        // cli-flags-19: reuse the existing ZCODE_ANTHROPIC_BETA passthrough
+        // (providers/anthropic.zig's buildAnthropicBetaValue already reads
+        // it and appends it to every Anthropic request's anthropic-beta
+        // header) instead of adding a parallel header-injection path.
+        try @import("core/env.zig").setOverride("ZCODE_ANTHROPIC_BETA", raw);
+    }
+    if (opts.fallback_model) |raw| {
+        if (!opts.print) {
+            try std_io.stderrWriter().writeAll("error: --fallback-model only works with --print.\n");
+            std.process.exit(2);
+        }
+        // Claude accepts a comma-separated chain and retries each in order;
+        // zcode's fallback_model field is a single model name today, so the
+        // first entry drives the existing single-hop fallback (documented
+        // narrowing -- a full chain is a follow-on for whichever package
+        // extends agent_runtime.zig's retry loop).
+        var it = std.mem.splitScalar(u8, raw, ',');
+        if (it.next()) |first| {
+            const trimmed = std.mem.trim(u8, first, " \t");
+            if (trimmed.len > 0) {
+                try loaded_cfg.config.setOwnedString(allocator, &loaded_cfg.config.fallback_model, trimmed);
+            }
+        }
+    }
+    if (opts.await_initialize and !(opts.input_format != null and std.mem.eql(u8, opts.input_format.?, "stream-json"))) {
+        try std_io.stderrWriter().writeAll("error: --await-initialize requires --input-format=stream-json.\n");
+        std.process.exit(2);
+    }
+    if (opts.no_session_persistence and !opts.print) {
+        try std_io.stderrWriter().writeAll("error: --no-session-persistence only works with --print.\n");
+        std.process.exit(2);
+    }
 
     // settings-03: before applying managed-file keys for real, gate any
     // dangerous ones (command-helper keys, non-safe env vars, a [hooks]
@@ -870,7 +1036,10 @@ pub fn main(init: std.process.Init) !void {
     // Chrome browser bridge (WebSocket server for lchrome extension)
     var browser_bridge = browser_bridge_mod.BrowserBridge.init(allocator, loaded_cfg.config.browser_bridge_port);
     var browser_bridge_started = false;
-    if (loaded_cfg.config.browser_bridge_enabled) {
+    // cli-flags-20: --chrome/--no-chrome override browser_bridge_enabled for
+    // this process only.
+    const chrome_enabled = opts.chrome orelse loaded_cfg.config.browser_bridge_enabled;
+    if (chrome_enabled) {
         browser_bridge.start() catch |err| {
             std.log.warn("Chrome bridge: failed to start: {s}", .{@errorName(err)});
         };
@@ -1402,7 +1571,33 @@ fn dispatch(
         },
         // phase-26 daemon-background-01/09/10: the detached-session surface.
         .ps => try bg_cmds.cmdPs(allocator, stdout),
+        // cli-flags-27: kill/stop keep the registry entry (marking it
+        // .stopped) so `attach` can reopen the conversation; `rm` is the
+        // destructive delete kill used to perform unconditionally.
         .kill => try bg_cmds.cmdKill(allocator, opts.subject orelse return error.MissingToolArg, stdout),
+        .rm => try bg_cmds.cmdRm(allocator, opts.subject orelse return error.MissingToolArg, stdout),
+        .attach => {
+            const subject = opts.subject orelse return error.MissingToolArg;
+            const session_id = bg_cmds.resolveAttachSessionId(allocator, subject) catch |err| switch (err) {
+                error.NoSessionId => {
+                    try stdout.print("session {s} has no recorded session_id; cannot attach.\n", .{subject});
+                    std.process.exit(1);
+                },
+                else => return err,
+            };
+            const sid = session_id orelse {
+                try stdout.print("no such session: {s}\n", .{subject});
+                std.process.exit(1);
+            };
+            defer allocator.free(sid);
+            // Reuse the exact interactive-resume path `--resume`/`session
+            // resume` already implements, just with the id resolved from
+            // the background-session registry instead of typed by hand.
+            session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, sid, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent) catch |err| switch (err) {
+                error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
+                else => return err,
+            };
+        },
         .logs => try bg_cmds.cmdLogs(allocator, opts.subject orelse return error.MissingToolArg, stdout),
         .mcp_list => session_mgmt.cmdMcpList(allocator, mcp, stdout) catch |err| switch (err) {
             error.InvalidMcpRegistry => std.process.exit(1),
@@ -1499,6 +1694,15 @@ fn dispatch(
             const ok = try enterprise_doctor.run(allocator, cwd, cfg, opts.json, stdout);
             if (!ok) std.process.exit(1);
         },
+        // cli-flags-28: bare `zcode doctor` is a general installation health
+        // check, distinct from the managed-policy-specific `doctor
+        // enterprise`.
+        .doctor_general => {
+            const ok = try enterprise_doctor.runGeneral(allocator, cwd, cfg, opts.json, stdout);
+            if (!ok) std.process.exit(1);
+        },
+        .project_purge => try project_purge.run(allocator, cwd, opts.subject, opts.dry_run, opts.yolo, stdout),
+        .respawn => try bg_cmds.cmdRespawn(allocator, opts.subject, opts.respawn_all, stdout),
         .benchmark_run => try session_mgmt.cmdBenchmarkRun(allocator, cwd, cfg, policy, stdout),
         .api_schema => try api_server.cmdApiSchema(stdout),
         .api_serve => try api_server.cmdApiServe(allocator, cwd, cfg, policy, audit, store, mcp, browser, stdout),
@@ -1523,7 +1727,25 @@ fn dispatch(
             error.UsageErrorReported => std.process.exit(2),
             else => return err,
         },
-        .update => try update.cmdUpdateWithConfig(allocator, cfg, stdout),
+        .update => {
+            // cli-flags-30: `zcode install <target>` with a concrete
+            // pinned-version target (not "stable"/"latest"/absent) has no
+            // support in the self-updater yet -- report that plainly
+            // rather than silently installing latest under a different
+            // name than the one requested.
+            if (opts.install_requested) {
+                if (opts.subject) |target| {
+                    if (!std.mem.eql(u8, target, "stable") and !std.mem.eql(u8, target, "latest")) {
+                        try stdout.print(
+                            "zcode install: pinned-version installs ('{s}') are not yet supported.\n  - Run `zcode update` (or `zcode install latest`) for the latest version.\n",
+                            .{target},
+                        );
+                        return;
+                    }
+                }
+            }
+            try update.cmdUpdateWithConfig(allocator, cfg, stdout);
+        },
         .help => try cli.printUsage(stdout),
         .list_env => {
             // Already handled in main() before dispatch; reach this
