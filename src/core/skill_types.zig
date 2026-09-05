@@ -280,7 +280,7 @@ fn parseContext(v: ?[]const u8) SkillContext {
 /// caller dupes it. Only the JSON-object form is supported (a constrained format
 /// in place of a YAML sub-parser, per the skills-11 footgun note); a non-`{`
 /// value degrades to "" rather than faulting.
-fn hooksJsonFrom(fm: []const u8) []const u8 {
+pub fn hooksJsonFrom(fm: []const u8) []const u8 {
     const v = frontmatter.getValue(fm, "hooks") orelse return "";
     const t = std.mem.trim(u8, v, " \t\r");
     if (t.len == 0 or t[0] != '{') return "";

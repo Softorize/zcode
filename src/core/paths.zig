@@ -88,6 +88,29 @@ pub fn resolve(allocator: std.mem.Allocator) !PathSet {
     };
 }
 
+/// Resolve `~/.claude`, the reference's user-scope config home -- independent
+/// of zcode's own `~/.zcode` / `$XDG_CONFIG_HOME/zcode` home. Every
+/// config-layout compatibility fallback ("also read the Claude Code
+/// location") shares this single HOME lookup so a machine or repo already
+/// configured for Claude Code works with zcode unchanged (see
+/// docs: the `wp5a-config-layout` package notes).
+pub fn claudeHomeDir(allocator: std.mem.Allocator) ![]u8 {
+    const home = @import("env.zig").getOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => try allocator.dupe(u8, "/tmp"),
+        else => return err,
+    };
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".claude" });
+}
+
+/// Join a relative path onto `~/.claude` (e.g. "settings.json", "commands",
+/// "agents/reviewer.md"). Caller owns the returned slice.
+pub fn claudeHomePathAlloc(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
+    const home = try claudeHomeDir(allocator);
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, rel });
+}
+
 pub fn workspaceConfigPath(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
     return workspacePathAlloc(allocator, cwd, "config.toml");
 }
@@ -153,4 +176,17 @@ test "workspaceDirNameAlloc returns dir" {
     const name = try workspaceDirNameAlloc(alloc, "/p");
     defer alloc.free(name);
     try testing.expectEqualStrings(PRIMARY_WORKSPACE_DIR, name);
+}
+
+test "claudeHomePathAlloc joins onto HOME/.claude" {
+    const alloc = testing.allocator;
+    const home = try @import("env.zig").getOwned(alloc, "HOME");
+    defer alloc.free(home);
+
+    const settings = try claudeHomePathAlloc(alloc, "settings.json");
+    defer alloc.free(settings);
+
+    const expected = try std.fs.path.join(alloc, &.{ home, ".claude", "settings.json" });
+    defer alloc.free(expected);
+    try testing.expectEqualStrings(expected, settings);
 }

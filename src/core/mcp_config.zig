@@ -232,6 +232,23 @@ pub fn freeServerConfigs(allocator: std.mem.Allocator, servers: []ServerConfig) 
     if (servers.len > 0) allocator.free(servers);
 }
 
+/// config-layout-12: concatenate two already-owned `ServerConfig` slices from
+/// the SAME `mergeScopes` scope bucket (e.g. two user-scope sources) into one
+/// new slice, `a` first then `b`. `mergeScopes`'s within-scope merge keeps the
+/// LAST occurrence of a given name, so put the source that should win a
+/// same-name conflict in `b`. Frees both inputs; the caller owns the result
+/// (an empty input is returned as-is with no allocation).
+pub fn concatServerConfigs(allocator: std.mem.Allocator, a: []ServerConfig, b: []ServerConfig) ![]ServerConfig {
+    if (a.len == 0) return b;
+    if (b.len == 0) return a;
+    const out = try allocator.alloc(ServerConfig, a.len + b.len);
+    @memcpy(out[0..a.len], a);
+    @memcpy(out[a.len..], b);
+    allocator.free(a);
+    allocator.free(b);
+    return out;
+}
+
 /// Deep-copy a `ServerConfig`. All owned slices are duplicated so the copy can
 /// be freed independently with `deinit`. Used by callers (e.g. `agents.clone`)
 /// that need an independent owned copy of a spec carrying MCP servers.
@@ -898,6 +915,64 @@ pub fn enterpriseFileExists(allocator: std.mem.Allocator) bool {
     const cwd = std.Io.Dir.cwd();
     cwd.access(rt.io, path, .{}) catch return false;
     return true;
+}
+
+/// config-layout-12: `~/.claude.json`'s top-level `mcpServers` object is the
+/// reference's user-scope MCP registry -- separate from zcode's own
+/// `{zcode_home}/mcp/servers.json` legacy registry. The file is already
+/// shaped `{ "mcpServers": {...}, ... }` at the top level, so it reuses
+/// `loadMcpJsonFile`/`parseMcpJson` directly with no reshaping. A missing
+/// file or missing key yields an empty (not an error) result, matching every
+/// other optional scope loader in this module.
+pub fn loadClaudeDotJsonUserScope(allocator: std.mem.Allocator, expand_vars: bool) !ParseResult {
+    const path = try claudeDotJsonPath(allocator);
+    defer allocator.free(path);
+    return loadMcpJsonFile(allocator, path, .user, expand_vars);
+}
+
+/// config-layout-12: `~/.claude.json`'s `projects["<cwd>"].mcpServers` is the
+/// reference's local (per-project) MCP scope. Re-wraps the nested object as a
+/// `.mcp.json`-shaped body (`{"mcpServers": {...}}`) and reuses the canonical
+/// parser -- the same "serialize then reparse" technique `agents.zig`'s
+/// `parseAgentMcpServers` already uses to avoid a bespoke recursive value
+/// walk. A missing file, missing `projects` key, or no entry for `cwd`
+/// yields an empty (not an error) result.
+pub fn loadClaudeDotJsonLocalScope(allocator: std.mem.Allocator, cwd: []const u8, expand_vars: bool) !ParseResult {
+    const path = try claudeDotJsonPath(allocator);
+    defer allocator.free(path);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(MAX_MCP_JSON_BYTES)) catch |err| switch (err) {
+        error.FileNotFound => return .{ .servers = &.{}, .errors = &.{} },
+        else => return .{ .servers = &.{}, .errors = &.{} },
+    };
+    defer allocator.free(bytes);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch {
+        return .{ .servers = &.{}, .errors = &.{} };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .servers = &.{}, .errors = &.{} };
+
+    const projects_v = parsed.value.object.get("projects") orelse return .{ .servers = &.{}, .errors = &.{} };
+    if (projects_v != .object) return .{ .servers = &.{}, .errors = &.{} };
+    const project_v = projects_v.object.get(cwd) orelse return .{ .servers = &.{}, .errors = &.{} };
+    if (project_v != .object) return .{ .servers = &.{}, .errors = &.{} };
+    const servers_v = project_v.object.get("mcpServers") orelse return .{ .servers = &.{}, .errors = &.{} };
+    if (servers_v != .object) return .{ .servers = &.{}, .errors = &.{} };
+
+    var body = std_io.StringBuilder.init(allocator);
+    defer body.deinit();
+    try body.writer().writeAll("{\"mcpServers\":");
+    try std.json.Stringify.value(servers_v, .{}, body.writer());
+    try body.writer().writeByte('}');
+
+    return parseMcpJson(allocator, body.items(), .local, expand_vars);
+}
+
+fn claudeDotJsonPath(allocator: std.mem.Allocator) ![]u8 {
+    const home = try @import("env.zig").getOwned(allocator, "HOME");
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".claude.json" });
 }
 
 /// Inputs to the scope merge. A scope's servers and errors are MOVED into the
