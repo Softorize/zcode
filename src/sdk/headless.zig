@@ -59,6 +59,7 @@ const plugins_mod = @import("../core/plugins.zig");
 const permission_decision_mod = @import("../core/permission_decision.zig");
 const env_mod = @import("../core/env.zig");
 const args_json = @import("args_json.zig");
+const skills_mod = @import("../core/skills.zig");
 
 const agent_runtime = @import("../agent_runtime.zig");
 const AgentRuntime = agent_runtime.AgentRuntime;
@@ -114,6 +115,15 @@ pub const RunCaps = struct {
     /// but the observable outcome the reference specifies -- no session file
     /// left behind for the run -- is honored.
     no_session_persistence: bool = false,
+    /// headless-sdk-14: `--forward-subagent-text`. When true, each completed
+    /// Agent/subagent tool call in this turn's stream-json output also emits
+    /// the subagent's own (real) prompt as a `user` line and its own (real)
+    /// final text as an `assistant` line, both carrying `parent_tool_use_id`
+    /// set to that tool call's tool_use id -- see
+    /// `maybeForwardSubagentText`. Validated (requires --print and
+    /// --output-format=stream-json) by
+    /// `sdk_output.validateForwardSubagentTextGate` before a run starts.
+    forward_subagent_text: bool = false,
 };
 
 /// Everything a headless turn needs that is not part of the transport: the
@@ -215,6 +225,129 @@ fn buildToolEvents(
         built += 1;
     }
     return out;
+}
+
+/// True for the model-facing names the subagent-launcher tool is dispatched
+/// under (tools-01: "Agent" is reference-exact; "AgentRun"/"agent_run" are
+/// zcode's legacy dispatch-only synonyms -- see agent_tools.isAgentRunTool).
+/// headless-sdk-16: the current, sorted, allocator-owned list of skill/
+/// command names visible at `cwd` (read-only use of `core/skills.list` --
+/// the actual discovery logic is that module's, not duplicated here).
+/// Caller frees with `freeOwnedStrings`.
+fn snapshotSortedSkillNames(allocator: std.mem.Allocator, cwd: []const u8) ![][]u8 {
+    const specs = try skills_mod.list(allocator, cwd);
+    defer skills_mod.freeList(allocator, specs);
+
+    const names = try allocator.alloc([]u8, specs.len);
+    var filled: usize = 0;
+    errdefer {
+        for (names[0..filled]) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    for (specs) |s| {
+        names[filled] = try allocator.dupe(u8, s.name);
+        filled += 1;
+    }
+    std.mem.sort([]u8, names, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    return names;
+}
+
+/// Exact-equality check for two sorted name lists (same length, same names in
+/// the same order). Used by `maybeEmitCommandsChanged` to decide whether the
+/// skill/command list genuinely changed since the last turn.
+fn skillNameListsEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
+}
+
+fn isAgentToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "Agent") or std.mem.eql(u8, name, "AgentRun") or std.mem.eql(u8, name, "agent_run");
+}
+
+/// Pull a top-level string field out of a small JSON object, or null when the
+/// object doesn't parse, the field is absent, not a string, or empty.
+/// Returns an allocator-owned copy; caller frees.
+fn extractJsonStringField(allocator: std.mem.Allocator, json_text: []const u8, field: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return null;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const val = obj.get(field) orelse return null;
+    const s = switch (val) {
+        .string => |str| str,
+        else => return null,
+    };
+    if (s.len == 0) return null;
+    return try allocator.dupe(u8, s);
+}
+
+/// A completed foreground Agent/subagent tool call's own final text, or null
+/// when `output_text` isn't shaped like one (a background spawn's "Agent
+/// spawned in background..." message, a denied/blocked call, or any other
+/// tool's output). `spawnChildAgent` (agent_runtime.zig) always embeds the
+/// child's real final text after a "\n---\n" marker in its enriched output
+/// -- this recovers exactly that, never a guess. Borrows from `output_text`.
+fn extractSubagentFinalText(output_text: []const u8) ?[]const u8 {
+    const marker = "\n---\n";
+    const idx = std.mem.indexOf(u8, output_text, marker) orelse return null;
+    const text = output_text[idx + marker.len ..];
+    if (text.len == 0) return null;
+    return text;
+}
+
+/// headless-sdk-14 (`--forward-subagent-text`): forward a completed Agent/
+/// subagent tool call's own REAL prompt (as a `user` line) and REAL final
+/// text (as an `assistant` line), both tagged `parent_tool_use_id = ev.
+/// tool_use_id` -- in addition to (not instead of) the normal tool_use/
+/// tool_result pair the caller already emitted for `ev`. A no-op for every
+/// non-Agent tool, and a no-op whenever the expected shape isn't present
+/// (background spawn, denied call): nothing here is ever fabricated.
+///
+/// Honest, documented scope limit: only the subagent's own PROMPT and FINAL
+/// text are forwarded -- not its extended-thinking text, and not each of its
+/// own intermediate rounds. zcode's turn loop does not carry a subagent's
+/// per-round text or reasoning_text back out through its ToolTrace today (the
+/// reference's own "thinking blocks" half of this flag is not yet wired).
+fn maybeForwardSubagentText(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    session_id: []const u8,
+    forward_enabled: bool,
+    ev: ToolEvent,
+) !void {
+    if (!forward_enabled) return;
+    if (!isAgentToolName(ev.name)) return;
+
+    if (try extractJsonStringField(allocator, ev.input_json, "prompt")) |prompt_text| {
+        defer allocator.free(prompt_text);
+        const u_uuid = try uuid_mod.allocV4(allocator);
+        defer allocator.free(u_uuid);
+        const line = try output.serializeForwardedUserText(allocator, prompt_text, ev.tool_use_id, session_id, u_uuid);
+        defer allocator.free(line);
+        try writer.writeAll(line);
+    }
+
+    if (extractSubagentFinalText(ev.output_text)) |final_text| {
+        const a_uuid = try uuid_mod.allocV4(allocator);
+        defer allocator.free(a_uuid);
+        const line = try output.serializeAssistant(allocator, .{
+            .session_id = session_id,
+            .uuid = a_uuid,
+            .parent_tool_use_id = ev.tool_use_id,
+            .content = &.{.{ .text = final_text }},
+        });
+        defer allocator.free(line);
+        try writer.writeAll(line);
+    }
 }
 
 /// Build the `result.permission_denials` entries out of a turn's tool events
@@ -362,6 +495,7 @@ fn runTurn(
             .stop_reason = stop_reason,
             .structured_output_json = if (rc.caps.json_schema) |s| try allocator.dupe(u8, s) else "",
             .uuid = try uuid_mod.allocV4(allocator),
+            .final_thinking = if (result.final_thinking) |t| try allocator.dupe(u8, t) else "",
         },
         .tool_events = tool_events,
     };
@@ -374,6 +508,7 @@ pub fn freeResult(allocator: std.mem.Allocator, result: *output.Result) void {
     allocator.free(result.model);
     if (result.structured_output_json.len > 0) allocator.free(result.structured_output_json);
     if (result.uuid.len > 0) allocator.free(result.uuid);
+    if (result.final_thinking.len > 0) allocator.free(result.final_thinking);
 }
 
 /// headless-sdk-02 (`--no-session-persistence`): remove the on-disk session
@@ -594,19 +729,33 @@ pub fn runOutput(
                 );
                 defer allocator.free(tool_result_line);
                 try writer.writeAll(tool_result_line);
+
+                try maybeForwardSubagentText(allocator, writer, result.session_id, rc.caps.forward_subagent_text, ev);
             }
 
             // The final assistant text message: this is the only assistant
             // event that carries model/stop_reason/usage (headless-sdk-08).
             const msg_uuid = try uuid_mod.allocV4(allocator);
             defer allocator.free(msg_uuid);
+            // headless-sdk-missed-184: a real thinking block, when the model
+            // returned one, precedes the text block -- matching the
+            // reference's Messages API content ordering for extended
+            // thinking. Never emitted when final_thinking is empty.
+            var content_buf: [2]output.ContentBlock = undefined;
+            var content_len: usize = 0;
+            if (result.final_thinking.len > 0) {
+                content_buf[content_len] = .{ .thinking = result.final_thinking };
+                content_len += 1;
+            }
+            content_buf[content_len] = .{ .text = result.result_text };
+            content_len += 1;
             const assistant_line = try output.serializeAssistant(allocator, .{
                 .session_id = result.session_id,
                 .uuid = msg_uuid,
                 .model = result.model,
                 .stop_reason = result.stop_reason,
                 .usage = result.usage,
-                .content = &.{.{ .text = result.result_text }},
+                .content = content_buf[0..content_len],
             });
             defer allocator.free(assistant_line);
             try writer.writeAll(assistant_line);
@@ -652,6 +801,11 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
         /// Scratch buffer holding the most recent turn's final text (duped so it
         /// outlives the TurnResult). Freed on the next turn and on deinit.
         last_text: []u8 = &.{},
+        /// headless-sdk-missed-184: scratch buffer holding the most recent
+        /// turn's extended-thinking text (duped so it outlives the
+        /// TurnResult), or empty when the turn had none. Freed on the next
+        /// turn and on deinit, same lifetime discipline as `last_text`.
+        last_thinking: []u8 = &.{},
         /// The most recent turn's mapped tool events (headless-sdk-07/
         /// missed-182), owned. Freed on the next turn and on deinit.
         last_tool_events: []ToolEvent = &.{},
@@ -684,6 +838,21 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
         /// another package) -- stored so the toggle is no longer silently
         /// dropped, ready for that trigger to consult.
         sdk_prompt_suggestions_enabled: bool = false,
+        /// headless-sdk-16: the skill/command names observed after the most
+        /// recent turn, sorted, owned. Compared against the fresh snapshot
+        /// taken after each subsequent turn (`maybeEmitCommandsChanged`) --
+        /// a real, working "mid-session change" detector (e.g. the agent
+        /// `cd`s into a subdirectory with its own `.claude/skills`, or a
+        /// Write/Edit tool call adds a new skill file), not a guess. Empty
+        /// (not yet observed) until the first turn completes; the first
+        /// observation only seeds the baseline, it never emits (there is no
+        /// "previous" list to have changed from).
+        known_command_names: [][]u8 = &.{},
+        /// True once `known_command_names` reflects a real prior
+        /// observation. Distinguishes "haven't looked yet" from "looked,
+        /// and there were zero skills" -- both start as an empty slice, but
+        /// only the latter should compare-and-emit on the next turn.
+        has_command_baseline: bool = false,
 
         pub fn init(rc: RunContext, reader: Reader, writer: Writer, out_format: output.OutputFormat) Self {
             return .{ .rc = rc, .reader = reader, .writer = writer, .out_format = out_format };
@@ -693,6 +862,10 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             if (self.last_text.len > 0) {
                 self.rc.allocator.free(self.last_text);
                 self.last_text = &.{};
+            }
+            if (self.last_thinking.len > 0) {
+                self.rc.allocator.free(self.last_thinking);
+                self.last_thinking = &.{};
             }
             if (self.last_result_uuid.len > 0) {
                 self.rc.allocator.free(self.last_result_uuid);
@@ -704,6 +877,8 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             }
             freeOwnedStrings(self.rc.allocator, self.sdk_agent_names);
             self.sdk_agent_names = &.{};
+            freeOwnedStrings(self.rc.allocator, self.known_command_names);
+            self.known_command_names = &.{};
             freeOwnedStrings(self.rc.allocator, self.sdk_mcp_server_names);
             self.sdk_mcp_server_names = &.{};
             if (self.sdk_json_schema) |s| {
@@ -913,6 +1088,8 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
                 );
                 defer allocator.free(tool_result_line);
                 try self.writeAll(tool_result_line);
+
+                try maybeForwardSubagentText(allocator, self, result.session_id, self.rc.caps.forward_subagent_text, ev);
             }
 
             // The final assistant text message: the only assistant event that
@@ -921,6 +1098,16 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             // uuid (missed-186).
             const msg_uuid = try uuid_mod.allocV4(allocator);
             defer allocator.free(msg_uuid);
+            // headless-sdk-missed-184: see the one-shot path above -- same
+            // "thinking block precedes text, only when real" rule.
+            var content_buf: [2]output.ContentBlock = undefined;
+            var content_len: usize = 0;
+            if (result.final_thinking.len > 0) {
+                content_buf[content_len] = .{ .thinking = result.final_thinking };
+                content_len += 1;
+            }
+            content_buf[content_len] = .{ .text = result.result_text };
+            content_len += 1;
             const assistant_line = try output.serializeAssistant(allocator, .{
                 .session_id = result.session_id,
                 .uuid = msg_uuid,
@@ -928,7 +1115,7 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
                 .stop_reason = result.stop_reason,
                 .usage = result.usage,
                 .user_message_uuid = message_uuid,
-                .content = &.{.{ .text = result.result_text }},
+                .content = content_buf[0..content_len],
             });
             defer allocator.free(assistant_line);
             try self.writeAll(assistant_line);
@@ -938,6 +1125,12 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             const line = try output.serializeResult(allocator, result_with_uuid, denials);
             defer allocator.free(line);
             try self.writeAll(line);
+
+            // headless-sdk-16: check for a real mid-session skill/command-list
+            // change (e.g. the turn just ran `cd` into a subdirectory with its
+            // own `.claude/skills`, or wrote a new skill file) after the
+            // result line, per the reference's own fire-and-forget push.
+            self.maybeEmitCommandsChanged(runtime.cwd, result.session_id);
         }
 
         /// Run one turn on the persistent runtime and map it to an SDK result.
@@ -987,6 +1180,10 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             // serialized the result line.
             if (self.last_text.len > 0) allocator.free(self.last_text);
             self.last_text = try allocator.dupe(u8, tr.final_text);
+            // headless-sdk-missed-184: same lifetime discipline as last_text
+            // above -- tr.final_thinking is freed when tr deinits.
+            if (self.last_thinking.len > 0) allocator.free(self.last_thinking);
+            self.last_thinking = if (tr.final_thinking) |t| try allocator.dupe(u8, t) else &.{};
             if (self.last_result_uuid.len > 0) allocator.free(self.last_result_uuid);
             self.last_result_uuid = try uuid_mod.allocV4(allocator);
             return .{
@@ -996,11 +1193,44 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
                 .num_turns = tr.rounds,
                 .total_cost_usd = est_cost,
                 .usage = usage,
+                .final_thinking = self.last_thinking,
                 .model = runtime.active_model,
                 .stop_reason = stop_reason,
                 .structured_output_json = "",
                 .uuid = self.last_result_uuid,
             };
+        }
+
+        /// headless-sdk-16: a real, working "mid-session change" detector.
+        /// Snapshots the skill/command names visible at `cwd` right now and
+        /// compares them against the previous turn's snapshot; on an actual
+        /// difference, emits `commands_changed` with the full new list
+        /// (never a diff -- matches the reference's "clients should REPLACE
+        /// their cached command list" contract) and writes it via `self.
+        /// writeAll`. The very first observation only seeds the baseline: a
+        /// brand-new session has no "previous" list to have changed from.
+        /// Best-effort: any error here is swallowed rather than failing an
+        /// otherwise-successful turn.
+        fn maybeEmitCommandsChanged(self: *Self, cwd: []const u8, session_id: []const u8) void {
+            const allocator = self.rc.allocator;
+            const fresh = snapshotSortedSkillNames(allocator, cwd) catch return;
+
+            if (self.has_command_baseline and !skillNameListsEqual(self.known_command_names, fresh)) {
+                emit: {
+                    const const_view = allocator.alloc([]const u8, fresh.len) catch break :emit;
+                    defer allocator.free(const_view);
+                    for (fresh, 0..) |n, i| const_view[i] = n;
+                    const uuid = uuid_mod.allocV4(allocator) catch break :emit;
+                    defer allocator.free(uuid);
+                    const line = output.serializeCommandsChanged(allocator, const_view, session_id, uuid) catch break :emit;
+                    defer allocator.free(line);
+                    self.writeAll(line) catch {};
+                }
+            }
+
+            freeOwnedStrings(allocator, self.known_command_names);
+            self.known_command_names = fresh;
+            self.has_command_baseline = true;
         }
 
         fn onControlRequest(ctx: *anyopaque, raw: []const u8) anyerror!void {
@@ -1558,6 +1788,122 @@ test "extractRequestId pulls the request_id out of a control_request line" {
     try testing.expectEqualStrings("cli-deadbeef", extractRequestId(line).?);
 }
 
+test "headless-sdk-14: isAgentToolName recognizes the reference name and its dispatch-only legacy synonyms" {
+    try testing.expect(isAgentToolName("Agent"));
+    try testing.expect(isAgentToolName("AgentRun"));
+    try testing.expect(isAgentToolName("agent_run"));
+    try testing.expect(!isAgentToolName("Task"));
+    try testing.expect(!isAgentToolName("Bash"));
+}
+
+test "headless-sdk-14: extractJsonStringField pulls a string field or null" {
+    const alloc = testing.allocator;
+    {
+        const got = try extractJsonStringField(alloc, "{\"prompt\":\"investigate the bug\",\"subagent_type\":\"explore\"}", "prompt");
+        defer if (got) |g| alloc.free(g);
+        try testing.expectEqualStrings("investigate the bug", got.?);
+    }
+    // Missing field -> null.
+    try testing.expect((try extractJsonStringField(alloc, "{\"subagent_type\":\"explore\"}", "prompt")) == null);
+    // Not a string -> null (never coerces a non-string into forwarded text).
+    try testing.expect((try extractJsonStringField(alloc, "{\"prompt\":5}", "prompt")) == null);
+    // Unparseable JSON -> null, not an error.
+    try testing.expect((try extractJsonStringField(alloc, "not json", "prompt")) == null);
+}
+
+test "headless-sdk-14: extractSubagentFinalText recovers the text after spawnChildAgent's marker, or null" {
+    try testing.expectEqualStrings(
+        "found the race condition in auth.zig:42",
+        extractSubagentFinalText("subagent_rounds=3\n---\nfound the race condition in auth.zig:42").?,
+    );
+    // A background spawn's status message has no marker -> not forwarded.
+    try testing.expect(extractSubagentFinalText("Agent spawned in background.\nbackground_agent_id=task-1") == null);
+    // Some other tool's plain output has no marker either.
+    try testing.expect(extractSubagentFinalText("edit ok: 1 replacement") == null);
+}
+
+/// Test-only ToolEvent builder: dupes each field so it's freed the same way
+/// `buildToolEvents` output is (via `ToolEvent.deinit`), rather than fighting
+/// `[]u8`-vs-string-literal mutability in every test fixture.
+fn testToolEvent(alloc: std.mem.Allocator, tool_use_id: []const u8, name: []const u8, input_json: []const u8, output_text: []const u8) !ToolEvent {
+    return .{
+        .tool_use_id = try alloc.dupe(u8, tool_use_id),
+        .name = try alloc.dupe(u8, name),
+        .input_json = try alloc.dupe(u8, input_json),
+        .output_text = try alloc.dupe(u8, output_text),
+        .denied = false,
+        .is_error = false,
+    };
+}
+
+test "headless-sdk-14: maybeForwardSubagentText emits user+assistant lines tagged with parent_tool_use_id for an Agent call" {
+    const alloc = testing.allocator;
+    var buf = std_io.StringBuilder.init(alloc);
+    defer buf.deinit();
+    const Sink = struct {
+        sb: *std_io.StringBuilder,
+        fn writeAll(self: @This(), bytes: []const u8) !void {
+            try self.sb.appendSlice(bytes);
+        }
+    };
+
+    var ev = try testToolEvent(alloc, "toolu_sess_0", "Agent", "{\"prompt\":\"investigate the auth bug\",\"subagent_type\":\"explore\"}", "subagent_rounds=1\n---\nfound it: race condition in auth.zig:42");
+    defer ev.deinit(alloc);
+    try maybeForwardSubagentText(alloc, Sink{ .sb = &buf }, "sess-9", true, ev);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, buf.items(), "\n"), '\n');
+    const user_line = lines.next().?;
+    const assistant_line = lines.next().?;
+    try testing.expect(lines.next() == null);
+
+    var up = try std.json.parseFromSlice(std.json.Value, alloc, user_line, .{});
+    defer up.deinit();
+    try testing.expectEqualStrings("user", up.value.object.get("type").?.string);
+    try testing.expectEqualStrings("toolu_sess_0", up.value.object.get("parent_tool_use_id").?.string);
+    try testing.expectEqualStrings("investigate the auth bug", up.value.object.get("message").?.object.get("content").?.array.items[0].object.get("text").?.string);
+
+    var ap = try std.json.parseFromSlice(std.json.Value, alloc, assistant_line, .{});
+    defer ap.deinit();
+    try testing.expectEqualStrings("assistant", ap.value.object.get("type").?.string);
+    try testing.expectEqualStrings("toolu_sess_0", ap.value.object.get("parent_tool_use_id").?.string);
+    try testing.expectEqualStrings("found it: race condition in auth.zig:42", ap.value.object.get("message").?.object.get("content").?.array.items[0].object.get("text").?.string);
+}
+
+test "headless-sdk-14: maybeForwardSubagentText is a no-op when disabled, for a non-Agent tool, or with no matching shape" {
+    const alloc = testing.allocator;
+    var buf = std_io.StringBuilder.init(alloc);
+    defer buf.deinit();
+    const Sink = struct {
+        sb: *std_io.StringBuilder,
+        fn writeAll(self: @This(), bytes: []const u8) !void {
+            try self.sb.appendSlice(bytes);
+        }
+    };
+
+    var agent_ev = try testToolEvent(alloc, "toolu_1", "Agent", "{\"prompt\":\"x\"}", "subagent_rounds=1\n---\nx done");
+    defer agent_ev.deinit(alloc);
+    // Flag off -> nothing emitted even for a real Agent call.
+    try maybeForwardSubagentText(alloc, Sink{ .sb = &buf }, "sess", false, agent_ev);
+    try testing.expectEqual(@as(usize, 0), buf.items().len);
+
+    // A non-Agent tool -> nothing emitted even with the flag on.
+    var bash_ev = try testToolEvent(alloc, "toolu_2", "Bash", "{\"command\":\"ls\"}", "file1\nfile2");
+    defer bash_ev.deinit(alloc);
+    try maybeForwardSubagentText(alloc, Sink{ .sb = &buf }, "sess", true, bash_ev);
+    try testing.expectEqual(@as(usize, 0), buf.items().len);
+
+    // A background-spawned Agent call (no "---\n" marker yet, no synchronous
+    // final text) -> the prompt is still forwarded, but no fabricated
+    // assistant line for text that doesn't exist yet.
+    var bg_ev = try testToolEvent(alloc, "toolu_3", "Agent", "{\"prompt\":\"do it in the background\",\"run_in_background\":true}", "Agent spawned in background.\nbackground_agent_id=task-1");
+    defer bg_ev.deinit(alloc);
+    try maybeForwardSubagentText(alloc, Sink{ .sb = &buf }, "sess", true, bg_ev);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, buf.items(), "\n"), '\n');
+    const only_line = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only_line, "\"type\":\"user\"") != null);
+}
+
 test "LIVE: --output-format json emits a single parseable SDK result (not the legacy blob)" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1804,6 +2150,57 @@ test "LIVE: a deny control_response drives the gate to block the tool" {
     try testing.expect(std.mem.indexOf(u8, host.out.items, "\"permission_denials\":[{") != null);
     try testing.expect(std.mem.indexOf(u8, host.out.items, "\"tool_input\":{\"command\":\"echo hi\"}") != null);
     try testing.expect(std.mem.indexOf(u8, host.out.items, "\"tool_use_input\"") == null);
+}
+
+test "LIVE: headless-sdk-16 -- commands_changed fires only after a real mid-session skill-list change" {
+    const alloc = testing.allocator;
+    const env = @import("../core/env.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    // Two plain no-tool-call turns -- the point is the skill list, not the
+    // model's own text.
+    try env.setOverride("ZCODE_MOCK_RESPONSE", "{\"assistant\":\"ok\",\"tool_calls\":[]}");
+    defer env.clearOverrides();
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    try host.queue("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"turn one\"}}");
+
+    const rc = h.runContext();
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(rc, &host, &host, .json);
+    defer session.deinit();
+    try session.run();
+
+    // Turn 1 only seeds the baseline (nothing to have changed from yet).
+    try testing.expect(std.mem.indexOf(u8, host.out.items, "commands_changed") == null);
+    const out_len_after_turn_one = host.out.items.len;
+
+    // Simulate a tool call having added a new skill mid-session (the
+    // reference's own cited example: "skills discovered dynamically as the
+    // agent works in a subdirectory") -- write it directly rather than
+    // scripting a Write tool call, since the mechanism under test is the
+    // POST-TURN detection, not the write itself.
+    var cwd_dir = try std.Io.Dir.cwd().openDir(rt.io, root, .{});
+    defer cwd_dir.close(rt.io);
+    try cwd_dir.createDirPath(rt.io, ".zcode/skills/discovered-skill");
+    try cwd_dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/skills/discovered-skill/SKILL.md",
+        .data = "---\nname: discovered-skill\ndescription: found mid-session\n---\nBody.\n",
+    });
+
+    try host.queue("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"turn two\"}}");
+    try session.run();
+
+    const turn_two_output = host.out.items[out_len_after_turn_one..];
+    try testing.expect(std.mem.indexOf(u8, turn_two_output, "\"type\":\"system\",\"subtype\":\"commands_changed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, turn_two_output, "discovered-skill") != null);
 }
 
 test "LIVE: stream-json control_request set_model mutates the live runtime and replies success" {

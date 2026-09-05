@@ -77,6 +77,23 @@ pub fn validateVerboseGate(format: OutputFormat, verbose: bool) error{StreamJson
     }
 }
 
+/// headless-sdk-14: `--forward-subagent-text` is only meaningful with
+/// `--print` and `--output-format=stream-json` -- without stream-json there
+/// is no NDJSON channel to carry the extra `assistant`/`user` lines on, and
+/// without `--print` there is no headless turn to forward from at all.
+/// Message text matches the reference's own validation error verbatim
+/// (cc_strings.txt: "Error: --forward-subagent-text requires --print and
+/// --output-format=stream-json.").
+pub fn validateForwardSubagentTextGate(print: bool, format: OutputFormat, forward_subagent_text: bool) error{ForwardSubagentTextRequiresStreamJson}!void {
+    if (forward_subagent_text and !(print and format == .stream_json)) {
+        std_io.stderrWriter().print(
+            "Error: --forward-subagent-text requires --print and --output-format=stream-json.\n",
+            .{},
+        ) catch {};
+        return error.ForwardSubagentTextRequiresStreamJson;
+    }
+}
+
 /// The result subtypes the SDK `result` message can carry. `success` is the
 /// happy path; the `error_*` variants map to the headless limit flags
 /// (sdk-headless-14). `subtype` strings match coreSchemas.ts.
@@ -164,6 +181,11 @@ pub const Result = struct {
     /// only. Optional in the reference; omitted when empty
     /// (headless-sdk-missed-186).
     user_message_uuid: []const u8 = "",
+    /// headless-sdk-missed-184: the real extended-thinking text behind
+    /// `result_text` (AgentRuntime.TurnResult.final_thinking), when the
+    /// model returned one. Empty -> no `thinking` content block emitted;
+    /// never fabricated, only ever the model's own captured reasoning_text.
+    final_thinking: []const u8 = "",
 };
 
 /// One entry in `result.permission_denials`. Mirrors SDKPermissionDenialSchema.
@@ -730,6 +752,48 @@ pub fn serializeUserReplay(
     return finalizeNdjson(allocator, out.items());
 }
 
+/// headless-sdk-14 (`--forward-subagent-text`): a subagent's own prompt,
+/// forwarded as a `user` NDJSON line tagged with `parent_tool_use_id` set to
+/// the spawning Agent tool call's tool_use id. Distinct from
+/// `serializeUserReplay` (a top-level accepted-message ack, always
+/// `parent_tool_use_id: null`, plain-string content) -- this one is always
+/// nested under a parent tool call and uses the array-of-blocks content shape
+/// to match `serializeAssistant`'s forwarded counterpart. Caller owns the
+/// returned newline-terminated slice.
+pub fn serializeForwardedUserText(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    parent_tool_use_id: []const u8,
+    session_id: []const u8,
+    uuid: []const u8,
+) ![]u8 {
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    const w = out.writer();
+
+    try w.writeAll("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, text);
+    try w.writeAll("}]}");
+    try w.writeAll(",\"parent_tool_use_id\":");
+    if (parent_tool_use_id.len > 0) {
+        try writeJsonString(w, parent_tool_use_id);
+    } else {
+        try w.writeAll("null");
+    }
+    if (session_id.len > 0) {
+        try w.writeAll(",\"session_id\":");
+        try writeJsonString(w, session_id);
+    }
+    if (uuid.len > 0) {
+        try w.writeAll(",\"uuid\":");
+        try writeJsonString(w, uuid);
+    }
+    try w.writeAll("}");
+
+    try out.append('\n');
+    return finalizeNdjson(allocator, out.items());
+}
+
 /// Serialize a `prompt_suggestion` message (headless-sdk-15): "Predicted next
 /// user prompt, emitted after each turn when promptSuggestions is enabled."
 /// `suggestion` is the predicted prompt text (escaped on write). Caller owns
@@ -803,10 +867,12 @@ pub fn serializeCommandsChanged(
 /// URL); `error_message` is optional (empty -> the `error` key is omitted).
 /// Caller owns the returned newline-terminated slice.
 ///
-/// Wire-format only: zcode has no `--enable-auth-status` flag (that CLI-flag
-/// surface belongs to wp4, which has not landed a config field for it in this
-/// worktree) and no call site inside `zcode auth login` emits stream-json
-/// today -- both are outside this package's ownership.
+/// Wire-format mostly: `--enable-auth-status` now parses (cli/args.zig,
+/// hidden from --help per the reference's `.hideHelp()`) and is stored on
+/// `CliOptions.enable_auth_status`, but no call site inside `zcode login`/
+/// `zcode mcp auth login` emits stream-json today -- wiring an actual login
+/// flow to call this serializer belongs to whichever package owns those
+/// command handlers, outside this package's ownership.
 pub fn serializeAuthStatus(
     allocator: std.mem.Allocator,
     is_authenticating: bool,
@@ -1204,6 +1270,35 @@ test "serializeUserReplay: re-emits a user message in the canonical shape" {
     try testing.expectEqualStrings("sess-3", obj.get("session_id").?.string);
 }
 
+test "headless-sdk-14: serializeForwardedUserText carries parent_tool_use_id and array content" {
+    const allocator = testing.allocator;
+    const line = try serializeForwardedUserText(allocator, "investigate the bug", "toolu_sess_0", "sess-4", "u-5");
+    defer allocator.free(line);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("user", obj.get("type").?.string);
+    try testing.expectEqualStrings("toolu_sess_0", obj.get("parent_tool_use_id").?.string);
+    try testing.expectEqualStrings("sess-4", obj.get("session_id").?.string);
+    try testing.expectEqualStrings("u-5", obj.get("uuid").?.string);
+    const content = obj.get("message").?.object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 1), content.len);
+    try testing.expectEqualStrings("text", content[0].object.get("type").?.string);
+    try testing.expectEqualStrings("investigate the bug", content[0].object.get("text").?.string);
+}
+
+test "headless-sdk-14: validateForwardSubagentTextGate requires --print and stream-json" {
+    // Off entirely -> never gated, regardless of the other flags.
+    try validateForwardSubagentTextGate(false, .text, false);
+    // On, with both requirements met -> passes.
+    try validateForwardSubagentTextGate(true, .stream_json, true);
+    // On, missing --print -> rejected.
+    try testing.expectError(error.ForwardSubagentTextRequiresStreamJson, validateForwardSubagentTextGate(false, .stream_json, true));
+    // On, wrong output format -> rejected.
+    try testing.expectError(error.ForwardSubagentTextRequiresStreamJson, validateForwardSubagentTextGate(true, .json, true));
+}
+
 // ── headless-sdk-05/missed-186: result uuid / user_message_uuid ────────────
 
 test "serializeResult: carries a required uuid and an optional user_message_uuid" {
@@ -1349,6 +1444,34 @@ test "serializeAssistant: a thinking block round-trips" {
     const block = parsed.value.object.get("message").?.object.get("content").?.array.items[0].object;
     try testing.expectEqualStrings("thinking", block.get("type").?.string);
     try testing.expectEqualStrings("let me consider...", block.get("thinking").?.string);
+}
+
+test "headless-sdk-missed-184: a thinking block precedes the final text block, in the exact order headless.zig builds them" {
+    const allocator = testing.allocator;
+    // Mirrors the content_buf construction in sdk/headless.zig's two
+    // serializeAssistant call sites: a real thinking block (only ever from
+    // TurnResult.final_thinking) goes first, the final text always last.
+    const line = try serializeAssistant(allocator, .{
+        .session_id = "sess-1",
+        .uuid = "u-4",
+        .model = "mock-agent",
+        .stop_reason = "end_turn",
+        .usage = .{ .input_tokens = 5, .output_tokens = 7 },
+        .content = &.{
+            .{ .thinking = "the user asked for X; I recalled it directly" },
+            .{ .text = "here is X" },
+        },
+    });
+    defer allocator.free(line);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("message").?.object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), content.len);
+    try testing.expectEqualStrings("thinking", content[0].object.get("type").?.string);
+    try testing.expectEqualStrings("the user asked for X; I recalled it directly", content[0].object.get("thinking").?.string);
+    try testing.expectEqualStrings("text", content[1].object.get("type").?.string);
+    try testing.expectEqualStrings("here is X", content[1].object.get("text").?.string);
 }
 
 test "serializeAssistant: parent_tool_use_id null when top-level, string when set" {
