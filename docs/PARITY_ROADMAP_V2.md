@@ -1,6 +1,6 @@
 # zcode Quality Plan
 
-Last updated: 2026-04-26
+Last updated: 2026-09-06
 
 This is the active product-quality roadmap for zcode. It supersedes
 `docs/PARITY_ROADMAP.md`, which is now historical.
@@ -307,6 +307,94 @@ Work items:
    envelopes, emits `request.completed` events after request handling, and the
    VS Code extension consumes server-side event notifications without
    confusing them with request responses.
+
+## Claude Code 2.1.261 Parity Pass (2026-09-04 to 2026-09-06)
+
+A second parity program compared zcode against the *installed* Claude Code
+2.1.261 binary (its embedded bundle, `claude --help`, and a transcribed live
+system prompt) rather than the older TypeScript snapshot. It ran as an audit
+workflow (10 subsystem surveys, two adversarial verifiers each, a completeness
+critic: 229 confirmed gaps), four implementation rounds in per-package git
+worktrees merged one at a time behind a green `zig build test`, and an
+adversarial verification pass with per-package fixers. Test count went from
+4170 to 4734 (main suite) with 0 failures.
+
+Landed (see CHANGELOG "Unreleased" for the itemized list):
+
+- Slash commands: every 2.1.261 command and alias resolves (`/advisor`,
+  `/cd`, `/security-review`, `/marketplace` restored; `/terminal-setup` is
+  the canonical spelling; `/background`, `/stop`, `/list-agents`, `/subtask`,
+  `/goal`, `/bug`, `/import`, `/skill-doctor`, `/reload-skills`, `/loops`,
+  `/pause-memory`, `/recap`, `/focus`, `/tui`, `/daemon`, ... added). zcode-only
+  extras still work but are hidden from the default `/help`.
+- Tools: reference-exact model-facing names (`Agent`, `SendUserMessage`,
+  `ListMcpResourcesTool`, `ReadMcpResourceTool`, `ReadMcpResourceDirTool`,
+  per-server `mcp__<server>__<tool>` schemas), 2.1.261 descriptions and
+  parameter names for the core tools, and new tools `Monitor`,
+  `ScheduleWakeup`, `ListAgents`, `ReportFindings`, `SendUserFile`,
+  `PushNotification`, `EndConversation`, `REPL` (advertised).
+- System prompt: `# Delivering work`, `# Writing for the user`, the
+  autonomy / verified-vs-assumed / pronoun / hard-to-reverse paragraphs, and
+  the session-specific-guidance reminder, worded for zcode's own identity.
+- CLI: every `claude --help` flag spelling is accepted (`--permission-mode`,
+  `--dangerously-skip-permissions`, `--add-dir`, `--allowedTools`,
+  `--mcp-config`, `--session-id`, `--system-prompt`, `--safe-mode`,
+  `--debug`, `--effort`, `--fallback-model`, `--worktree`, ...) plus the
+  `attach`, `stop`, `logs`, `rm`, `respawn`, `project purge`, `import`, bare
+  `doctor` subcommands.
+- Config layout: `~/.claude` and `.claude` locations are read alongside
+  `.zcode` (settings.json incl. `permissions.*`, `env`, `model`, `statusLine`,
+  `enabledPlugins`; commands; agents as Markdown+frontmatter; skills;
+  plugins; output styles; keybindings; `~/.claude.json` MCP servers; managed
+  settings at the OS-standard paths); auto-memory lives under
+  `projects/<cwd-slug>/memory/`.
+- Hooks and permissions: all 28 hook events fire with the 2.1.261 stdin JSON
+  base fields; `command` exec-form `args`, `prompt`/`http`/`agent`/`script`/
+  `mcp_tool` hook types; permission modes `default|acceptEdits|plan|
+  bypassPermissions|dontAsk|auto|manual` with `permissions.defaultMode` and
+  `additionalDirectories` honored.
+- Headless: `--print --output-format json|stream-json` emits the 2.1.261 SDK
+  shapes (system/init fields, assistant/user/result records with UUIDs,
+  usage detail, `permission_denials`, `can_use_tool` with real input).
+- Sessions: UUIDv4 ids, Claude Code JSONL record schema, per-project
+  sharding with cross-project resume hints, `/clear` regenerates the id,
+  `/fork` is distinct from `/branch`, `--session-id` / `--fork-session`.
+- Bundled skills: `simplify`, `code-review`, `init`, `security-review`,
+  `update-config`, `keybindings-help`, `fewer-permission-prompts`, `loop`,
+  `schedule`, `claude-api`, `run`, `debug`, `explain-usage`, `batch`,
+  `run-skill-generator` (bodies written for zcode, not copied).
+- REPL: 2.1.261 startup header (mascot glyph, version, model · provider,
+  cwd), prompt box with `Try "..."` placeholder, `? for shortcuts` footer with
+  the permission-mode chip, flat `⏺ Tool(args)` / `⎿ result` transcript,
+  titled approval dialog, sectioned `/status`, trust-dialog copy, Esc-Esc
+  rewind, context-low warning, retry status in the spinner. The previous
+  chrome is available via `ui_show_top_bar`, `ui_legacy_banner`,
+  `ui_legacy_footer`.
+- Bugs fixed on the way: tests popped a real desktop notification;
+  `--no-fullscreen` startup failed with EndOfStream (stdin read); slash
+  commands never submitted on Enter in the fullscreen composer.
+
+Documented deviations (intentional, not gaps):
+
+- `Workflow` tool and `/workflows`: the reference runs JavaScript orchestration
+  scripts; zcode has no JS runtime. Not built.
+- `context: fork` skills run synchronously (the reference backgrounds them).
+- Permission mode `auto` behaves as tiered-auto: zcode has no cloud
+  classifier (`classifyAllShell` is accepted as a no-op key).
+- `TeammateIdle` has no production trigger in zcode's teammate model.
+- `/tui` cannot switch renderer mid-session (relaunch with
+  `--no-fullscreen`); `install <version>` cannot pin a version yet.
+- Cloud/auth-only surfaces (`/teleport`, `/remote-control`, `/desktop`,
+  `/mobile`, `/artifacts`, design tools, `RemoteTrigger`, Chrome) are stubs
+  that say what they would need.
+- `-p` stays `--provider` (use `--print`); `-v` stays `--verbose` (use `-V`).
+
+Re-running the comparison: extract the current Claude Code bundle strings
+with `strings -n 4 ~/.local/share/claude/versions/<ver>`, diff the command
+objects (`type:"local"|"local-jsx"|"prompt"` + `name:"..."`) and the tool
+constants against `src/repl_commands.zig`, `src/repl_commands_parity.zig`,
+and `src/tools/tool_schemas.zig`; `tools/similarity/score-*.py` still score
+against the older TypeScript snapshot (`ZCODE_CC_REF`).
 
 ## Active Backlog
 
