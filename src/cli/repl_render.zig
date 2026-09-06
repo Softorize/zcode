@@ -1017,13 +1017,15 @@ fn renderContextLowWarning(writer: anytype, used_cols: *usize, cols: usize, opti
 
 /// r3-chrome-04: the reference default footer (edualc
 /// PromptInputFooterLeftSide.tsx:411, "? for shortcuts" -- hidden only
-/// when a custom `statusLine` command is configured, which zcode does
-/// not yet plumb here) paired with the persistent permission-mode chip
-/// from PromptInputFooter, right-aligned on the same row. The context-low
-/// warning and the queued-message notice keep the same priority they had
-/// in the legacy multi-segment footer: both are more urgent than the
-/// static "? for shortcuts" hint, so they replace it on the left when
-/// present.
+/// when a custom `statusLine` command is configured (config-layout-16:
+/// `options.status_line_text`, refreshed by the REPL's own footer-state
+/// tick from a spawned `statusLine.command` in settings.json)) paired with
+/// the persistent permission-mode chip from PromptInputFooter,
+/// right-aligned on the same row. The context-low warning and the
+/// queued-message notice keep the same priority they had in the legacy
+/// multi-segment footer: both are more urgent than either the configured
+/// statusLine text or the static "? for shortcuts" hint, so they replace
+/// it on the left when present.
 fn renderDefaultFooterLine(writer: anytype, options: anytype, cols: usize) !void {
     if (cols == 0) return;
 
@@ -1033,6 +1035,8 @@ fn renderDefaultFooterLine(writer: anytype, options: anytype, cols: usize) !void
         warning
     else if (@hasField(@TypeOf(options), "queued_prompt_notice") and options.queued_prompt_notice.len > 0)
         options.queued_prompt_notice
+    else if (@hasField(@TypeOf(options), "status_line_text") and options.status_line_text.len > 0)
+        options.status_line_text
     else
         "? for shortcuts";
     const left_tone: FooterSegmentTone = if (warning.len > 0) .danger else .dim;
@@ -4017,6 +4021,98 @@ test "renderStatusLine (legacy_footer=true) keeps rendering the old ready/versio
     try renderStatusLine(buf.writer(), options, TestMode.execution, 0, 0, "", 120);
 
     try testing.expect(std.mem.indexOf(u8, buf.items(), "ready") != null);
+}
+
+test "config-layout-16: a configured statusLine command's output replaces the default '? for shortcuts' hint" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    try renderDefaultFooterLine(buf.writer(), .{
+        .status_line_text = @as([]const u8, "hi"),
+        .color_enabled = false,
+    }, 80);
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "hi") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "? for shortcuts") == null);
+}
+
+test "config-layout-16: '? for shortcuts' still shows when no statusLine is configured" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    try renderDefaultFooterLine(buf.writer(), .{
+        .status_line_text = @as([]const u8, ""),
+        .color_enabled = false,
+    }, 80);
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "? for shortcuts") != null);
+}
+
+test "config-layout-16: the context-low warning still outranks a configured statusLine" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const StatusMetrics = @import("repl.zig").StatusMetrics;
+    const StatusMetricsProvider = @import("repl.zig").StatusMetricsProvider;
+    const Ctx = struct {
+        fn get(_: *anyopaque) StatusMetrics {
+            return .{ .last_prompt_tokens = 95, .last_budget_input = 100 };
+        }
+    };
+    var dummy: u8 = 0;
+    const provider = StatusMetricsProvider{ .ctx = @ptrCast(&dummy), .get = Ctx.get };
+
+    try renderDefaultFooterLine(buf.writer(), .{
+        .status_line_text = @as([]const u8, "hi"),
+        .color_enabled = false,
+        .status_metrics_provider = @as(?StatusMetricsProvider, provider),
+        .status_model_context_window = @as(usize, 0),
+    }, 80);
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "Context low") != null);
+}
+
+test "config-layout-16: end to end -- a trusted ~/.zcode/settings.json statusLine command's rendered output reaches the footer" {
+    const rt_test = @import("zcode_runtime");
+    const status_line_mod = @import("../core/status_line.zig");
+    const env_mod = @import("../core/env.zig");
+    const test_helpers = @import("../core/test_helpers.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", cwd);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt_test.io, ".zcode");
+    try tmp.dir.writeFile(rt_test.io, .{
+        .sub_path = ".zcode/settings.json",
+        .data = "{\"statusLine\":{\"type\":\"command\",\"command\":\"echo hi\"}}",
+    });
+
+    var cfg = (try status_line_mod.readConfig(testing.allocator, cwd)).?;
+    defer cfg.deinit(testing.allocator);
+    try testing.expectEqualStrings("echo hi", cfg.command);
+
+    const rendered = try status_line_mod.run(testing.allocator, cfg, cwd, cwd, .{
+        .cwd = cwd,
+        .current_dir = cwd,
+        .project_dir = cwd,
+    }, 5000);
+    defer if (rendered) |r| testing.allocator.free(r);
+    try testing.expect(rendered != null);
+
+    var footer_buf = std_io.StringBuilder.init(testing.allocator);
+    defer footer_buf.deinit();
+    try renderDefaultFooterLine(footer_buf.writer(), .{
+        .status_line_text = rendered.?,
+        .color_enabled = false,
+    }, 80);
+
+    try testing.expect(std.mem.indexOf(u8, footer_buf.items(), "hi") != null);
 }
 
 test "assistant transcript block wraps to inner width" {
