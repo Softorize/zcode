@@ -2297,6 +2297,23 @@ pub fn renderHorizontalBorder(writer: anytype, cols: usize) !void {
     try writer.writeAll(repl_markdown.ANSI_RESET);
 }
 
+// r3-chrome-03: the reference's PromptInput border (edualc
+// PromptInput.tsx:2291, `borderStyle="round" borderLeft={false}
+// borderRight={false} borderBottom`) carries no title, no keyboard hints,
+// and no left/right border glyphs -- it is a plain top rule, the "> "
+// prompt content with no vertical bars around it, and a plain bottom rule.
+// The mode/permission indicator and hint text live in the footer row below
+// instead (renderPromptFooter). `legacy_footer` (default false on the real
+// Options struct; absent -- and therefore also legacy -- on the many
+// anonymous option literals throughout this file's older tests) opts back
+// into zcode's previous embedded-label, left/right-bordered composer for
+// anyone who preferred that density. Shared by renderComposerBorder (the
+// top/bottom rule) and renderMultiLineInput (the content rows) so both
+// halves of the composer box switch together.
+fn composerUsesLegacyChrome(options: anytype) bool {
+    return !@hasField(@TypeOf(options), "legacy_footer") or options.legacy_footer;
+}
+
 fn renderComposerBorder(writer: anytype, cols: usize, top: bool, mode: anytype, options: anytype) !void {
     if (cols == 0) return;
     if (cols < 4) return renderHorizontalBorder(writer, cols);
@@ -2305,17 +2322,7 @@ fn renderComposerBorder(writer: anytype, cols: usize, top: bool, mode: anytype, 
     const left = if (top) repl_markdown.BOX_TL else repl_markdown.BOX_BL;
     const right = if (top) repl_markdown.BOX_TR else repl_markdown.BOX_BR;
 
-    // r3-chrome-03: the reference's PromptInput border (edualc
-    // PromptInput.tsx:2291, `borderStyle="round" borderLeft={false}
-    // borderRight={false} borderBottom`) carries no title and no keyboard
-    // hints -- it is a plain top rule and a plain bottom rule around the
-    // "> " prompt, with the mode/permission indicator and hint text living
-    // in the footer row below instead (renderPromptFooter). `legacy_footer`
-    // (default false on the real Options struct; absent -- and therefore
-    // also legacy -- on the many anonymous option literals throughout this
-    // file's older tests) opts back into zcode's previous embedded-label
-    // borders for anyone who preferred that density.
-    const use_legacy_labels = !@hasField(@TypeOf(options), "legacy_footer") or options.legacy_footer;
+    const use_legacy_labels = composerUsesLegacyChrome(options);
 
     var label_buf: [160]u8 = undefined;
     const mode_word = shortModeLabel(mode);
@@ -2498,6 +2505,13 @@ fn renderStyledInputChunk(
 }
 
 fn renderMultiLineInput(writer: anytype, prompt_label: []const u8, input_text: []const u8, cols: usize, first_row: usize, num_rows: usize, show_placeholder: bool, options: anytype) !void {
+    // r3-chrome-03: match renderComposerBorder's default/legacy_footer
+    // switch so the composer's content rows drop the left/right BOX_V
+    // pipes in lockstep with the top/bottom rule dropping its embedded
+    // title and hint text -- otherwise the default composer still reads
+    // as a full rounded box instead of the reference's borderLeft={false}
+    // borderRight={false} plain-rule look.
+    const use_legacy_labels = composerUsesLegacyChrome(options);
     const content_max: usize = if (cols > 4) cols - 4 else 1;
     var content_buf: [16 * 1024]u8 = undefined;
     const content = repl_input.formatInputPreview(prompt_label, input_text, &content_buf);
@@ -2598,9 +2612,11 @@ fn renderMultiLineInput(writer: anytype, prompt_label: []const u8, input_text: [
         "";
     while (row < num_rows) : (row += 1) {
         try writer.print("\x1b[{d};1H\x1b[2K", .{first_row + row});
-        try writer.writeAll(repl_markdown.ANSI_DIM);
-        try writer.writeAll(repl_markdown.BOX_V);
-        try writer.writeAll(repl_markdown.ANSI_RESET);
+        if (use_legacy_labels) {
+            try writer.writeAll(repl_markdown.ANSI_DIM);
+            try writer.writeAll(repl_markdown.BOX_V);
+            try writer.writeAll(repl_markdown.ANSI_RESET);
+        }
         try writer.writeByte(' ');
 
         if (row < visible_count) {
@@ -2651,9 +2667,11 @@ fn renderMultiLineInput(writer: anytype, prompt_label: []const u8, input_text: [
         }
 
         try writer.writeByte(' ');
-        try writer.writeAll(repl_markdown.ANSI_DIM);
-        try writer.writeAll(repl_markdown.BOX_V);
-        try writer.writeAll(repl_markdown.ANSI_RESET);
+        if (use_legacy_labels) {
+            try writer.writeAll(repl_markdown.ANSI_DIM);
+            try writer.writeAll(repl_markdown.BOX_V);
+            try writer.writeAll(repl_markdown.ANSI_RESET);
+        }
     }
 }
 
@@ -3953,6 +3971,38 @@ test "renderComposerBorder (default) draws a plain rule with no title or hint te
     try testing.expect(std.mem.indexOf(u8, top_buf.items(), "ask zcode") == null);
     try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), "Enter submit") == null);
     try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), "? shortcuts") == null);
+}
+
+test "renderMultiLineInput (default) omits the left/right BOX_V pipes around the prompt content" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+    };
+    try renderMultiLineInput(buf.writer(), ">", "", 60, 1, 1, true, options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_V) == null);
+    try testing.expect(std.mem.indexOf(u8, out, ">") != null);
+    try testing.expect(std.mem.indexOf(u8, out, PROMPT_PLACEHOLDER) != null);
+}
+
+test "renderMultiLineInput (legacy_footer=true) keeps the left/right BOX_V pipes" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = true,
+        .color_enabled = false,
+    };
+    try renderMultiLineInput(buf.writer(), ">", "", 60, 1, 1, true, options);
+
+    const out = buf.items();
+    const first_pipe = std.mem.indexOf(u8, out, repl_markdown.BOX_V) orelse return error.TestUnexpectedResult;
+    const last_pipe = std.mem.lastIndexOf(u8, out, repl_markdown.BOX_V) orelse return error.TestUnexpectedResult;
+    try testing.expect(first_pipe != last_pipe);
 }
 
 test "renderComposerBorder (legacy_footer=true) keeps the embedded title and hint text" {
