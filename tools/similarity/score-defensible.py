@@ -33,10 +33,10 @@ with open(f"{ZC}/src/tools/tool_schemas.zig") as f:
         zc_names.add(m)
 
 aliases = {
-    "FileRead": "file_read", "FileWrite": "file_write", "FileEdit": "file_edit",
-    "Agent": "AgentRun", "MCP": "mcp_invoke",
-    "ListMcpResources": "mcp_resources_list", "ReadMcpResource": "mcp_resource_read",
-    "ScheduleCron": "CronCreate",
+    "FileRead": "Read", "FileWrite": "Write", "FileEdit": "Edit",
+    "Agent": "Agent", "MCP": "mcp_invoke",
+    "ListMcpResources": "ListMcpResourcesTool", "ReadMcpResource": "ReadMcpResourceTool",
+    "ScheduleCron": "CronCreate", "Brief": "SendUserMessage",
 }
 
 have, miss = [], []

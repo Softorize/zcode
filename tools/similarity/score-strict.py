@@ -18,13 +18,13 @@ with open(f"{ZC}/src/tools/tool_schemas.zig") as f:
 
 # Map CC tool name -> zcode equivalent (Pascal or snake)
 aliases = {
-    "FileRead": "file_read", "FileWrite": "file_write", "FileEdit": "file_edit",
-    "Agent": "AgentRun",
+    "FileRead": "Read", "FileWrite": "Write", "FileEdit": "Edit",
+    "Agent": "Agent",
     "MCP": "mcp_invoke",
-    "ListMcpResources": "mcp_resources_list",
-    "ReadMcpResource": "mcp_resource_read",
+    "ListMcpResources": "ListMcpResourcesTool",
+    "ReadMcpResource": "ReadMcpResourceTool",
     "ScheduleCron": "CronCreate",
-    "BashTool": "Bash",
+    "BashTool": "Bash", "Brief": "SendUserMessage",
     # No equivalent (zcode does not have these tools)
     "McpAuth": None, "REPL": None, "PowerShell": None,
     "SyntheticOutput": None, "Config": None, "RemoteTrigger": None,
