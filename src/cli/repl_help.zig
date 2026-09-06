@@ -7,6 +7,8 @@ const skills_mod = @import("../core/skills.zig");
 const display_safe = @import("../core/display_safe.zig");
 const rt = @import("zcode_runtime");
 
+const command_list_format = @import("../core/command_list_format.zig");
+
 const ANSI_RESET = repl_markdown.ANSI_RESET;
 const ANSI_DIM = repl_markdown.ANSI_DIM;
 const ANSI_BOLD = repl_markdown.ANSI_BOLD;
@@ -695,6 +697,163 @@ pub fn buildKeysPlaintext(allocator: std.mem.Allocator) ![]u8 {
     defer buf.deinit();
     try writeKeysScreen(buf.writer(), false);
     return buf.toOwnedSlice();
+}
+
+// commands-38: feed the built-in command catalog (GROUPS) into
+// command_list_format's exact reference algorithm to produce the system
+// prompt's "Available commands (N in this build)" section. GROUPS is the
+// live registry every dispatch-reachable built-in command is declared in
+// (see writeHelpScreen), so this section tracks it automatically -- no
+// separate list to keep in sync.
+
+/// One parsed `HelpEntry.usage` string, e.g. "/cd [path]" -> name "cd", no
+/// alias; "/exit, /quit" -> name "exit", alias "quit". Only the primary
+/// spelling and a same-line comma-separated alt spelling are extracted;
+/// bracketed/angle-bracket argument placeholders and trailing subcommand
+/// words (e.g. "/agent current") are dropped from the name. Returned slices
+/// borrow from `usage` itself, which is 'static (owned by the GROUPS
+/// tables), so this needs no allocation.
+const ParsedUsage = struct {
+    name: []const u8,
+    aliases: [2][]const u8 = .{ "", "" },
+    alias_count: usize = 0,
+};
+
+/// Index of the first byte in `s` that ends a bare command token: a space,
+/// an argument-placeholder opener, or a comma separating an alt spelling.
+fn commandTokenEnd(s: []const u8) usize {
+    for (s, 0..) |c, i| {
+        if (c == ' ' or c == '[' or c == '<' or c == ',') return i;
+    }
+    return s.len;
+}
+
+fn parseUsage(usage: []const u8) ParsedUsage {
+    var result = ParsedUsage{ .name = "" };
+    if (usage.len == 0 or usage[0] != '/') return result;
+
+    var rest = usage[1..];
+    const primary_end = commandTokenEnd(rest);
+    result.name = rest[0..primary_end];
+    rest = rest[primary_end..];
+
+    while (rest.len > 0 and result.alias_count < result.aliases.len) {
+        if (rest[0] != ',') {
+            // Trailing subcommand word / arg placeholder for the primary
+            // spelling (e.g. "current" in "/agent current") -- skip ahead
+            // to the next alt-spelling comma, if any.
+            const comma_idx = std.mem.indexOfScalar(u8, rest, ',') orelse break;
+            rest = rest[comma_idx..];
+            continue;
+        }
+        rest = rest[1..]; // consume ','
+        rest = std.mem.trim(u8, rest, " ");
+        if (rest.len == 0 or rest[0] != '/') break;
+        rest = rest[1..];
+        const alias_end = commandTokenEnd(rest);
+        if (alias_end > 0) {
+            result.aliases[result.alias_count] = rest[0..alias_end];
+            result.alias_count += 1;
+        }
+        rest = rest[alias_end..];
+    }
+    return result;
+}
+
+/// Collect the deduplicated, filtered command list for the system-prompt
+/// section: walks every built-in `GROUPS` entry, drops removed commands
+/// (removed_commands.isRemoved) and `is_hidden` ones (commands-37 -- these
+/// have no 2.1.261 counterpart, mirroring the reference's own `isHidden`
+/// filter), parses each surviving `usage` into name+aliases, and keeps only
+/// the first row seen per name (later rows are alternate subcommand-usage
+/// lines for the same command, e.g. "/agent current" / "/agent <name>").
+/// Caller owns the returned slice; free with `freeAvailableCommandEntries`.
+pub fn buildAvailableCommandEntries(allocator: std.mem.Allocator) ![]command_list_format.CommandEntry {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var out: std.array_list.Managed(command_list_format.CommandEntry) = .init(allocator);
+    errdefer {
+        for (out.items) |e| if (e.aliases.len > 0) allocator.free(e.aliases);
+        out.deinit();
+    }
+
+    for (GROUPS) |group| {
+        for (group.entries) |entry| {
+            if (removed_commands.isRemoved(entry.usage)) continue;
+            if (entry.is_hidden) continue;
+            const parsed = parseUsage(entry.usage);
+            if (parsed.name.len == 0) continue;
+            if (seen.contains(parsed.name)) continue;
+            try seen.put(parsed.name, {});
+
+            const aliases = try allocator.alloc([]const u8, parsed.alias_count);
+            for (0..parsed.alias_count) |i| aliases[i] = parsed.aliases[i];
+            try out.append(.{
+                .name = parsed.name,
+                .description = entry.desc,
+                .aliases = aliases,
+            });
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn freeAvailableCommandEntries(allocator: std.mem.Allocator, entries: []command_list_format.CommandEntry) void {
+    for (entries) |e| if (e.aliases.len > 0) allocator.free(e.aliases);
+    allocator.free(entries);
+}
+
+/// Render the reference-format "**Available commands (N in this build):**"
+/// system-prompt section from the live built-in command registry. Caller
+/// owns the returned buffer.
+pub fn buildAvailableCommandsSection(allocator: std.mem.Allocator) ![]u8 {
+    const entries = try buildAvailableCommandEntries(allocator);
+    defer freeAvailableCommandEntries(allocator, entries);
+    return command_list_format.renderAvailableCommands(allocator, entries);
+}
+
+test "commands-38: buildAvailableCommandsSection renders the reference header and excludes hidden/removed commands" {
+    const out = try buildAvailableCommandsSection(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "**Available commands ("));
+    try testing.expect(std.mem.indexOf(u8, out, " in this build):**") != null);
+    // A well-known non-hidden built-in shows up in the format the algorithm
+    // specifies (name, no aliases if it has none).
+    try testing.expect(std.mem.indexOf(u8, out, "- /init: Drop a starter ZCODE.md skeleton in the current cwd") != null);
+    // is_hidden entries (commands-37 zcode-only extras) never appear.
+    try testing.expect(std.mem.indexOf(u8, out, "/quick-open") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "/sandbox-toggle") == null);
+}
+
+test "commands-38: buildAvailableCommandsSection dedupes multi-line subcommand usages and formats a comma-alias pair" {
+    const out = try buildAvailableCommandsSection(testing.allocator);
+    defer testing.allocator.free(out);
+    // "/agent current", "/agent <name>", "/agent none" all collapse to one row.
+    var agent_count: usize = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "- /agent:") or std.mem.startsWith(u8, line, "- /agent ")) agent_count += 1;
+    }
+    try testing.expect(agent_count == 0); // /agent is hidden -- confirms hidden filtering, not just dedup
+    // "/exit, /quit" -> primary /exit with alias /quit in the exact format.
+    try testing.expect(std.mem.indexOf(u8, out, "- /exit (aliases: /quit): Exit the session") != null);
+}
+
+test "commands-38: entries are sorted alphabetically by name" {
+    const out = try buildAvailableCommandsSection(testing.allocator);
+    defer testing.allocator.free(out);
+    var last: []const u8 = "";
+    var it = std.mem.splitScalar(u8, out, '\n');
+    _ = it.next(); // header line
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        try testing.expect(std.mem.startsWith(u8, line, "- /"));
+        const rest = line[3..];
+        const name_end = std.mem.indexOfAny(u8, rest, " :") orelse rest.len;
+        const name = rest[0..name_end];
+        try testing.expect(std.mem.order(u8, last, name) != .gt);
+        last = name;
+    }
 }
 
 const testing = std.testing;

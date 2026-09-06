@@ -235,6 +235,24 @@ pub fn renderDynamicSystemPolicy(
         }
     }
 
+    // commands-38: the reference's "Available commands (N in this build)"
+    // system-prompt section, generated from the live built-in command
+    // registry via command_list_format's exact filter/format algorithm
+    // (repl_help.zig owns the registry and the collection logic; see
+    // buildAvailableCommandsSection). Best-effort: a build failure must not
+    // abort the whole prompt.
+    {
+        const repl_help = @import("../cli/repl_help.zig");
+        const commands_section = repl_help.buildAvailableCommandsSection(allocator) catch |err| blk: {
+            std.log.debug("prompt: available-commands section build failed: {s}", .{@errorName(err)});
+            break :blk try allocator.dupe(u8, "");
+        };
+        defer allocator.free(commands_section);
+        if (commands_section.len > 0) {
+            try out.writer().print("\n{s}\n", .{commands_section});
+        }
+    }
+
     var os_buf: [192]u8 = undefined;
     try out.writer().print(
         "# Environment\nToday's date is {s}.\ncwd={s}\nplatform={s}\nos_version={s}\nshell={s}\nmodel={s}/{s}\n",
@@ -1154,6 +1172,34 @@ test "renderDynamicSystemPolicy injects Today's date into the prompt" {
     // environment block stays together.
     const approval_idx = std.mem.indexOf(u8, rendered, "approval_mode=") orelse return error.MissingApproval;
     try testing.expect(idx < approval_idx);
+}
+
+test "commands-38: renderDynamicSystemPolicy includes the Available commands section" {
+    const allocator = testing.allocator;
+
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const rendered = try renderDynamicSystemPolicy(
+        allocator,
+        &cfg,
+        &policy,
+        "/tmp/zcode-test",
+        "hello",
+        "default",
+        "",
+        "",
+        .execution,
+        false,
+    );
+    defer allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "**Available commands (") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, " in this build):**") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "- /init: Drop a starter ZCODE.md skeleton in the current cwd") != null);
 }
 
 test "renderDynamicSystemPolicy loads MEMORY.md index under its header" {
