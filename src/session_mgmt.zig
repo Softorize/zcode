@@ -137,6 +137,7 @@ pub fn replOptionsFromConfig(cfg: *const config_mod.Config, yolo_mode: bool, cwd
         .status_workspace = cwd,
         .status_branch = branch,
         .status_model_context_window = cfg.model_context_window,
+        .autocompact_enabled = cfg.auto_compact_enabled,
         .status_approval_mode = if (yolo_mode) "yolo" else cfg.approval_mode,
         .status_sandbox = cfg.sandbox,
         .status_show_workspace = cfg.ui_status_show_workspace,
@@ -991,6 +992,23 @@ test "replOptionsFromConfig: yolo flips approval_mode and threads location" {
     const opts_yolo = replOptionsFromConfig(&cfg, true, "/tmp/ws", "main");
     try testing_alloc.expectEqualStrings("yolo", opts_yolo.status_approval_mode);
     try testing_alloc.expect(opts_yolo.yolo_mode);
+}
+
+// repl-ux-missed-128/130: confirms Config.auto_compact_enabled genuinely
+// reaches the live repl.Options the footer render pipeline reads --
+// not just the isolated repl_render.zig unit test.
+test "replOptionsFromConfig: threads auto_compact_enabled into Options.autocompact_enabled" {
+    const alloc = testing_alloc.allocator;
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+
+    cfg.auto_compact_enabled = true;
+    const opts_on = replOptionsFromConfig(&cfg, false, "/tmp/ws", "main");
+    try testing_alloc.expect(opts_on.autocompact_enabled);
+
+    cfg.auto_compact_enabled = false;
+    const opts_off = replOptionsFromConfig(&cfg, false, "/tmp/ws", "main");
+    try testing_alloc.expect(!opts_off.autocompact_enabled);
 }
 
 // ── sdk-headless-14: headless caps threaded into the runtime ───────

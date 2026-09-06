@@ -983,11 +983,17 @@ const CONTEXT_LOW_WARNING_USED_PCT: usize = 90;
 /// Compute the reference's "Context low (N% remaining) \xc2\xb7 Run
 /// /compact to compact & continue" line (cc_strings.txt: `` `Context low
 /// (${pctLeft}% remaining) \xB7 ${...}` ``, "Run /compact to compact &
-/// continue"). Reuses the same percent-used inputs
-/// `buildTokenStatusVariants` already computes from the status-metrics
-/// provider and the model's context window -- no new plumbing needed.
-/// Returns "" when there is no metrics provider, no usage data yet, or
-/// usage is still comfortably below the threshold.
+/// continue"), or its off-variant "Context low (N% remaining) \xc2\xb7
+/// auto-compact is off \xc2\xb7 /config to turn it on" when
+/// `options.autocompact_enabled` is present and false -- the reference
+/// does not suggest a command that will not self-trigger. Reuses the
+/// same percent-used inputs `buildTokenStatusVariants` already computes
+/// from the status-metrics provider and the model's context window -- no
+/// new plumbing needed. Returns "" when there is no metrics provider, no
+/// usage data yet, or usage is still comfortably below the threshold.
+/// A caller that does not carry `autocompact_enabled` at all (existing
+/// call sites/tests) gets the normal "/compact" variant, matching prior
+/// behavior exactly.
 fn computeContextLowWarning(buf: []u8, options: anytype) []const u8 {
     if (!@hasField(@TypeOf(options), "status_metrics_provider")) return "";
     const provider = options.status_metrics_provider orelse return "";
@@ -1005,11 +1011,19 @@ fn computeContextLowWarning(buf: []u8, options: anytype) []const u8 {
     if (used_pct < CONTEXT_LOW_WARNING_USED_PCT) return "";
 
     const percent_left = 100 -| used_pct;
+    const autocompact_enabled = if (@hasField(@TypeOf(options), "autocompact_enabled")) options.autocompact_enabled else true;
+    if (!autocompact_enabled) {
+        return std.fmt.bufPrint(
+            buf,
+            "Context low ({d}% remaining) \xc2\xb7 auto-compact is off \xc2\xb7 /config to turn it on",
+            .{percent_left},
+        ) catch "";
+    }
     return std.fmt.bufPrint(buf, "Context low ({d}% remaining) \xc2\xb7 Run /compact to compact & continue", .{percent_left}) catch "";
 }
 
 fn renderContextLowWarning(writer: anytype, used_cols: *usize, cols: usize, options: anytype) !void {
-    var warning_buf: [80]u8 = undefined;
+    var warning_buf: [96]u8 = undefined;
     const warning = computeContextLowWarning(&warning_buf, options);
     if (warning.len == 0) return;
     _ = try writeFooterSegment(writer, used_cols, cols, warning, .danger, options);
@@ -1029,7 +1043,7 @@ fn renderContextLowWarning(writer: anytype, used_cols: *usize, cols: usize, opti
 fn renderDefaultFooterLine(writer: anytype, options: anytype, cols: usize) !void {
     if (cols == 0) return;
 
-    var warning_buf: [80]u8 = undefined;
+    var warning_buf: [96]u8 = undefined;
     const warning = computeContextLowWarning(&warning_buf, options);
     const left_text: []const u8 = if (warning.len > 0)
         warning
@@ -3752,6 +3766,39 @@ test "computeContextLowWarning falls back to status_model_context_window when la
     var buf: [80]u8 = undefined;
     const warning = computeContextLowWarning(&buf, options);
     try testing.expect(std.mem.startsWith(u8, warning, "Context low (5% remaining)"));
+}
+
+// repl-ux-missed-128/130: when auto-compaction is disabled, the reference
+// does not suggest a command that will not self-trigger -- it tells the
+// user auto-compact is off and where to turn it back on.
+test "computeContextLowWarning shows the auto-compact-off variant when autocompact_enabled is false" {
+    var metrics = TestContextMetrics{ .last_budget_input = 100_000, .last_prompt_tokens = 92_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+        .autocompact_enabled = false,
+    };
+    var buf: [96]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.startsWith(u8, warning, "Context low (8% remaining)"));
+    try testing.expect(std.mem.indexOf(u8, warning, "auto-compact is off") != null);
+    try testing.expect(std.mem.indexOf(u8, warning, "/config to turn it on") != null);
+    // Must not ALSO suggest /compact -- that would not self-trigger.
+    try testing.expect(std.mem.indexOf(u8, warning, "Run /compact") == null);
+}
+
+// A caller with no `autocompact_enabled` field at all (every pre-existing
+// call site/test) keeps the original "/compact" wording unchanged.
+test "computeContextLowWarning defaults to the /compact wording when autocompact_enabled is absent" {
+    var metrics = TestContextMetrics{ .last_budget_input = 100_000, .last_prompt_tokens = 92_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+    };
+    var buf: [96]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.indexOf(u8, warning, "Run /compact to compact & continue") != null);
+    try testing.expect(std.mem.indexOf(u8, warning, "auto-compact is off") == null);
 }
 
 test "classifyInputHighlightByte marks slash commands and @references" {
