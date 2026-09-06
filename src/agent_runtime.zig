@@ -632,6 +632,26 @@ pub const AgentRuntime = struct {
     /// see the `catch` at the one construction site for the (unreachable in
     /// practice) fallback.
     transcript_path: []u8,
+    /// hooks-permissions-09: a per-user-turn correlator (reference `Se` base
+    /// schema's optional `prompt_id`), synthesized once at the top of the
+    /// root runtime's `handlePromptDetailed*` (mirroring how `tool_use_id` is
+    /// synthesized once per tool call in agent_tools.zig) and copied by value
+    /// into any sub-agent `AgentRuntime` spawned during that turn, so every
+    /// hook fired anywhere in the turn's tree shares one id. Fixed-size
+    /// buffer (not heap-allocated) so a sub-agent can inherit it by a plain
+    /// struct-field copy with no allocation or ownership to manage. See
+    /// `promptId()`.
+    prompt_id_buf: [24]u8 = undefined,
+    prompt_id_len: usize = 0,
+    /// hooks-permissions-09: the reference `Se` base schema's optional
+    /// `agent_id`. Empty for the root runtime (no data source distinguishes
+    /// "the" main agent from itself); synthesized once when a sub-agent is
+    /// spawned (`spawnChildAgent`) and set on the CHILD runtime before it
+    /// runs, so the child's own tool-call hooks and the parent's
+    /// SubagentStart/SubagentStop hooks about it all carry the same id. See
+    /// `agentId()`.
+    agent_id_buf: [24]u8 = undefined,
+    agent_id_len: usize = 0,
     history: agent_history.History,
     snapshot: types.SessionSnapshot,
     approval_handler: ?ApprovalHandler,
@@ -1526,6 +1546,9 @@ pub const AgentRuntime = struct {
             .message = payload_json,
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -1624,6 +1647,13 @@ pub const AgentRuntime = struct {
         // the parent would never see it.
         if (self.depth == 0) {
             common.beginNewRequest();
+            // hooks-permissions-09: synthesize this turn's `prompt_id`
+            // (mirrors `tool_use_id`'s per-call synthesis in agent_tools.zig)
+            // so every hook fired anywhere during this turn -- including any
+            // sub-agent spawned from it, which inherits the value by copy in
+            // `spawnChildAgent` -- carries the same correlator.
+            const pid = std.fmt.bufPrint(&self.prompt_id_buf, "prompt_{x}", .{clock.nowNanos()}) catch "";
+            self.prompt_id_len = pid.len;
             // sdk-headless-06: clear any stale SDK interrupt from a prior turn so
             // a new turn does not abort immediately. Same root-only ownership
             // rule as the cancel flag above.
@@ -4213,6 +4243,19 @@ pub const AgentRuntime = struct {
         if (config.model) |model_ref| {
             try child.applyModelOverride(model_ref);
         }
+        // hooks-permissions-09: the child inherits this turn's `prompt_id` by
+        // value (same user prompt, same correlator) and gets its own fresh
+        // `agent_id` (the reference `Se` base schema's optional per-agent
+        // identity, which the single root runtime has no data source for --
+        // see the field doc comment -- but a spawned sub-agent clearly does).
+        // Both are plain fixed-size-array copies: no allocation, no ownership
+        // to hand back on `child.deinit()`.
+        child.prompt_id_buf = self.prompt_id_buf;
+        child.prompt_id_len = self.prompt_id_len;
+        {
+            const aid = std.fmt.bufPrint(&child.agent_id_buf, "agent_{x}", .{clock.nowNanos()}) catch "";
+            child.agent_id_len = aid.len;
+        }
 
         // Phase 5 (hooks-01): SubagentStart fires before the child agent runs,
         // SubagentStop after it completes (reference: subagent lifecycle hooks).
@@ -4221,6 +4264,9 @@ pub const AgentRuntime = struct {
             const sub_start = self.fireLifecycleHook(.{
                 .event = .subagent_start,
                 .cwd = self.cwd,
+                .prompt_id = self.promptId(),
+                .agent_id = child.agentId(),
+                .mcp_ctx = @ptrCast(self.mcp),
             });
             if (sub_start.reason) |r| self.allocator.free(r);
         }
@@ -4248,6 +4294,9 @@ pub const AgentRuntime = struct {
             const sub_stop = self.fireLifecycleHook(.{
                 .event = .subagent_stop,
                 .cwd = self.cwd,
+                .prompt_id = self.promptId(),
+                .agent_id = child.agentId(),
+                .mcp_ctx = @ptrCast(self.mcp),
             });
             if (sub_stop.reason) |r| self.allocator.free(r);
         }
@@ -4750,6 +4799,9 @@ pub const AgentRuntime = struct {
             .old_cwd = old_cwd,
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -5320,6 +5372,19 @@ pub const AgentRuntime = struct {
         return path;
     }
 
+    /// hooks-permissions-09: the current turn's synthesized `prompt_id`, or
+    /// "" before the root runtime's first `handlePromptDetailed*` call (and
+    /// for a sub-agent that never had it copied onto it).
+    pub fn promptId(self: *const AgentRuntime) []const u8 {
+        return self.prompt_id_buf[0..self.prompt_id_len];
+    }
+
+    /// hooks-permissions-09: the current runtime's synthesized `agent_id`,
+    /// or "" for the root runtime (see the field doc comment).
+    pub fn agentId(self: *const AgentRuntime) []const u8 {
+        return self.agent_id_buf[0..self.agent_id_len];
+    }
+
     fn buildToolExecContext(self: *AgentRuntime) agent_tools.ToolExecContext {
         return .{
             .allocator = self.allocator,
@@ -5352,6 +5417,8 @@ pub const AgentRuntime = struct {
             .session_mem_file = self.session_mem_file_restriction,
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
         };
     }
 
@@ -5718,6 +5785,9 @@ pub const AgentRuntime = struct {
             .notification_type = "idle",
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -5753,6 +5823,9 @@ pub const AgentRuntime = struct {
             .last_assistant_message = last_assistant_message orelse "",
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -5786,6 +5859,9 @@ pub const AgentRuntime = struct {
                 .load_reason = load_reason,
                 .session_id = self.session_id,
                 .transcript_path = self.transcript_path,
+                .prompt_id = self.promptId(),
+                .agent_id = self.agentId(),
+                .mcp_ctx = @ptrCast(self.mcp),
                 .permission_mode = self.effectiveLivePermissionModeString(),
             }) catch continue;
             result.deinit(self.allocator);
@@ -5820,6 +5896,9 @@ pub const AgentRuntime = struct {
             .file_path = file_path orelse "",
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -5841,6 +5920,9 @@ pub const AgentRuntime = struct {
             .worktree_name = std.fs.path.basename(worktree_path),
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -5861,6 +5943,9 @@ pub const AgentRuntime = struct {
             .worktree_path = worktree_path,
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -5890,6 +5975,9 @@ pub const AgentRuntime = struct {
             .tool_calls_json = tool_calls_json,
             .session_id = self.session_id,
             .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
             .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
@@ -7816,6 +7904,91 @@ test "hooks-permissions-04: PostToolBatch fires exactly once for a resolved roun
     // second firing would double the file's line count / duplicate content,
     // which the single parseFromSlice call above would already have failed
     // on if the file held two concatenated JSON objects).
+}
+
+test "hooks-permissions-09: SubagentStart/SubagentStop carry a synthesized agent_id and the parent's prompt_id" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |h| {
+            if (alloc.dupeZ(u8, h)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    const start_sentinel = try std.fs.path.join(alloc, &.{ root, "subagent_start.json" });
+    defer alloc.free(start_sentinel);
+    const stop_sentinel = try std.fs.path.join(alloc, &.{ root, "subagent_stop.json" });
+    defer alloc.free(stop_sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"SubagentStart\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"SubagentStop\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ start_sentinel, stop_sentinel },
+    );
+    defer alloc.free(settings);
+    try skillGuardWriteFile(tmp.dir, ".zcode/settings.json", settings);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+    hooks_test_override = true;
+    defer hooks_test_override = false;
+
+    // Simulate being mid-turn: a real root call sets this in
+    // handlePromptDetailedWithModeAndReporter before ever reaching a tool
+    // dispatch that could spawn a sub-agent. Set it directly here so this
+    // test can call spawnChildAgent in isolation, the same way the
+    // pre-existing "tools-23" fork test above does.
+    const pid = std.fmt.bufPrint(&h.runtime.prompt_id_buf, "prompt_parent-1", .{}) catch unreachable;
+    h.runtime.prompt_id_len = pid.len;
+
+    const config = @import("tools/agent.zig").AgentRunConfig{
+        .prompt = "say hi",
+        .model = "mock/mock-agent",
+        .run_in_background = false,
+        .max_rounds = 1,
+    };
+    const result = try AgentRuntime.spawnChildAgent(@ptrCast(&h.runtime), config);
+    defer alloc.free(result);
+
+    const start_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, start_sentinel, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("SubagentStart hook did not fire: {s} ({any})\n", .{ start_sentinel, err });
+        return error.SubagentStartHookDidNotRun;
+    };
+    defer alloc.free(start_bytes);
+    var start_parsed = try std.json.parseFromSlice(std.json.Value, alloc, start_bytes, .{});
+    defer start_parsed.deinit();
+    try testing.expectEqualStrings("prompt_parent-1", start_parsed.value.object.get("prompt_id").?.string);
+    const agent_id = start_parsed.value.object.get("agent_id").?.string;
+    try testing.expect(agent_id.len > 0);
+    try testing.expect(std.mem.startsWith(u8, agent_id, "agent_"));
+
+    const stop_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, stop_sentinel, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("SubagentStop hook did not fire: {s} ({any})\n", .{ stop_sentinel, err });
+        return error.SubagentStopHookDidNotRun;
+    };
+    defer alloc.free(stop_bytes);
+    var stop_parsed = try std.json.parseFromSlice(std.json.Value, alloc, stop_bytes, .{});
+    defer stop_parsed.deinit();
+    try testing.expectEqualStrings("prompt_parent-1", stop_parsed.value.object.get("prompt_id").?.string);
+    // Same sub-agent spawn -> same agent_id on both hooks.
+    try testing.expectEqualStrings(agent_id, stop_parsed.value.object.get("agent_id").?.string);
 }
 
 fn hooksPermissions03DummyAskUser(ctx: *anyopaque, allocator: std.mem.Allocator, question: []const u8, choices: []const []const u8) anyerror![]u8 {

@@ -68,6 +68,13 @@ pub const HookDef = struct {
     /// http `headers` re-serialization -- both are "capture an object verbatim"
     /// concerns keyed on the same storage list).
     mcp_input_json: []const u8 = "",
+    /// `script` type only: true when this def came from the inline `script`
+    /// key (no `file`), meaning `body` holds raw script SOURCE TEXT rather
+    /// than a path to an existing file. The executor (hooks.zig) writes this
+    /// content to a fresh, executable temp file before spawning -- see
+    /// `hooks.writeInlineScriptTempFile`. False for every other type/form,
+    /// including a `file`-based script (where `body` already is a real path).
+    script_inline: bool = false,
 };
 
 pub const Parsed = struct {
@@ -240,8 +247,11 @@ pub fn parse(allocator: std.mem.Allocator, settings_json: []const u8) !Parsed {
                     .prompt, .agent => str(h.object.get("prompt"), ""),
                     // hooks-permissions-missed-163: `file` is the primary form
                     // (a script file path); fall back to inline `script`
-                    // content when `file` is absent (the executor writes it to
-                    // a temp file before spawning -- see hooks.zig).
+                    // content when `file` is absent -- `script_inline` below
+                    // tells the executor which case it is so it knows to
+                    // write `body` to a temp file before spawning (see
+                    // hooks.writeInlineScriptTempFile) rather than treating
+                    // it as an already-existing path.
                     .script => if (h.object.get("file") != null)
                         str(h.object.get("file"), "")
                     else
@@ -293,6 +303,7 @@ pub fn parse(allocator: std.mem.Allocator, settings_json: []const u8) !Parsed {
                     .mcp_server = if (ht == .mcp_tool) str(h.object.get("server"), "") else "",
                     .mcp_tool = if (ht == .mcp_tool) str(h.object.get("tool"), "") else "",
                     .mcp_input_json = mcp_input_json,
+                    .script_inline = ht == .script and h.object.get("file") == null,
                 });
             }
         }
@@ -411,6 +422,36 @@ test "parse reads if, shell, statusMessage, async, asyncRewake, model, headers, 
     // allowedEnvVars captured as a single-element slice.
     try testing.expectEqual(@as(usize, 1), ht.allowed_env_vars.len);
     try testing.expectEqualStrings("TOKEN", ht.allowed_env_vars[0]);
+}
+
+test "hooks-permissions-07: parse captures a command hook's exec-form args verbatim, with no shell interpretation" {
+    const json =
+        \\{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/usr/bin/prettier","args":["a b","$(whoami)","--write"]}]}]}}
+    ;
+    var p = try parse(testing.allocator, json);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 1), p.defs.len);
+    const d = p.defs[0];
+    try testing.expectEqualStrings("/usr/bin/prettier", d.body);
+    try testing.expectEqual(@as(usize, 3), d.args.len);
+    // Captured byte-for-byte: no shell metacharacter interpretation at parse
+    // time -- `$(whoami)` is an opaque string, not a substitution to expand.
+    try testing.expectEqualStrings("a b", d.args[0]);
+    try testing.expectEqualStrings("$(whoami)", d.args[1]);
+    try testing.expectEqualStrings("--write", d.args[2]);
+}
+
+test "hooks-permissions-07: args is empty when absent, and is only read for the command type" {
+    const json =
+        \\{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"./x.sh"}]},{"matcher":"*","hooks":[{"type":"prompt","prompt":"check","args":["ignored"]}]}]}}
+    ;
+    var p = try parse(testing.allocator, json);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 2), p.defs.len);
+    try testing.expectEqual(@as(usize, 0), p.defs[0].args.len);
+    // A `prompt` hook has no exec form; a stray `args` key on it is ignored
+    // rather than misapplied.
+    try testing.expectEqual(@as(usize, 0), p.defs[1].args.len);
 }
 
 test "parse defaults new fields and implies async from asyncRewake" {

@@ -4,18 +4,18 @@
 //! (an `Outcome` struct, a non-blocking-error degrade path) for the other
 //! network-backed hook type.
 //!
-//! Scope note: zcode's live MCP client registry (the connected server
-//! sessions that could actually invoke a tool) is owned by
-//! `mcp/client.zig` / `agent_runtime.zig`, well above the hooks dispatch
-//! layer, and wiring a live handle through `hooks.HookContext` end-to-end is
-//! out of this package's scope (agent_runtime.zig ownership here is
-//! "hook emission points only"). Rather than fabricate a fake call or drop
-//! the hook type entirely, this module is invocation-ready: `runMcpToolHook`
-//! takes an optional `Invoker` callback a future call site can wire to the
-//! real registry. With none supplied (today's only wiring in
-//! `hooks.processDef`), the hook is reported as "ran" (so `once`/dedup
-//! semantics behave normally) with a clear non-blocking error explaining
-//! that no bridge is connected, instead of the entry silently vanishing the
+//! Wiring: `runMcpToolHook` takes an optional `Invoker` callback so this
+//! module never has to construct or know about a live MCP client itself.
+//! `hooks.zig`'s `mcpToolInvoker` is the real adapter: `hooks.processDef`
+//! passes it (bound to `HookContext.mcp_ctx`, an opaque handle onto
+//! `mcp.Client`) whenever a live client was threaded through -- which every
+//! real, non-test call site in agent_tools.zig/agent_runtime.zig does (both
+//! already carry a `*mcp.Client` on their context for the model-facing
+//! `mcp_invoke` tool, and now hand the same handle to the hooks layer). With
+//! no live client wired (most unit tests, or a hook fired before the client
+//! is bound), this degrades to a clear non-blocking error explaining that no
+//! bridge is connected -- the hook still reports "ran" (so `once`/dedup
+//! semantics behave normally) instead of the entry silently vanishing the
 //! way an unparsed `mcp_tool` hook used to (hook_config.zig's
 //! `orelse continue`).
 
