@@ -11,6 +11,7 @@ const skill_listing = @import("skill_listing.zig");
 const skill_visibility = @import("skill_visibility.zig");
 const command_namespace = @import("command_namespace.zig");
 const gitignore = @import("gitignore.zig");
+const path_utils = @import("path_utils.zig");
 
 // The skill data model + frontmatter parser live in skill_types.zig (a leaf
 // module so the pure transforms are unit-testable and the listing/visibility
@@ -83,6 +84,16 @@ pub fn listWithTouched(
     // above each touched file. Best-effort -- a discovery error never fails the
     // whole listing.
     discoverNestedSkills(allocator, &out, cwd, touched_files) catch {};
+
+    // bundled-skills-02: unconditional scan for `.claude/skills`/`.zcode/skills`
+    // directories scattered anywhere below `cwd` (a monorepo's `apps/web/`,
+    // `apps/api/`, etc.), namespaced by their own relative path so two
+    // same-named nested skills stay distinct (`apps/web:deploy` vs
+    // `apps/api:deploy`) instead of one silently shadowing the other. Runs
+    // regardless of `touched_files` -- unlike `discoverNestedSkills` above,
+    // this does not depend on a file having been touched near the nested dir
+    // first, so `skills list`/`skills show` at session start see it too.
+    discoverScatteredWorkspaceSkills(allocator, &out, cwd) catch {};
 
     std.mem.sort(SkillSpec, out.items, {}, lessThan);
     return out.toOwnedSlice();
@@ -502,6 +513,106 @@ fn discoverNestedSkills(
     }
 }
 
+/// Directory names never worth descending into while looking for a nested
+/// `.claude/skills` or `.zcode/skills` directory -- dependency trees, build
+/// output, and VCS metadata. Keeps `discoverScatteredWorkspaceSkills` cheap
+/// even without a `.gitignore` covering them, mirroring the equivalent list in
+/// `repl_global_search.zig`'s `shouldSkipWalkPath`.
+const pruned_tree_dirs = [_][]const u8{
+    ".git",          "node_modules", ".zig-cache", "zig-out",
+    ".venv",         "venv",         "__pycache__", "target",
+    "build",         "dist",         ".cache",     ".next",
+    ".nuxt",         ".svelte-kit",  "vendor",     ".hg",
+    ".svn",
+};
+
+fn isPrunedTreeDir(name: []const u8) bool {
+    for (pruned_tree_dirs) |d| {
+        if (std.mem.eql(u8, name, d)) return true;
+    }
+    return false;
+}
+
+/// Defensive cap on directories visited by `discoverScatteredWorkspaceSkills`
+/// so a pathological tree (huge repo with no `.gitignore`) cannot turn a skill
+/// listing into an unbounded filesystem walk. Best-effort discovery: once the
+/// cap is hit the walk simply stops finding MORE nested roots, it does not
+/// error.
+const max_scattered_walk_dirs: usize = 4000;
+
+/// bundled-skills-02: unconditional scan for `.claude/skills` / `.zcode/skills`
+/// directories anywhere below `cwd`, not just at the workspace root (handled
+/// separately, unconditionally, by the two `appendFromRoot` calls earlier in
+/// `listWithTouched`) and not gated on `touched_files` like the older
+/// `discoverNestedSkills` walk above. Each such directory is namespaced with
+/// its OWN path -- relative to `cwd` -- as the initial prefix, so a monorepo
+/// with `apps/web/.claude/skills/deploy/` and `apps/api/.claude/skills/deploy/`
+/// lists both simultaneously as `apps/web:deploy` and `apps/api:deploy`
+/// instead of one silently shadowing the other on a same-name collision.
+/// Mirrors the reference's documented "Directory-scoped skills are listed
+/// with a path prefix" rule for the Skill tool. Common non-source directories
+/// are pruned (`pruned_tree_dirs`), the walk is depth- and dir-count-bounded,
+/// and a `.claude`/`.zcode` directory is never descended into beyond checking
+/// for its `skills` subdir (its `commands`/`agents`/`rules` siblings are
+/// handled by other modules).
+fn discoverScatteredWorkspaceSkills(
+    allocator: std.mem.Allocator,
+    out: *std.array_list.Managed(SkillSpec),
+    cwd: []const u8,
+) !void {
+    var visited: usize = 0;
+    try walkForScatteredSkills(allocator, out, cwd, cwd, 0, &visited);
+}
+
+fn walkForScatteredSkills(
+    allocator: std.mem.Allocator,
+    out: *std.array_list.Managed(SkillSpec),
+    cwd: []const u8,
+    dir_path: []const u8,
+    depth: usize,
+    visited: *usize,
+) !void {
+    if (depth > command_namespace.max_depth) return;
+    if (visited.* >= max_scattered_walk_dirs) return;
+    visited.* += 1;
+
+    var dir = std.Io.Dir.cwd().openDir(rt.io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.AccessDenied => return,
+        else => return err,
+    };
+    defer dir.close(rt.io);
+
+    var it = dir.iterate();
+    while (try it.next(rt.io)) |entry| {
+        if (visited.* >= max_scattered_walk_dirs) return;
+        if (entry.kind != .directory) continue;
+        if (isPrunedTreeDir(entry.name)) continue;
+
+        const child_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(child_path);
+
+        if (std.mem.eql(u8, entry.name, ".claude") or std.mem.eql(u8, entry.name, ".zcode")) {
+            // The root-level `.claude/skills`/`.zcode/skills` dirs are already
+            // scanned unconditionally above this call; only handle a NESTED
+            // one here so it is not loaded twice under two different names.
+            if (!std.mem.eql(u8, dir_path, cwd)) {
+                const skills_dir = try std.fs.path.join(allocator, &.{ child_path, "skills" });
+                defer allocator.free(skills_dir);
+                if (!gitignore.isPathGitignored(allocator, cwd, skills_dir)) {
+                    if (path_utils.toRelativePath(allocator, cwd, dir_path)) |rel| {
+                        defer allocator.free(rel);
+                        appendFromRoot(allocator, out, skills_dir, .workspace, rel) catch {};
+                    } else |_| {}
+                }
+            }
+            // Do not descend further into `.claude`/`.zcode` themselves.
+            continue;
+        }
+
+        try walkForScatteredSkills(allocator, out, cwd, child_path, depth + 1, visited);
+    }
+}
+
 fn appendFromRoot(
     allocator: std.mem.Allocator,
     out: *std.array_list.Managed(SkillSpec),
@@ -714,6 +825,85 @@ test "skill in a subdirectory gets a namespaced name" {
         if (std.mem.eql(u8, skill.name, "frontend:deploy")) found = true;
     }
     try testing.expect(found);
+}
+
+test "bundled-skills-02: two same-named nested workspace skills are both listed, namespaced by directory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two monorepo packages each ship their own "deploy" skill, at different
+    // subdirectories -- neither is the top-level `.claude/skills` root. Each
+    // SKILL.md carries the realistic, conventional `name:` frontmatter
+    // (matching its own directory's leaf) -- this is how virtually every
+    // real, hand-authored skill is written, and it must NOT strip the
+    // directory-namespace prefix the way a bare-body (no frontmatter) fixture
+    // would trivially (and unrealistically) avoid testing.
+    try tmp.dir.createDirPath(rt.io, "apps/web/.claude/skills/deploy");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "apps/web/.claude/skills/deploy/SKILL.md",
+        .data =
+        \\---
+        \\name: deploy
+        \\description: deploy the web app
+        \\---
+        \\Deploy the web app.
+        ,
+    });
+    try tmp.dir.createDirPath(rt.io, "apps/api/.claude/skills/deploy");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "apps/api/.claude/skills/deploy/SKILL.md",
+        .data =
+        \\---
+        \\name: deploy
+        \\description: deploy the api
+        \\---
+        \\Deploy the api.
+        ,
+    });
+
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+    try isolateHome(cwd);
+    defer env.clearOverrides();
+
+    // Make the tmp dir its own git repo so the nested-discovery gitignore
+    // probe (`git check-ignore`, run from cwd) resolves against THIS repo and
+    // not the outer repo whose .gitignore ignores the .zig-cache tmp tree the
+    // test runs inside -- see the near-identical comment on "skills-04 nested
+    // discovery surfaces a skill in a subdir .zcode/skills" above.
+    if (std.process.run(testing.allocator, rt.io, .{
+        .argv = &.{ "git", "init", "-q" },
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    })) |res| {
+        testing.allocator.free(res.stdout);
+        testing.allocator.free(res.stderr);
+    } else |_| {}
+
+    // No touched files at all -- discovery must be unconditional, matching
+    // what a plain `skills list`/`skills show` sees at session start.
+    const skills = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, skills);
+
+    var found_web = false;
+    var found_api = false;
+    var found_bare = false;
+    for (skills) |skill| {
+        if (std.mem.eql(u8, skill.name, "apps/web:deploy")) found_web = true;
+        if (std.mem.eql(u8, skill.name, "apps/api:deploy")) found_api = true;
+        if (std.mem.eql(u8, skill.name, "deploy")) found_bare = true;
+    }
+    try testing.expect(found_web);
+    try testing.expect(found_api);
+    // Neither one silently shadows the other under a bare, unscoped "deploy".
+    try testing.expect(!found_bare);
+
+    // The Skill tool's directory-scoped lookup resolves to the right one.
+    var resolved = (try findByName(testing.allocator, cwd, "apps/web:deploy")).?;
+    defer resolved.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, resolved.source_path, "apps/web") != null);
+    try testing.expect(std.mem.indexOf(u8, resolved.prompt, "web app") != null);
 }
 
 test "skills-04 computeActivatedConditionalSkills marks a matching conditional skill" {

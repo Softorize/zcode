@@ -233,12 +233,25 @@ pub fn parse(
 ) !SkillSpec {
     if (frontmatter.extract(raw)) |block| {
         const fm = block.body;
-        // name override from frontmatter, else the directory name.
+        // name override from frontmatter, else the directory name. `name` (the
+        // caller-supplied identity) already carries any directory/plugin
+        // namespace prefix computed by the caller (e.g. `appendFromDir` passes
+        // "apps/web:deploy", not just "deploy") -- bundled-skills-02: almost
+        // every realistically-authored SKILL.md sets an explicit (conventionally
+        // bare, matching its directory's leaf) `name:`, so letting it replace
+        // `name` OUTRIGHT silently drops that prefix the instant a skill
+        // declares one, defeating directory-scoped naming for exactly the
+        // skills that need it. `owned_name` instead RE-namespaces a bare
+        // frontmatter name under `name`'s prefix (recovered by splitting on the
+        // last `:`); a frontmatter name the author already wrote WITH its own
+        // `:` is trusted verbatim (an explicit override), and the common
+        // flat/unprefixed case (`name` has no `:`) is unchanged from before.
         const fm_name = frontmatter.getValue(fm, "name");
-        const eff_name = if (fm_name) |n| (if (n.len > 0) n else name) else name;
+        const owned_name = try effectiveSkillName(allocator, name, fm_name);
+        errdefer allocator.free(owned_name);
 
         return .{
-            .name = try allocator.dupe(u8, eff_name),
+            .name = owned_name,
             .description = try allocator.dupe(u8, descriptionFrom(fm) orelse name),
             .when_to_use = try allocator.dupe(u8, getEither(fm, "when-to-use", "whenToUse") orelse ""),
             .prompt = try allocator.dupe(u8, block.rest),
@@ -290,6 +303,26 @@ pub fn parse(
 
 fn getEither(fm: []const u8, key_a: []const u8, key_b: []const u8) ?[]const u8 {
     return frontmatter.getValue(fm, key_a) orelse frontmatter.getValue(fm, key_b);
+}
+
+/// bundled-skills-02: resolve a skill's final identity from the caller-supplied
+/// `dirname` (a bare leaf, or an already `:`-namespaced path the caller
+/// computed from directory/plugin structure -- see `appendFromDir`) and an
+/// optional frontmatter `name:` override. A bare frontmatter name (no `:` of
+/// its own) is RE-namespaced under `dirname`'s prefix rather than replacing it
+/// outright, so a directory-scoped skill does not lose its `apps/web:`/
+/// `<plugin>:` scoping just because its SKILL.md declares the conventional
+/// (dirname-matching) bare `name:`. An absent/empty frontmatter name, or a
+/// `dirname` with no prefix (the common flat case), behaves exactly as before.
+/// A frontmatter name the author already wrote WITH its own `:` is trusted
+/// verbatim as an explicit full override. Caller owns the returned slice.
+fn effectiveSkillName(allocator: std.mem.Allocator, dirname: []const u8, fm_name: ?[]const u8) ![]u8 {
+    const n = fm_name orelse return allocator.dupe(u8, dirname);
+    if (n.len == 0) return allocator.dupe(u8, dirname);
+    if (std.mem.indexOfScalar(u8, n, ':') != null) return allocator.dupe(u8, n);
+    const prefix = if (std.mem.lastIndexOfScalar(u8, dirname, ':')) |idx| dirname[0..idx] else "";
+    if (prefix.len == 0) return allocator.dupe(u8, n);
+    return std.fmt.allocPrint(allocator, "{s}:{s}", .{ prefix, n });
 }
 
 /// Description from frontmatter, handling inline and `description: |` block
@@ -423,6 +456,33 @@ pub fn hasOnlySafeProperties(spec: *const SkillSpec) bool {
     // family as allowed-tools, so it is unsafe by the same reasoning.
     if (spec.disallowed_tools.len > 0) return false;
     return true;
+}
+
+/// bundled-skills-03/17: true when `tool_name` falls outside a skill's
+/// declared tool surface, so the run path can refuse the call instead of only
+/// using `allowed_tools`/`disallowed_tools` as a permission auto-allow grant
+/// or a listing/detail-view annotation. `allowed_tools`, when non-empty,
+/// narrows the surface to EXACTLY that list -- anything not named is blocked.
+/// Otherwise a non-empty `disallowed_tools` blocks exactly those names and
+/// nothing else (mirrors `disallowed_tools`'s own doc comment: "Ignored when
+/// `allowed_tools` is non-empty"). Both lists empty means no restriction (every
+/// tool is allowed). Comparison is case-insensitive, matching every other
+/// tool/skill name comparison in this module.
+pub fn isToolBlockedBySkillRestriction(
+    allowed_tools: []const []const u8,
+    disallowed_tools: []const []const u8,
+    tool_name: []const u8,
+) bool {
+    if (allowed_tools.len > 0) {
+        for (allowed_tools) |t| {
+            if (std.ascii.eqlIgnoreCase(t, tool_name)) return false;
+        }
+        return true;
+    }
+    for (disallowed_tools) |t| {
+        if (std.ascii.eqlIgnoreCase(t, tool_name)) return true;
+    }
+    return false;
 }
 
 // ===========================================================================
@@ -571,6 +631,43 @@ test "parse populates fields and strips frontmatter from body" {
     try testing.expect(std.mem.indexOf(u8, spec.prompt, "Do the thing.") != null);
 }
 
+test "bundled-skills-02: a bare frontmatter name is re-namespaced under the caller's directory prefix" {
+    // The realistic case: a SKILL.md's `name:` matches its own directory's
+    // leaf (the conventional authoring pattern) -- the namespace prefix the
+    // caller computed from directory/plugin structure ("apps/web") must
+    // survive, not be replaced outright by the bare "deploy".
+    {
+        const raw = "---\nname: deploy\ndescription: ship it\n---\nbody\n";
+        var spec = try parse(testing.allocator, raw, "apps/web:deploy", .workspace, "/p");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("apps/web:deploy", spec.name);
+    }
+    // A multi-level within-root namespace (appendFromDir's own recursion)
+    // behaves the same way.
+    {
+        const raw = "---\nname: deploy\ndescription: ship it\n---\nbody\n";
+        var spec = try parse(testing.allocator, raw, "frontend:sub:deploy", .workspace, "/p");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("frontend:sub:deploy", spec.name);
+    }
+    // An author-written fully-qualified name (already containing ':') is
+    // trusted verbatim as an explicit override.
+    {
+        const raw = "---\nname: other:explicit\ndescription: ship it\n---\nbody\n";
+        var spec = try parse(testing.allocator, raw, "apps/web:deploy", .workspace, "/p");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("other:explicit", spec.name);
+    }
+    // The flat/unprefixed case (dirname has no ':') is exactly the pre-existing
+    // behavior: frontmatter name wins outright.
+    {
+        const raw = "---\nname: committer\ndescription: d\n---\nbody\n";
+        var spec = try parse(testing.allocator, raw, "dirname", .user, "/p");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("committer", spec.name);
+    }
+}
+
 test "parse handles no frontmatter" {
     var spec = try parse(testing.allocator, "# Title\n\nbody text\n", "mydir", .workspace, "/p");
     defer spec.deinit(testing.allocator);
@@ -712,6 +809,35 @@ test "hasOnlySafeProperties: name/description-only safe; allowed-tools and fork 
         defer spec.deinit(alloc);
         try testing.expect(hasOnlySafeProperties(&spec));
     }
+}
+
+test "isToolBlockedBySkillRestriction: no restriction, allow-list, and deny-list precedence" {
+    // No restriction at all -- nothing is blocked.
+    try testing.expect(!isToolBlockedBySkillRestriction(&.{}, &.{}, "Write"));
+
+    // allowed_tools non-empty: exactly that list, case-insensitively.
+    const allowed = [_][]const u8{ "Read", "Grep", "Glob" };
+    try testing.expect(!isToolBlockedBySkillRestriction(&allowed, &.{}, "read"));
+    try testing.expect(!isToolBlockedBySkillRestriction(&allowed, &.{}, "Glob"));
+    try testing.expect(isToolBlockedBySkillRestriction(&allowed, &.{}, "Write"));
+    try testing.expect(isToolBlockedBySkillRestriction(&allowed, &.{}, "Bash"));
+
+    // disallowed_tools only (no allowed_tools): exactly those names are
+    // blocked, everything else is fine.
+    const disallowed = [_][]const u8{ "Write", "Edit" };
+    try testing.expect(isToolBlockedBySkillRestriction(&.{}, &disallowed, "write"));
+    try testing.expect(isToolBlockedBySkillRestriction(&.{}, &disallowed, "Edit"));
+    try testing.expect(!isToolBlockedBySkillRestriction(&.{}, &disallowed, "Read"));
+    try testing.expect(!isToolBlockedBySkillRestriction(&.{}, &disallowed, "Bash"));
+
+    // allowed_tools, when non-empty, wins over disallowed_tools entirely --
+    // mirrors disallowed_tools's own doc comment ("Ignored when allowed_tools
+    // is non-empty"). Here "Write" is (oddly) in both lists; allowed_tools
+    // still decides.
+    const both_allowed = [_][]const u8{ "Write", "Read" };
+    const both_disallowed = [_][]const u8{ "Write", "Edit" };
+    try testing.expect(!isToolBlockedBySkillRestriction(&both_allowed, &both_disallowed, "Write"));
+    try testing.expect(isToolBlockedBySkillRestriction(&both_allowed, &both_disallowed, "Edit"));
 }
 
 test "skills-11: parse extracts a single-line JSON hooks block; absent yields empty" {

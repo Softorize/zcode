@@ -158,6 +158,61 @@ pub const ToolTrace = struct {
     }
 };
 
+/// bundled-skills-03/17: an owned snapshot of a skill's `allowed_tools`/
+/// `disallowed_tools` frontmatter, held on the runtime for as long as that
+/// skill is "active" (see `AgentRuntime.active_skill_restriction`'s doc
+/// comment for the exact lifetime rule). Owned separately from the
+/// originating `SkillSpec` because the spec is `deinit`'d as soon as the skill
+/// finishes rendering/forking, well before later tool calls need to consult
+/// the restriction.
+const ActiveSkillRestriction = struct {
+    skill_name: []u8 = &.{},
+    allowed_tools: [][]u8 = &.{},
+    disallowed_tools: [][]u8 = &.{},
+
+    fn deinit(self: *ActiveSkillRestriction, allocator: std.mem.Allocator) void {
+        if (self.skill_name.len > 0) allocator.free(self.skill_name);
+        freeOwnedStrList(allocator, self.allowed_tools);
+        freeOwnedStrList(allocator, self.disallowed_tools);
+        self.* = .{};
+    }
+};
+
+fn freeOwnedStrList(allocator: std.mem.Allocator, list: [][]u8) void {
+    for (list) |s| allocator.free(s);
+    if (list.len > 0) allocator.free(list);
+}
+
+fn dupeOwnedStrList(allocator: std.mem.Allocator, list: [][]u8) ![][]u8 {
+    if (list.len == 0) return &.{};
+    const out = try allocator.alloc([]u8, list.len);
+    var filled: usize = 0;
+    errdefer {
+        // Free each already-dup'd string individually, then the backing
+        // array at its FULL allocated length -- `allocator.free` requires the
+        // exact slice it handed out, so freeing `out[0..filled]` here (a
+        // shorter sub-slice) would be wrong.
+        for (out[0..filled]) |s| allocator.free(s);
+        allocator.free(out);
+    }
+    for (list, 0..) |item, i| {
+        out[i] = try allocator.dupe(u8, item);
+        filled += 1;
+    }
+    return out;
+}
+
+fn buildActiveSkillRestriction(allocator: std.mem.Allocator, spec: *const skills_types.SkillSpec) !ActiveSkillRestriction {
+    if (spec.allowed_tools.len == 0 and spec.disallowed_tools.len == 0) return .{};
+    const name = try allocator.dupe(u8, spec.name);
+    errdefer allocator.free(name);
+    const allowed = try dupeOwnedStrList(allocator, spec.allowed_tools);
+    errdefer freeOwnedStrList(allocator, allowed);
+    const disallowed = try dupeOwnedStrList(allocator, spec.disallowed_tools);
+    errdefer freeOwnedStrList(allocator, disallowed);
+    return .{ .skill_name = name, .allowed_tools = allowed, .disallowed_tools = disallowed };
+}
+
 /// Phase 22 (agent-loop-deep-11): machine-readable discriminator for why a turn
 /// ended. `final_text` continues to carry the human-readable message a CLI user
 /// reads; this enum is the structured signal a JSON consumer (ci_output.zig)
@@ -695,6 +750,16 @@ pub const AgentRuntime = struct {
     /// plan instead of guessing from heuristic text matching.
     pending_plan_markdown: ?[]u8 = null,
     current_reporter: ?repl.ProgressReporter = null,
+    /// bundled-skills-03/17: the tool-surface restriction (`allowed-tools`/
+    /// `disallowed-tools` frontmatter) of the most recently run skill, enforced
+    /// by `blockedBySkillRestriction` at every `executeToolCallDispatch` call.
+    /// Empty (the default) means no restriction is active. Set by
+    /// `setActiveSkillRestriction` on every inline skill run (replacing any
+    /// prior restriction, so a later unrestricted skill lifts an earlier one --
+    /// there is no other "skill ended" signal for an inline run, mirroring the
+    /// reference's session-wide tool-permission-context union) and on a forked
+    /// skill's child runtime (scoped to that child's lifetime by construction).
+    active_skill_restriction: ActiveSkillRestriction = .{},
     session_approved_tools: std.StringHashMap(void),
     /// Skill names invoked this session. A runtime field (not history), so it
     /// survives compaction; re-surfaced in the awareness listing each turn so
@@ -1269,6 +1334,7 @@ pub const AgentRuntime = struct {
         if (self.pending_plan_markdown) |plan| self.allocator.free(plan);
         self.history.deinit();
         freeSnapshot(self.allocator, self.snapshot);
+        self.active_skill_restriction.deinit(self.allocator);
         self.clearSessionApprovedTools();
         self.session_approved_tools.deinit();
         self.clearInvokedSkills();
@@ -3608,6 +3674,12 @@ pub const AgentRuntime = struct {
         if (self.sdk_relay) |relay| {
             if (relay.setPending) |setFn| setFn(relay.ctx, name, args, "");
         }
+        // bundled-skills-03/17: refuse a call outside the active skill's
+        // declared tool surface BEFORE it reaches the Skill-run intercept or
+        // the generic dispatcher -- this is the run-path enforcement of
+        // `allowed-tools`/`disallowed-tools`, not merely the permission
+        // auto-allow grant a few lines below already provides.
+        if (try self.blockedBySkillRestriction(name, args)) |trace| return trace;
         // Intercept Skill action=run so we can apply the skill's autonomy
         // directives the generic dispatch can't see: session-scoped
         // allowed-tools auto-allow and context: fork (isolated child runtime).
@@ -3616,6 +3688,48 @@ pub const AgentRuntime = struct {
             if (try self.tryExecuteSkillRun(name, args)) |trace| return trace;
         }
         return agent_tools.executeToolCall(self.buildToolExecContext(), name, args);
+    }
+
+    /// bundled-skills-03/17: true (and a finished, executed=false denial
+    /// trace) when `name` is outside the active skill's declared tool
+    /// surface. `allowed_tools` narrows the surface to EXACTLY that list when
+    /// non-empty; otherwise a non-empty `disallowed_tools` blocks exactly
+    /// those names (mirrors the precedence documented on `SkillSpec.
+    /// disallowed_tools`: ignored once `allowed_tools` is set). No active
+    /// restriction (the common case) always returns null.
+    fn blockedBySkillRestriction(self: *AgentRuntime, name: []const u8, args: []const u8) !?ToolTrace {
+        const restriction = self.active_skill_restriction;
+        if (restriction.allowed_tools.len == 0 and restriction.disallowed_tools.len == 0) return null;
+        if (!skills_types.isToolBlockedBySkillRestriction(restriction.allowed_tools, restriction.disallowed_tools, name)) return null;
+
+        return ToolTrace{
+            .name = try self.allocator.dupe(u8, name),
+            .args = try self.allocator.dupe(u8, args),
+            .risk = .LOW,
+            .approval_state = .denied,
+            .executed = false,
+            .duration_ms = 0,
+            .output = try std.fmt.allocPrint(
+                self.allocator,
+                "tool '{s}' is not available: skill '{s}' restricts the active tool set to its {s}",
+                .{
+                    name,
+                    restriction.skill_name,
+                    if (restriction.allowed_tools.len > 0) "allowed-tools" else "disallowed-tools",
+                },
+            ),
+        };
+    }
+
+    /// bundled-skills-03/17: replace the active skill tool-surface restriction
+    /// with `spec`'s (an empty spec clears it). See `active_skill_restriction`'s
+    /// doc comment for the lifetime rule. Best-effort: an allocation failure
+    /// leaves the previous restriction in place rather than propagating an
+    /// error out of the skill-run path.
+    fn setActiveSkillRestriction(self: *AgentRuntime, spec: *const skills_types.SkillSpec) void {
+        const built = buildActiveSkillRestriction(self.allocator, spec) catch return;
+        self.active_skill_restriction.deinit(self.allocator);
+        self.active_skill_restriction = built;
     }
 
     fn tryExecuteSkillRun(self: *AgentRuntime, name: []const u8, args: []const u8) !?ToolTrace {
@@ -3698,6 +3812,11 @@ pub const AgentRuntime = struct {
             // skill they persist for the rest of the session (the body lives in
             // history), so the mark is discarded.
             _ = self.registerSkillHooks(&spec);
+            // bundled-skills-03/17: same "persists for the rest of the
+            // session" reasoning applies to the skill's declared tool-surface
+            // restriction -- replace whatever was active before (an
+            // unrestricted skill correctly lifts an earlier restriction).
+            self.setActiveSkillRestriction(&spec);
         }
 
         const output: []u8 = if (fork)
@@ -3817,6 +3936,12 @@ pub const AgentRuntime = struct {
         child.depth = self.depth + 1;
         child.max_tool_rounds_override = 15;
         defer child.deinit();
+        // bundled-skills-03/17: the forked skill's tool-surface restriction is
+        // naturally scoped to the child runtime's lifetime (it is torn down
+        // via `defer child.deinit()` once this fork's turn loop returns), so
+        // no separate restore step is needed the way `registerSkillHooks`
+        // above needs one for the shared session-hook registry.
+        child.setActiveSkillRestriction(spec);
 
         if (spec.agent.len > 0) {
             if (child.activateAgentByNameStrict(spec.agent)) |act| self.allocator.free(act) else |_| {}
@@ -7795,6 +7920,135 @@ test "skills-11: inline skill registers its frontmatter hooks on invocation" {
     try testing.expectEqual(hook_event_mod.Event.pre_tool_use, registered[0].event);
     try testing.expectEqualStrings("Bash(*)", registered[0].matcher);
     try testing.expectEqualStrings("echo SKILL_HOOK_SENTINEL", registered[0].body);
+}
+
+// bundled-skills-03/17: allowed-tools/disallowed-tools are enforced by the run
+// path, not merely used as a permission auto-allow grant. Runs a real skill
+// through `tryExecuteSkillRun`, then dispatches subsequent tool calls through
+// the SAME `executeToolCallDispatch` entry point the round loop uses, so this
+// exercises the actual production gate rather than the pure classifier alone.
+test "bundled-skills-03/17: an active skill's allowed-tools/disallowed-tools restrict later tool calls" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |hh| {
+            if (alloc.dupeZ(u8, hh)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(hh);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    try skillGuardWriteFile(tmp.dir, ".zcode/skills/readers-only/SKILL.md",
+        \\---
+        \\name: readers-only
+        \\description: only reads
+        \\allowed-tools: Read, Grep, Glob
+        \\---
+        \\Only look, do not touch.
+        \\
+    );
+    try skillGuardWriteFile(tmp.dir, ".zcode/skills/no-editing/SKILL.md",
+        \\---
+        \\name: no-editing
+        \\description: never write or edit
+        \\disallowed-tools: Write, Edit
+        \\---
+        \\Investigate, but never modify a file.
+        \\
+    );
+    try skillGuardWriteFile(tmp.dir, ".zcode/skills/unrestricted/SKILL.md",
+        \\---
+        \\name: unrestricted
+        \\description: no tool restriction at all
+        \\---
+        \\Anything goes.
+        \\
+    );
+    try skillGuardWriteFile(tmp.dir, "note.txt", "hello\n");
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    // allowed-tools/disallowed-tools both make a skill non-safe-only (skills-02
+    // gating), so seed a blanket allow rule to let each run proceed --
+    // matching the skills-02/10/11 harness convention.
+    try h.runtime.permission_rules.addRule(.allow, .global, "Skill", "*", "test", 1, "test");
+
+    // (a) allowed-tools: Read/Grep/Glob only -- a Bash call is refused, a Read
+    // call proceeds. Tool args here use the same `key=value;key2=value2`
+    // shape `core/parse_helpers.zig` builds from a real model tool call
+    // (NOT raw `{"k":"v"}` JSON -- `tool_dispatch.getArg` is a lightweight
+    // kv-text parser, not a JSON parser) so this exercises the exact string
+    // shape the production round loop hands to `executeToolCallDispatch`.
+    {
+        var run_trace = (try h.runtime.tryExecuteSkillRun("Skill", "{\"action\":\"run\",\"name\":\"readers-only\"}")).?;
+        defer run_trace.deinit(alloc);
+        try testing.expect(run_trace.executed);
+
+        var bash_trace = try h.runtime.executeToolCallDispatch("Bash", "command=echo hi");
+        defer bash_trace.deinit(alloc);
+        try testing.expect(!bash_trace.executed);
+        try testing.expect(std.mem.indexOf(u8, bash_trace.output, "readers-only") != null);
+        try testing.expect(std.mem.indexOf(u8, bash_trace.output, "allowed-tools") != null);
+
+        var read_trace = try h.runtime.executeToolCallDispatch("Read", "file_path=note.txt");
+        defer read_trace.deinit(alloc);
+        try testing.expect(read_trace.executed);
+    }
+
+    // (b) disallowed-tools: Write, Edit -- a Write call is refused while
+    // no-editing is active.
+    {
+        var run_trace = (try h.runtime.tryExecuteSkillRun("Skill", "{\"action\":\"run\",\"name\":\"no-editing\"}")).?;
+        defer run_trace.deinit(alloc);
+        try testing.expect(run_trace.executed);
+
+        var write_trace = try h.runtime.executeToolCallDispatch("Write", "file_path=note.txt;content=nope");
+        defer write_trace.deinit(alloc);
+        try testing.expect(!write_trace.executed);
+        try testing.expect(std.mem.indexOf(u8, write_trace.output, "no-editing") != null);
+        try testing.expect(std.mem.indexOf(u8, write_trace.output, "disallowed-tools") != null);
+
+        var edit_trace = try h.runtime.executeToolCallDispatch("Edit", "file_path=note.txt;old_string=hello;new_string=bye");
+        defer edit_trace.deinit(alloc);
+        try testing.expect(!edit_trace.executed);
+    }
+
+    // The on-disk file was genuinely never touched by either refused call.
+    {
+        const contents = try tmp.dir.readFileAlloc(core_rt.io, "note.txt", alloc, .limited(64));
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("hello\n", contents);
+    }
+
+    // (c) running an unrestricted skill afterward lifts the earlier
+    // restriction -- Write is available again.
+    {
+        var run_trace = (try h.runtime.tryExecuteSkillRun("Skill", "{\"action\":\"run\",\"name\":\"unrestricted\"}")).?;
+        defer run_trace.deinit(alloc);
+        try testing.expect(run_trace.executed);
+
+        var write_trace = try h.runtime.executeToolCallDispatch("Write", "file_path=note.txt;content=now ok");
+        defer write_trace.deinit(alloc);
+        try testing.expect(write_trace.executed);
+    }
 }
 
 test "config-layout-missed-148: resolveInitialPermissionMode -- explicit CLI reference mode wins over settings.json" {
