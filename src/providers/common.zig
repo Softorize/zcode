@@ -10,6 +10,11 @@ const reactive_compaction = @import("../core/reactive_compaction.zig");
 const max_tokens_overflow = @import("../core/max_tokens_overflow.zig");
 const cancel_reason_mod = @import("../core/cancel_reason.zig");
 const retry_policy = @import("../core/retry_policy.zig");
+/// cli-flags-14: `-d, --debug api,...` category filtering only has real
+/// effect on `std.log.scoped` call sites -- this file's HTTP retry trace is
+/// the shared client used by every provider, so tagging it `.api` gives the
+/// reference's own `--debug api,hooks` example genuine content to filter on.
+const log_api = std.log.scoped(.api);
 
 pub const CancelReason = cancel_reason_mod.CancelReason;
 
@@ -1081,7 +1086,7 @@ pub fn callHttpWithResilienceAndRetryStatus(
                 status_cb.notify(formatRetryStatus(&status_buf, delay_ms, attempt + 1));
             }
             clock.sleepNanos(delay_ms * std.time.ns_per_ms);
-            std.log.debug("http retry {d}/{d} after {d}ms for {s}: {s}", .{
+            log_api.debug("http retry {d}/{d} after {d}ms for {s}: {s}", .{
                 attempt + 1, retry_count, delay_ms, url, @errorName(err),
             });
         }

@@ -478,6 +478,117 @@ pub fn filterAgentSchemas(allocator: std.mem.Allocator, schemas: []const types.T
     return out.toOwnedSlice();
 }
 
+/// cli-flags-04/missed-113/117: does `cfg` carry any of `--allowedTools`/
+/// `--disallowedTools`/`--tools` restrictions, or is `--brief` NOT set
+/// (which hides `SendUserMessage` by default -- see `isToolBlockedByCliFlags`)?
+/// Callers use this to skip the filter pass entirely (and its extra
+/// allocation) on the rare case none of these apply.
+pub fn hasCliToolFilters(cfg: *const @import("core/config.zig").Config) bool {
+    return cfg.allowed_tools.len > 0 or cfg.disallowed_tools.len > 0 or cfg.tools_flag_set or !cfg.brief;
+}
+
+/// cli-flags-missed-113/117: is `tool_name` the `SendUserMessage` tool (or
+/// its `send_user_message` dispatch synonym, per `tool_dispatch.zig`'s
+/// handler table)? `SendUserMessage` is hidden from the advertised/
+/// dispatchable tool set unless `--brief` was passed, matching Claude's own
+/// "Enable SendUserMessage tool for agent-to-user communication" wording
+/// (default OFF). Distinct from the unrelated, always-available
+/// `AttachContext` file-attachment tool (formerly named `Brief`, which is
+/// where the naming collision this flag's own help text could suggest comes
+/// from).
+fn isSendUserMessageToolName(tool_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(tool_name, "SendUserMessage") or std.ascii.eqlIgnoreCase(tool_name, "send_user_message");
+}
+
+/// cli-flags-04: does `csv` (a comma/space-separated tool-name list, as
+/// carried by `Config.allowed_tools`/`disallowed_tools`/`tools_allowlist`)
+/// name `tool_name`? Matching is a case-insensitive compare of the bare tool
+/// name; an entry written in Claude's `Bash(git *)` pattern form is accepted
+/// but only the part before the first `(` is compared -- argument-scoped
+/// pattern matching is a permission-engine concern, not a schema-visibility
+/// one, so `Bash(git *)` behaves like a plain `Bash` entry here.
+fn toolNameListContains(csv: []const u8, tool_name: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, csv, ", \t\r\n");
+    while (it.next()) |raw| {
+        var entry = raw;
+        if (std.mem.indexOfScalar(u8, entry, '(')) |paren_idx| entry = entry[0..paren_idx];
+        entry = std.mem.trim(u8, entry, " \t");
+        if (entry.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(entry, tool_name)) return true;
+    }
+    return false;
+}
+
+/// cli-flags-04: apply `--allowedTools`/`--disallowedTools`/`--tools` (their
+/// hyphenated reference spellings are folded into the same `Config` fields by
+/// `cli/args.zig`) to the primary session's own advertised/dispatchable tool
+/// schema list, so `zcode --tools "Read,Grep" ...` genuinely exposes only
+/// Read and Grep to the model, and `--disallowedTools Bash` genuinely removes
+/// Bash while leaving everything else intact. Precedence, matching Claude's
+/// own wording for `--tools`: an unset (not-passed) `--tools`, or the literal
+/// value "default", leaves the base tool set unrestricted; `--tools ""`
+/// (flag passed with an empty value) disables every tool; any other
+/// `--tools` value narrows the base set to just those names. `--allowedTools`
+/// then further narrows to its own list, and `--disallowedTools` removes its
+/// names last, so a name in both an allow-list and a deny-list ends up
+/// denied (deny wins, matching Claude's own "subtract disallowed" semantics
+/// already used by `filterAgentSchemas`/`agents_mod.allowsTool` above).
+/// cli-flags-04: the single source of truth for whether `tool_name` is shut
+/// out by `--allowedTools`/`--disallowedTools`/`--tools`. Shared by
+/// `filterByCliToolFlags` (advertised-schema visibility) and
+/// `executeToolCall`'s dispatch gate below (defense in depth: a model that
+/// calls a tool by an un-advertised alias, or from stale history, is still
+/// refused, exactly like the existing `active_agent`/`agents_mod.allowsTool`
+/// gate immediately above it).
+pub fn isToolBlockedByCliFlags(cfg: *const @import("core/config.zig").Config, tool_name: []const u8) bool {
+    if (!cfg.brief and isSendUserMessageToolName(tool_name)) return true;
+    const tools_csv_trimmed = std.mem.trim(u8, cfg.tools_allowlist, " \t");
+    if (cfg.tools_flag_set and tools_csv_trimmed.len == 0) return true; // --tools ""
+    const tools_unrestricted = !cfg.tools_flag_set or std.ascii.eqlIgnoreCase(tools_csv_trimmed, "default");
+    if (!tools_unrestricted and !toolNameListContains(cfg.tools_allowlist, tool_name)) return true;
+    if (cfg.allowed_tools.len > 0 and !toolNameListContains(cfg.allowed_tools, tool_name)) return true;
+    if (cfg.disallowed_tools.len > 0 and toolNameListContains(cfg.disallowed_tools, tool_name)) return true;
+    return false;
+}
+
+pub fn filterByCliToolFlags(
+    allocator: std.mem.Allocator,
+    schemas: []const types.ToolSchema,
+    cfg: *const @import("core/config.zig").Config,
+) ![]types.ToolSchema {
+    var out = std.array_list.Managed(types.ToolSchema).init(allocator);
+    errdefer {
+        for (out.items) |schema| {
+            allocator.free(schema.name);
+            allocator.free(schema.description);
+            allocator.free(schema.json_schema);
+            if (schema.usage_hint.len > 0) allocator.free(schema.usage_hint);
+        }
+        out.deinit();
+    }
+
+    for (schemas) |schema| {
+        if (isToolBlockedByCliFlags(cfg, schema.name)) continue;
+
+        try out.ensureUnusedCapacity(1);
+        const dup_name = try allocator.dupe(u8, schema.name);
+        errdefer allocator.free(dup_name);
+        const dup_description = try allocator.dupe(u8, schema.description);
+        errdefer allocator.free(dup_description);
+        const dup_schema = try allocator.dupe(u8, schema.json_schema);
+        errdefer allocator.free(dup_schema);
+        const dup_hint = try allocator.dupe(u8, schema.usage_hint);
+        out.appendAssumeCapacity(.{
+            .name = dup_name,
+            .description = dup_description,
+            .json_schema = dup_schema,
+            .usage_hint = dup_hint,
+        });
+    }
+
+    return out.toOwnedSlice();
+}
+
 // --- Approval helpers ---
 
 pub fn approvalStateToString(state: types.ApprovalState) []const u8 {
@@ -784,7 +895,23 @@ const EffectiveApproval = struct { ctx: ?*anyopaque, prompt: ?ApprovalPromptFn }
 /// front-end's installed `approval_handler`; otherwise they fall back to
 /// the built-in stdin approver bound to `stdin_token`. Single source of
 /// truth for both the permission-rule prompt and the main approval gate.
+/// cli-flags-missed-114/116/headless-sdk-13: `--permission-prompts none` --
+/// "nobody" answers a prompt with `--print`: anything that would otherwise
+/// prompt (the SDK host relay, `--permission-prompt-tool`, or the local
+/// stdin prompt) is auto-denied instead, without ever asking. `""` (flag
+/// absent) and `"host"` (the default) both behave as before -- only the
+/// literal value "none" changes anything here.
+fn permissionPromptsNone(ctx: ToolExecContext) bool {
+    return std.mem.eql(u8, ctx.cfg.permission_prompts, "none");
+}
+
 fn effectiveApproval(ctx: ToolExecContext, stdin_token: *u8) EffectiveApproval {
+    // `--permission-prompts none` wins over EVERYTHING below, including the
+    // SDK host relay: nobody answers, so no `can_use_tool` control_request
+    // is ever emitted and no stdin prompt ever shown. This mirrors the
+    // `!ctx.interactive` no-relay case two lines down, which already
+    // produces exactly this auto-deny shape for a plain headless run.
+    if (permissionPromptsNone(ctx)) return .{ .ctx = null, .prompt = null };
     // sdk-headless-05: a host-driven session (input-format stream-json) relays
     // permission prompts to the SDK host via `can_use_tool`. This wins over
     // everything below -- including the `!interactive` short-circuit -- because
@@ -799,10 +926,13 @@ fn effectiveApproval(ctx: ToolExecContext, stdin_token: *u8) EffectiveApproval {
 /// The interactivity flag the approval gate (`approval.evaluate`) runs under. A
 /// host-driven session (sdk-headless-05 `sdk_relay` set) is "interactive" for
 /// gate purposes -- the `can_use_tool` relay can produce a decision -- so the
-/// gate must not auto-deny it on the `!interactive` short-circuit. Otherwise it
-/// is `ctx.interactive` unchanged. Single source of truth so every evaluate
-/// call site agrees with `effectiveApproval`.
+/// gate must not auto-deny it on the `!interactive` short-circuit. `--permission-
+/// prompts none` overrides that back to non-interactive (nobody answers, so
+/// the gate must auto-deny ask-tier outcomes instead of trying to relay them).
+/// Otherwise it is `ctx.interactive` unchanged. Single source of truth so every
+/// evaluate call site agrees with `effectiveApproval`.
 fn effectiveInteractive(ctx: ToolExecContext) bool {
+    if (permissionPromptsNone(ctx)) return false;
     return ctx.interactive or ctx.sdk_relay != null;
 }
 
@@ -1197,6 +1327,18 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
             logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
             return trace;
         }
+    }
+
+    // cli-flags-04: --allowedTools/--disallowedTools/--tools dispatch-level
+    // enforcement, in addition to filterByCliToolFlags removing the tool
+    // from what gets advertised -- a model that calls a tool it was never
+    // shown (an alias, or something left over in history) must still be
+    // refused.
+    if (isToolBlockedByCliFlags(ctx.cfg, effective_name)) {
+        const output = try ctx.allocator.dupe(u8, "tool blocked for this session by --allowedTools/--disallowedTools/--tools");
+        const trace = try buildToolTrace(ctx.allocator, effective_name, args, .BLOCKED, .blocked, false, 0, output);
+        logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
+        return trace;
     }
 
     // Phase 10 Task 5 (memory-01): auto-memory extraction fork allowlist.
@@ -5162,11 +5304,15 @@ test "effectiveApproval prefers the SDK relay when host-driven, else falls back"
     };
     const relay_handler = ApprovalHandler{ .ctx = @ptrCast(&Relay.sentinel), .prompt = Relay.prompt };
 
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+
     // Base context: non-interactive, no relay -> no approver (auto-deny path).
     var base = ToolExecContext{
         .allocator = testing.allocator,
         .cwd = "/repo",
-        .cfg = undefined,
+        .cfg = &cfg,
         .policy = undefined,
         .mcp = undefined,
         .browser = null,
@@ -5211,6 +5357,20 @@ test "effectiveApproval prefers the SDK relay when host-driven, else falls back"
     {
         const a = effectiveApproval(base, &tok);
         try testing.expect(a.prompt == stdinApprovalPromptWithCtx);
+    }
+
+    // 4. cli-flags-missed-114/116/headless-sdk-13: --permission-prompts none
+    // wins over EVERYTHING, including a live SDK relay and interactive mode
+    // -- nobody answers, so no can_use_tool relay, no REPL handler, no stdin
+    // prompt, and the gate is no longer "interactive" for ask-tier purposes.
+    base.sdk_relay = relay_handler;
+    testing.allocator.free(cfg.permission_prompts);
+    cfg.permission_prompts = try testing.allocator.dupe(u8, "none");
+    {
+        const a = effectiveApproval(base, &tok);
+        try testing.expect(a.prompt == null);
+        try testing.expect(a.ctx == null);
+        try testing.expect(!effectiveInteractive(base));
     }
 }
 
@@ -6128,4 +6288,195 @@ test "analytics-10: cardinality limit collapses the overflow value to <other> in
     // "Write" is the 2nd distinct tool_name value -> collapsed to "<other>".
     try testing.expect(std.mem.indexOf(u8, second, "\"tool_name\":\"<other>\"") != null);
     try testing.expect(std.mem.indexOf(u8, second, "\"tool_name\":\"Write\"") == null);
+}
+
+test "cli-flags-04: --tools narrows the advertised schema list to just the named tools" {
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+    testing.allocator.free(cfg.tools_allowlist);
+    cfg.tools_allowlist = try testing.allocator.dupe(u8, "Read,Grep");
+    cfg.tools_flag_set = true;
+
+    const schemas = [_]types.ToolSchema{
+        .{ .name = "Read", .description = "d", .json_schema = "{}" },
+        .{ .name = "Grep", .description = "d", .json_schema = "{}" },
+        .{ .name = "Bash", .description = "d", .json_schema = "{}" },
+    };
+
+    try testing.expect(hasCliToolFilters(&cfg));
+    const filtered = try filterByCliToolFlags(testing.allocator, &schemas, &cfg);
+    defer {
+        for (filtered) |s| {
+            testing.allocator.free(s.name);
+            testing.allocator.free(s.description);
+            testing.allocator.free(s.json_schema);
+        }
+        testing.allocator.free(filtered);
+    }
+
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+    try testing.expectEqualStrings("Read", filtered[0].name);
+    try testing.expectEqualStrings("Grep", filtered[1].name);
+}
+
+test "cli-flags-04: --disallowedTools removes just the named tool" {
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+    testing.allocator.free(cfg.disallowed_tools);
+    cfg.disallowed_tools = try testing.allocator.dupe(u8, "Bash");
+
+    const schemas = [_]types.ToolSchema{
+        .{ .name = "Read", .description = "d", .json_schema = "{}" },
+        .{ .name = "Bash", .description = "d", .json_schema = "{}" },
+    };
+
+    const filtered = try filterByCliToolFlags(testing.allocator, &schemas, &cfg);
+    defer {
+        for (filtered) |s| {
+            testing.allocator.free(s.name);
+            testing.allocator.free(s.description);
+            testing.allocator.free(s.json_schema);
+        }
+        testing.allocator.free(filtered);
+    }
+
+    try testing.expectEqual(@as(usize, 1), filtered.len);
+    try testing.expectEqualStrings("Read", filtered[0].name);
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "Bash"));
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "Read"));
+}
+
+test "cli-flags-04: --tools \"\" disables every tool while unset --tools leaves everything unrestricted" {
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+
+    // Not passed at all: --tools/--allowedTools/--disallowedTools are fully
+    // unrestricted (a plain tool like "Bash" is never blocked); the filter
+    // pass itself still runs by default because `--brief` defaults off (see
+    // the SendUserMessage-specific test below).
+    try testing.expect(hasCliToolFilters(&cfg));
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "Bash"));
+
+    // `--tools ""`: flag WAS passed, with an empty value -> disable all.
+    cfg.tools_flag_set = true;
+    try testing.expect(hasCliToolFilters(&cfg));
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "Bash"));
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "Read"));
+
+    // `--tools default`: flag WAS passed but the literal "default" keeps
+    // everything unrestricted, per Claude's own documented wording.
+    testing.allocator.free(cfg.tools_allowlist);
+    cfg.tools_allowlist = try testing.allocator.dupe(u8, "default");
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "Bash"));
+}
+
+test "cli-flags-missed-113/117: --brief gates SendUserMessage, off by default" {
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+
+    // Default (no --brief): SendUserMessage is hidden; every other tool
+    // (including the unrelated, always-available AttachContext) is not.
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "SendUserMessage"));
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "send_user_message"));
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "AttachContext"));
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "Bash"));
+
+    const schemas = [_]types.ToolSchema{
+        .{ .name = "AttachContext", .description = "d", .json_schema = "{}" },
+        .{ .name = "SendUserMessage", .description = "d", .json_schema = "{}" },
+    };
+    {
+        const filtered = try filterByCliToolFlags(testing.allocator, &schemas, &cfg);
+        defer {
+            for (filtered) |s| {
+                testing.allocator.free(s.name);
+                testing.allocator.free(s.description);
+                testing.allocator.free(s.json_schema);
+            }
+            testing.allocator.free(filtered);
+        }
+        try testing.expectEqual(@as(usize, 1), filtered.len);
+        try testing.expectEqualStrings("AttachContext", filtered[0].name);
+    }
+
+    // --brief: SendUserMessage is now advertised too.
+    cfg.brief = true;
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "SendUserMessage"));
+    {
+        const filtered = try filterByCliToolFlags(testing.allocator, &schemas, &cfg);
+        defer {
+            for (filtered) |s| {
+                testing.allocator.free(s.name);
+                testing.allocator.free(s.description);
+                testing.allocator.free(s.json_schema);
+            }
+            testing.allocator.free(filtered);
+        }
+        try testing.expectEqual(@as(usize, 2), filtered.len);
+    }
+}
+
+test "cli-flags-04: executeToolCall denies a call to a tool excluded by --tools" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const cwd = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(cwd);
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.tools_allowlist);
+    cfg.tools_allowlist = try alloc.dupe(u8, "Read");
+    cfg.tools_flag_set = true;
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    var rules = permission_rules_mod.Store.init(alloc);
+    defer rules.deinit();
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = &rules,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = true,
+    };
+
+    var trace = try executeToolCall(ctx, "Bash", "command=echo hi");
+    defer trace.deinit(alloc);
+    try testing.expectEqual(types.RiskTier.BLOCKED, trace.risk);
+    try testing.expect(!trace.executed);
+    try testing.expect(std.mem.indexOf(u8, trace.output, "--allowedTools/--disallowedTools/--tools") != null);
 }

@@ -643,6 +643,19 @@ pub const Client = struct {
     /// scoped set/clear here is safe.
     http_extra_headers: []const mcp_config.HeaderEntry = &.{},
 
+    /// cli-flags-06: servers parsed from `--mcp-config <configs...>`
+    /// (inline JSON or JSON files), installed by `setCliMcpConfig` before
+    /// the first scoped-config load. Owned by the Client; consumed (moved
+    /// out, replaced with `&.{}`) the first time `loadScopedConfig` runs, or
+    /// freed directly by `deinit` if that never happens (e.g. the `mcp add`/
+    /// `mcp remove` subcommands, which never touch scoped config at all).
+    cli_mcp_servers: []mcp_config.ServerConfig = &.{},
+    /// cli-flags-06: `--strict-mcp-config` -- when true, `loadScopedConfig`
+    /// uses ONLY `cli_mcp_servers`, skipping the legacy registry,
+    /// `~/.claude.json`, project `.mcp.json`, enterprise managed config, and
+    /// plugin-contributed servers entirely.
+    cli_mcp_strict: bool = false,
+
     pub fn init(allocator: std.mem.Allocator, registry_path: []const u8) !Client {
         const dir = std.fs.path.dirname(registry_path) orelse return error.InvalidPath;
         try paths.ensureDir(dir);
@@ -660,6 +673,19 @@ pub const Client = struct {
     /// call this, keep `scoped_enabled == false` and stay hermetic. Idempotent.
     pub fn enableScopedConfig(self: *Client) void {
         self.scoped_enabled = true;
+    }
+
+    /// cli-flags-06: install `--mcp-config`/`--strict-mcp-config`-supplied
+    /// servers for this process. Takes ownership of `servers` (freed by
+    /// `deinit` if `loadScopedConfig` never runs). Call before
+    /// `enableScopedConfig`/before anything else touches the client, so the
+    /// very first scoped-config load already sees them. `strict` mirrors
+    /// Claude's own `--strict-mcp-config`: when true, `loadScopedConfig`
+    /// uses ONLY these servers, ignoring every other MCP configuration
+    /// source.
+    pub fn setCliMcpConfig(self: *Client, servers: []mcp_config.ServerConfig, strict: bool) void {
+        self.cli_mcp_servers = servers;
+        self.cli_mcp_strict = strict;
     }
 
     /// Build and cache the merged scoped-config server set the first time it is
@@ -715,6 +741,15 @@ pub const Client = struct {
     /// `self.scoped_servers`. Factored out of `ensureScopedConfig` so a test can
     /// drive it directly with an explicit cwd via `loadScopedConfigForTest`.
     fn loadScopedConfig(self: *Client) !void {
+        // cli-flags-06: --strict-mcp-config short-circuits everything else --
+        // ONLY the --mcp-config-supplied servers are used, full stop.
+        if (self.cli_mcp_strict) {
+            mcp_config.freeServerConfigs(self.allocator, self.scoped_servers);
+            self.scoped_servers = self.cli_mcp_servers;
+            self.cli_mcp_servers = &.{};
+            return;
+        }
+
         const cwd = try self.scopedCwd();
         defer self.allocator.free(cwd);
 
@@ -754,6 +789,17 @@ pub const Client = struct {
         // is the reference's local (per-project) MCP scope.
         var claude_json_local = try mcp_config.loadClaudeDotJsonLocalScope(self.allocator, cwd, true);
         errdefer claude_json_local.deinit(self.allocator);
+
+        // cli-flags-06: `--mcp-config`-supplied servers join the `local`
+        // scope too (the reference's own precedence has CLI-supplied config
+        // win), appended LAST so a same-name collision with a
+        // `~/.claude.json` local-scope entry resolves in `--mcp-config`'s
+        // favor (mergeScopes's within-scope merge keeps the last
+        // occurrence).
+        if (self.cli_mcp_servers.len > 0) {
+            claude_json_local.servers = try mcp_config.concatServerConfigs(self.allocator, claude_json_local.servers, self.cli_mcp_servers);
+            self.cli_mcp_servers = &.{};
+        }
 
         // enterprise scope: exclusive control when the managed file exists.
         const enterprise_exclusive = mcp_config.enterpriseFileExists(self.allocator);
@@ -902,6 +948,11 @@ pub const Client = struct {
         self.notifications.deinit();
         self.bridge_stack.deinit();
         mcp_config.freeServerConfigs(self.allocator, self.scoped_servers);
+        // cli-flags-06: freed unconditionally -- `loadScopedConfig` already
+        // reset this to `&.{}` (a no-op free) once it moved the servers
+        // elsewhere, so this only actually frees anything when scoped
+        // config was never loaded at all (e.g. `mcp add`/`mcp remove`).
+        mcp_config.freeServerConfigs(self.allocator, self.cli_mcp_servers);
         if (self.scoped_cwd) |c| self.allocator.free(c);
         self.allocator.free(self.registry_path);
     }
@@ -4741,6 +4792,74 @@ test "scoped config: a project .mcp.json stdio server is merged into the client'
         if (std.mem.eql(u8, s.name, "legacy")) saw_legacy = true;
     }
     try testing.expect(saw_fs and saw_legacy);
+}
+
+test "cli-flags-06: --mcp-config servers merge into the local scope alongside .mcp.json" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".mcp.json",
+        .data = "{ \"mcpServers\": { \"fs\": { \"command\": \"node\" } } }",
+    });
+
+    const project_dir = try @import("../core/test_helpers.zig").tmpDirPath(allocator, &tmp, ".");
+    defer allocator.free(project_dir);
+    const registry_path = try std.fs.path.join(allocator, &.{ project_dir, "registry.json" });
+    defer allocator.free(registry_path);
+
+    var client = try Client.init(allocator, registry_path);
+    defer client.deinit();
+
+    const parsed = try mcp_config.parseMcpJson(allocator, "{\"mcpServers\":{\"foo\":{\"command\":\"echo\"}}}", .local, false);
+    // NOTE: `deinitErrorsOnly` also frees `.servers`'s container array (it
+    // assumes the elements were already moved elsewhere) -- since we're
+    // about to hand `.servers` itself to `setCliMcpConfig`, free only the
+    // (empty, here) errors slice, not the whole result.
+    if (parsed.errors.len > 0) allocator.free(parsed.errors);
+    client.setCliMcpConfig(parsed.servers, false);
+
+    try client.loadScopedConfigForTest(project_dir);
+
+    // Both the project's own `.mcp.json` server and the `--mcp-config`
+    // server are present -- non-strict mode merges, it doesn't replace.
+    try testing.expect(client.serverConfigFor("fs") != null);
+    const foo_cfg = client.serverConfigFor("foo").?;
+    try testing.expectEqualStrings("echo", foo_cfg.command.?);
+}
+
+test "cli-flags-06: --strict-mcp-config uses ONLY the --mcp-config servers, ignoring .mcp.json" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".mcp.json",
+        .data = "{ \"mcpServers\": { \"fs\": { \"command\": \"node\" } } }",
+    });
+
+    const project_dir = try @import("../core/test_helpers.zig").tmpDirPath(allocator, &tmp, ".");
+    defer allocator.free(project_dir);
+    const registry_path = try std.fs.path.join(allocator, &.{ project_dir, "registry.json" });
+    defer allocator.free(registry_path);
+
+    var client = try Client.init(allocator, registry_path);
+    defer client.deinit();
+    try client.add("legacy", "python -m server");
+
+    const parsed = try mcp_config.parseMcpJson(allocator, "{\"mcpServers\":{\"foo\":{\"command\":\"echo\"}}}", .local, false);
+    if (parsed.errors.len > 0) allocator.free(parsed.errors);
+    client.setCliMcpConfig(parsed.servers, true);
+
+    try client.loadScopedConfigForTest(project_dir);
+
+    // Strict mode: the project's `.mcp.json` server and the legacy registry
+    // server are BOTH absent -- only the --mcp-config server survives.
+    try testing.expect(client.serverConfigFor("fs") == null);
+    try testing.expect(client.serverConfigFor("legacy") == null);
+    const foo_cfg = client.serverConfigFor("foo").?;
+    try testing.expectEqualStrings("echo", foo_cfg.command.?);
 }
 
 test "scoped config: resolved http headers reach the HTTP request builder" {

@@ -19,6 +19,10 @@ const hooks_snapshot = @import("hooks_snapshot.zig");
 const session_hooks = @import("session_hooks.zig");
 const hook_events = @import("hook_events.zig");
 const plugin_hooks = @import("plugin_hooks.zig");
+/// cli-flags-14: scoped so `-d, --debug hooks` (or `api,hooks`) can select
+/// hook-execution traces specifically -- see providers/common.zig's `log_api`
+/// for the matching `.api` half of the reference's own example filter.
+const log_hooks = std.log.scoped(.hooks);
 
 /// The live dispatch layer now routes every lifecycle event through the full
 /// reference event set (`hook_event.Event`) rather than the old 3-variant enum.
@@ -548,6 +552,7 @@ pub fn run(allocator: std.mem.Allocator, ctx: HookContext) !HookRunResult {
             };
         }
         ran = true;
+        log_hooks.debug("running {s} hook {s} for event {s}", .{ scopeName(hook.scope), hook.path, eventName(ctx.event) });
         var result = try runSingle(allocator, hook.path, ctx);
         defer result.deinit(allocator);
 
@@ -787,6 +792,14 @@ fn processDef(
     } else if (std.mem.trim(u8, def.if_cond, " \t").len > 0) {
         return null;
     }
+
+    // cli-flags-14: `-d, --debug hooks` (or `api,hooks`) trace point for the
+    // settings.json/`.claude`/`.zcode` JSON-contract hook path -- the one
+    // most users actually configure (contrast the legacy per-event `.sh`
+    // file path in `run()` above, which has its own `log_hooks.debug` call).
+    log_hooks.debug("dispatching hook (type={s} matcher={s}) for event {s}", .{
+        @tagName(def.hook_type), def.matcher, eventName(engine_event),
+    });
 
     const payload = buildEventPayload(allocator, ctx) catch return null;
     defer allocator.free(payload);

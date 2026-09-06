@@ -658,13 +658,28 @@ pub fn shouldAdvertiseDeferredTool(schema: types.ToolSchema, non_interactive: bo
 /// joined with ", ". The agent runtime appends this to the system prompt so the
 /// model knows what it can fetch via ToolSearch. `non_interactive` gates
 /// session-mode-specific tools (StructuredOutput). Allocated; caller owns.
-pub fn renderDeferredToolNamesListFor(allocator: std.mem.Allocator, non_interactive: bool) ![]u8 {
+/// cli-flags-missed-113/117: is `name` the `SendUserMessage` tool (or its
+/// `send_user_message` dispatch synonym)? Duplicated here (rather than
+/// importing `agent_tools.zig`'s equivalent) to avoid a cross-module
+/// dependency from the tool-schema layer into the tool-execution layer for
+/// one name check.
+fn isSendUserMessageToolName(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "SendUserMessage") or std.ascii.eqlIgnoreCase(name, "send_user_message");
+}
+
+pub fn renderDeferredToolNamesListFor(allocator: std.mem.Allocator, non_interactive: bool, hide_brief_gated_tools: bool) ![]u8 {
     var out = std_io.StringBuilder.init(allocator);
     errdefer out.deinit();
     var first = true;
     for (builtin_schemas) |schema| {
         if (!isDeferredTool(schema)) continue;
         if (!shouldAdvertiseDeferredTool(schema, non_interactive)) continue;
+        // cli-flags-missed-113/117: SendUserMessage is `--brief`-gated (off
+        // by default) -- a model should not even be told it EXISTS (let
+        // alone be able to ToolSearch its schema) unless the flag was
+        // passed, matching Claude's own "Enable SendUserMessage tool..."
+        // wording for a default-off tool.
+        if (hide_brief_gated_tools and isSendUserMessageToolName(schema.name)) continue;
         if (!first) try out.appendSlice(", ");
         try out.appendSlice(schema.name);
         first = false;
@@ -672,11 +687,13 @@ pub fn renderDeferredToolNamesListFor(allocator: std.mem.Allocator, non_interact
     return out.toOwnedSlice();
 }
 
-/// Back-compat: the interactive (default) deferred-names advisory. StructuredOutput
-/// is excluded since it is non-interactive-only. Callers that know the session is
-/// one-shot should use `renderDeferredToolNamesListFor(allocator, true)`.
+/// Back-compat: the interactive (default) deferred-names advisory, with
+/// SendUserMessage NOT hidden (existing callers/tests expect the full list).
+/// StructuredOutput is excluded since it is non-interactive-only. Callers
+/// that know the session is one-shot should use
+/// `renderDeferredToolNamesListFor(allocator, true, ...)`.
 pub fn renderDeferredToolNamesList(allocator: std.mem.Allocator) ![]u8 {
-    return renderDeferredToolNamesListFor(allocator, false);
+    return renderDeferredToolNamesListFor(allocator, false, false);
 }
 
 /// Sanitize MCP tool descriptions to mitigate prompt injection.
@@ -985,11 +1002,11 @@ test "StructuredOutput is present in the non-interactive tool set and absent in 
     // tools-09: the StructuredOutput tool is advertised only in a
     // non-interactive (one-shot) session. The deferred-names advisory must
     // list it when non_interactive=true and omit it when false.
-    const non_interactive_list = try renderDeferredToolNamesListFor(testing.allocator, true);
+    const non_interactive_list = try renderDeferredToolNamesListFor(testing.allocator, true, false);
     defer testing.allocator.free(non_interactive_list);
     try testing.expect(std.mem.indexOf(u8, non_interactive_list, "StructuredOutput") != null);
 
-    const interactive_list = try renderDeferredToolNamesListFor(testing.allocator, false);
+    const interactive_list = try renderDeferredToolNamesListFor(testing.allocator, false, false);
     defer testing.allocator.free(interactive_list);
     try testing.expect(std.mem.indexOf(u8, interactive_list, "StructuredOutput") == null);
 
@@ -997,6 +1014,18 @@ test "StructuredOutput is present in the non-interactive tool set and absent in 
     const default_list = try renderDeferredToolNamesList(testing.allocator);
     defer testing.allocator.free(default_list);
     try testing.expect(std.mem.indexOf(u8, default_list, "StructuredOutput") == null);
+}
+
+test "cli-flags-missed-113/117: renderDeferredToolNamesListFor hides SendUserMessage when hide_brief_gated_tools is set" {
+    const shown = try renderDeferredToolNamesListFor(testing.allocator, false, false);
+    defer testing.allocator.free(shown);
+    try testing.expect(std.mem.indexOf(u8, shown, "SendUserMessage") != null);
+
+    const hidden = try renderDeferredToolNamesListFor(testing.allocator, false, true);
+    defer testing.allocator.free(hidden);
+    try testing.expect(std.mem.indexOf(u8, hidden, "SendUserMessage") == null);
+    // Nothing else was dropped -- just the one gated name.
+    try testing.expect(std.mem.indexOf(u8, hidden, "AttachContext") != null);
 
     // Pure gating helper contract.
     const so = blk: {

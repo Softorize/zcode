@@ -1015,12 +1015,74 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
         /// Run the stream-json input loop: read NDJSON from `reader`, dispatch
         /// each line, and emit SDK output for each completed `user` turn.
         pub fn run(self: *Self) !void {
+            // headless-sdk-12: --await-initialize blocks on the first stdin
+            // line, requiring it to be an `initialize` control_request,
+            // BEFORE anything else (including the normal dispatch loop) runs.
+            if (self.rc.cfg.await_initialize) {
+                try self.awaitInitializeFirstLine();
+            }
             try structured_io.runDispatchLoop(self.rc.allocator, self.reader, self.writer, .{
                 .ctx = @ptrCast(self),
                 .on_user = onUser,
                 .on_control_request = onControlRequest,
                 .on_update_env = onUpdateEnv,
             });
+        }
+
+        /// headless-sdk-12: read exactly one line from `self.reader` and
+        /// require it to be an `initialize` control_request, applying it via
+        /// the same `handleControlRequest` path a normally-arriving
+        /// initialize takes (so its side effects -- jsonSchema/
+        /// promptSuggestions/agents/sdkMcpServers -- are identical either
+        /// way). Errors with reference-equivalent text on EOF / malformed
+        /// JSON / a different first message, printed to stderr (matching
+        /// every other CLI-level validation failure in this codebase) before
+        /// returning `error.AwaitInitializeFailed` so the caller's normal
+        /// error propagation aborts the run without ever starting a turn.
+        fn awaitInitializeFirstLine(self: *Self) !void {
+            const allocator = self.rc.allocator;
+            const stderr = std_io.stderrWriter();
+
+            const line_opt = try self.reader.readUntilDelimiterOrEofAlloc(allocator, '\n', structured_io.LINE_CAP);
+            const line = line_opt orelse {
+                try stderr.writeAll("error: --await-initialize: stdin ended before an initialize request arrived.\n");
+                return error.AwaitInitializeFailed;
+            };
+            defer allocator.free(line);
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+
+            if (trimmed.len == 0) {
+                try stderr.writeAll(
+                    "error: --await-initialize requires the initialize control request as the first stdin line, and the first line is a different message.\n",
+                );
+                return error.AwaitInitializeFailed;
+            }
+
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch {
+                try stderr.writeAll(
+                    "error: --await-initialize requires the initialize control request as the first stdin line, and the first line is not valid JSON.\n",
+                );
+                return error.AwaitInitializeFailed;
+            };
+            defer parsed.deinit();
+
+            const is_initialize = blk: {
+                if (parsed.value != .object) break :blk false;
+                const type_val = parsed.value.object.get("type") orelse break :blk false;
+                if (type_val != .string or !std.mem.eql(u8, type_val.string, "control_request")) break :blk false;
+                const req_val = parsed.value.object.get("request") orelse break :blk false;
+                if (req_val != .object) break :blk false;
+                const subtype_val = req_val.object.get("subtype") orelse break :blk false;
+                break :blk subtype_val == .string and std.mem.eql(u8, subtype_val.string, "initialize");
+            };
+            if (!is_initialize) {
+                try stderr.writeAll(
+                    "error: --await-initialize requires the initialize control request as the first stdin line, and the first line is a different message.\n",
+                );
+                return error.AwaitInitializeFailed;
+            }
+
+            try self.handleControlRequest(trimmed);
         }
 
         fn onUser(ctx: *anyopaque, prompt: []const u8, message_uuid: []const u8) anyerror!void {
@@ -2201,6 +2263,110 @@ test "LIVE: headless-sdk-16 -- commands_changed fires only after a real mid-sess
     const turn_two_output = host.out.items[out_len_after_turn_one..];
     try testing.expect(std.mem.indexOf(u8, turn_two_output, "\"type\":\"system\",\"subtype\":\"commands_changed\"") != null);
     try testing.expect(std.mem.indexOf(u8, turn_two_output, "discovered-skill") != null);
+}
+
+test "headless-sdk-12: --await-initialize errors instead of starting a turn when the first line is a plain user message" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+    h.cfg.await_initialize = true;
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    try host.queue("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"turn one\"}}");
+
+    const rc = h.runContext();
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(rc, &host, &host, .json);
+    defer session.deinit();
+
+    try testing.expectError(error.AwaitInitializeFailed, session.run());
+    // The turn never ran: no `result` (or anything else) was ever written.
+    try testing.expectEqualStrings("", host.out.items);
+}
+
+test "headless-sdk-12: --await-initialize errors on EOF before any line arrives" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+    h.cfg.await_initialize = true;
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    // No queued lines at all -> immediate EOF.
+
+    const rc = h.runContext();
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(rc, &host, &host, .json);
+    defer session.deinit();
+
+    try testing.expectError(error.AwaitInitializeFailed, session.run());
+}
+
+test "headless-sdk-12: --await-initialize errors on a malformed-JSON first line" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+    h.cfg.await_initialize = true;
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    try host.queue("{not json");
+
+    const rc = h.runContext();
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(rc, &host, &host, .json);
+    defer session.deinit();
+
+    try testing.expectError(error.AwaitInitializeFailed, session.run());
+}
+
+test "headless-sdk-12: --await-initialize accepts a genuine initialize control_request as the first line, then proceeds normally" {
+    const alloc = testing.allocator;
+    const env = @import("../core/env.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    try env.setOverride("ZCODE_MOCK_RESPONSE", "{\"assistant\":\"ok\",\"tool_calls\":[]}");
+    defer env.clearOverrides();
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+    h.cfg.await_initialize = true;
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    try host.queue("{\"type\":\"control_request\",\"request_id\":\"init-1\",\"request\":{\"subtype\":\"initialize\"}}");
+    try host.queue("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"turn one\"}}");
+
+    const rc = h.runContext();
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(rc, &host, &host, .json);
+    defer session.deinit();
+
+    try session.run();
+
+    // The initialize control_request got its own control_response...
+    try testing.expect(std.mem.indexOf(u8, host.out.items, "\"request_id\":\"init-1\"") != null);
+    // ...and the turn that followed actually ran (a result line was emitted).
+    try testing.expect(std.mem.indexOf(u8, host.out.items, "\"type\":\"result\"") != null);
 }
 
 test "LIVE: stream-json control_request set_model mutates the live runtime and replies success" {
