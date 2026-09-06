@@ -192,6 +192,13 @@ fn applySettingsJsonBridge(allocator: std.mem.Allocator, cfg: *Config, cwd: []co
             if (n >= 0) cfg.auto_compact_window = @intCast(@min(n, std.math.maxInt(u32)));
         }
 
+        // repl-ux-missed-128/130: "autoCompactEnabled" (bool, default true)
+        // -> auto_compact_enabled. See that field's doc comment for the
+        // current (footer-wording-only) scope of what this drives.
+        if (settings_sources.getBool(parsed.value, "autoCompactEnabled")) |v| {
+            cfg.auto_compact_enabled = v;
+        }
+
         // config-layout-17: "includeCoAuthoredBy" (bool, default true) ->
         // include_co_authored_by. The reference documents `attribution` as
         // the newer, preferred key with `includeCoAuthoredBy` "deprecated:
@@ -2803,6 +2810,39 @@ test "config-layout-17: .claude/settings.json alwaysThinkingEnabled/autoCompactW
     try testing.expect(loaded.config.always_thinking_enabled);
     try testing.expectEqual(@as(u32, 500_000), loaded.config.auto_compact_window);
     try testing.expect(!loaded.config.include_co_authored_by);
+}
+
+test "repl-ux-missed-128/130: .claude/settings.json autoCompactEnabled:false bridges into Config" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"autoCompactEnabled\":false}",
+    });
+
+    var opts: cli.CliOptions = .{};
+    var loaded = try load(allocator, root, &opts);
+    defer loaded.deinit(allocator);
+
+    try testing.expect(!loaded.config.auto_compact_enabled);
+}
+
+test "auto_compact_enabled defaults to true when unset" {
+    const allocator = testing.allocator;
+    var cfg = try Config.init(allocator);
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.auto_compact_enabled);
 }
 
 test "config-layout-17: autoCompactWindow accepts a bare number and \"auto\"" {

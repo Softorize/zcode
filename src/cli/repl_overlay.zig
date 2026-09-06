@@ -393,10 +393,14 @@ pub fn runInlineApprovalPrompt(message: []const u8) !ApprovalChoice {
     const stdin = std_io.stdinReader();
 
     var name_buf: [64]u8 = undefined;
-    var body_buf: [256]u8 = undefined;
+    // repl-ux-03: sized generously (not the old 256) so a full Bash
+    // command/approval body threaded through from agent_tools.zig is not
+    // re-truncated here after already surviving the un-clipped
+    // fullDetailForApproval path.
+    var body_buf: [4096]u8 = undefined;
     const parts = parseApprovalMessage(message, &name_buf, &body_buf);
-    var dont_ask_label_buf: [80]u8 = undefined;
-    const dont_ask_label = dontAskAgainLabel(&dont_ask_label_buf, parts.tool_name);
+    var dont_ask_label_buf: [200]u8 = undefined;
+    const dont_ask_label = dontAskAgainLabel(&dont_ask_label_buf, parts.tool_name, parts.allow_rule);
 
     // repl-ux-03: title + body + the reference's literal "Do you want to
     // proceed?" question, then a numbered Yes / "don't ask again" / No
@@ -460,7 +464,17 @@ fn dialogTitleForTool(name: []const u8) []const u8 {
 /// (`session_approved_tools`, agent_tools.zig) rather than the
 /// reference's finer command-prefix rule, so the label names that real
 /// scope instead of promising a specific prefix rule it cannot yet grant.
-fn dontAskAgainLabel(out: []u8, tool_name: []const u8) []const u8 {
+/// repl-ux-03: when `rule` is non-empty (a concrete allow-rule derived by
+/// `agent_tools.buildApprovalDescription`, e.g. "Bash(npm run)" or
+/// "WebFetch(domain:example.com)"), name it directly -- "Yes, and don't
+/// ask again for: <rule>" -- mirroring the reference's Haiku-suggested
+/// prefix row. Falls back to the generic tool-scoped label (zcode's real
+/// grant scope, `session_approved_tools`) only when no concrete rule
+/// could be derived for this call.
+fn dontAskAgainLabel(out: []u8, tool_name: []const u8, rule: []const u8) []const u8 {
+    if (rule.len > 0) {
+        return std.fmt.bufPrint(out, "Yes, and don't ask again for: {s}", .{rule}) catch "Yes, and don't ask again for this tool this session";
+    }
     if (tool_name.len == 0) return "Yes, and don't ask again for this tool this session";
     return std.fmt.bufPrint(out, "Yes, and don't ask again for {s} this session", .{tool_name}) catch "Yes, and don't ask again for this tool this session";
 }
@@ -468,6 +482,11 @@ fn dontAskAgainLabel(out: []u8, tool_name: []const u8) []const u8 {
 const ApprovalMessageParts = struct {
     tool_name: []const u8 = "",
     body: []const u8 = "",
+    /// repl-ux-03: a concrete allow-rule (e.g. "Bash(npm run)"), sliced
+    /// directly out of the original `message` -- not copied -- when a
+    /// "Suggested allow-rules: <rule>" line is present. Empty when none
+    /// was derivable for this call.
+    allow_rule: []const u8 = "",
 };
 
 /// Parse the "{name} [{RISK}]: {summary}" line `agent_tools.
@@ -480,6 +499,7 @@ const ApprovalMessageParts = struct {
 /// newlines together with no separator at all.
 fn parseApprovalMessage(message: []const u8, name_buf: []u8, body_buf: []u8) ApprovalMessageParts {
     var tool_name: []const u8 = "";
+    var allow_rule: []const u8 = "";
     var body_pos: usize = 0;
     var first = true;
     var lines = std.mem.splitScalar(u8, message, '\n');
@@ -502,6 +522,13 @@ fn parseApprovalMessage(message: []const u8, name_buf: []u8, body_buf: []u8) App
                 }
             }
         }
+        if (allow_rule.len == 0) {
+            const rule_marker = "Suggested allow-rules: ";
+            if (std.mem.startsWith(u8, this_line, rule_marker)) {
+                const rule_text = std.mem.trim(u8, this_line[rule_marker.len..], " \t");
+                if (rule_text.len > 0) allow_rule = rule_text;
+            }
+        }
         if (!first and body_pos < body_buf.len) {
             const sep = " \xc2\xb7 ";
             const take_sep = @min(sep.len, body_buf.len - body_pos);
@@ -513,7 +540,7 @@ fn parseApprovalMessage(message: []const u8, name_buf: []u8, body_buf: []u8) App
         body_pos += take;
         first = false;
     }
-    return .{ .tool_name = tool_name, .body = body_buf[0..body_pos] };
+    return .{ .tool_name = tool_name, .body = body_buf[0..body_pos], .allow_rule = allow_rule };
 }
 
 fn stepUpRow(row: usize) usize {
@@ -616,7 +643,12 @@ fn renderApprovalOverlay(message: []const u8, selected: usize, bottom_margin_row
     const title_row = stepUpRow(body_row);
 
     var name_buf: [64]u8 = undefined;
-    var body_buf: [256]u8 = undefined;
+    // repl-ux-03: sized generously (not the old 256) -- the single-row
+    // body is still ultimately clipped to the real terminal width below
+    // (`draw_cols`, a genuine display constraint), but it must not be
+    // re-truncated here, well before that, back down to the old
+    // ~60/80-char summary length.
+    var body_buf: [2048]u8 = undefined;
     const parts = parseApprovalMessage(message, &name_buf, &body_buf);
 
     const draw_cols = if (cols > 1) cols - 1 else cols;
@@ -636,20 +668,20 @@ fn renderApprovalOverlay(message: []const u8, selected: usize, bottom_margin_row
     ) catch "Tool";
     const title_line = title_full[0..@min(title_full.len, draw_cols)];
 
-    var safe_body_buf: [240]u8 = undefined;
+    var safe_body_buf: [600]u8 = undefined;
     const safe_body = sanitizeText(parts.body, safe_body_buf[0..]);
-    var body_full_buf: [260]u8 = undefined;
+    var body_full_buf: [620]u8 = undefined;
     const body_full = std.fmt.bufPrint(&body_full_buf, "  {s}", .{safe_body}) catch safe_body;
     const body_line = body_full[0..@min(body_full.len, draw_cols)];
 
     const question_full = "  Do you want to proceed?";
     const question_line = question_full[0..@min(question_full.len, draw_cols)];
 
-    var dont_ask_label_buf: [80]u8 = undefined;
-    const dont_ask_label = dontAskAgainLabel(&dont_ask_label_buf, parts.tool_name);
+    var dont_ask_label_buf: [200]u8 = undefined;
+    const dont_ask_label = dontAskAgainLabel(&dont_ask_label_buf, parts.tool_name, parts.allow_rule);
 
     var opt1_buf: [64]u8 = undefined;
-    var opt2_buf: [128]u8 = undefined;
+    var opt2_buf: [220]u8 = undefined;
     var opt3_buf: [96]u8 = undefined;
     const opt1_full = buildApprovalOptionLine(&opt1_buf, 0, selected, "Yes");
     const opt2_full = buildApprovalOptionLine(&opt2_buf, 1, selected, dont_ask_label);
@@ -658,7 +690,7 @@ fn renderApprovalOverlay(message: []const u8, selected: usize, bottom_margin_row
     const opt2_line = opt2_full[0..@min(opt2_full.len, draw_cols)];
     const opt3_line = opt3_full[0..@min(opt3_full.len, draw_cols)];
 
-    var seq: [2048]u8 = undefined;
+    var seq: [4096]u8 = undefined;
     const frame = std.fmt.bufPrint(
         &seq,
         "\x1b7" ++
@@ -6658,6 +6690,39 @@ test "parseApprovalMessage extracts the tool name and flattens extra context lin
     try testing.expect(std.mem.indexOf(u8, parts2.body, "matched deny-adjacent rule") != null);
     try testing.expect(std.mem.indexOf(u8, parts2.body, "rm -rf /tmp/scratch") != null);
     try testing.expect(std.mem.indexOf(u8, parts2.body, "Suggested allow-rules") != null);
+    // repl-ux-03: the concrete allow-rule is also lifted out into its own
+    // field so the "don't ask again" option can name it directly.
+    try testing.expectEqualStrings("Bash(rm:*)", parts2.allow_rule);
+}
+
+// repl-ux-03: the approval body must carry the FULL command through
+// end-to-end parsing -- not just up to the old 256-byte body_buf cap.
+test "parseApprovalMessage does not re-truncate a long body back down to ~256 bytes" {
+    const long_command = "a" ** 400;
+    var msg_buf: [512]u8 = undefined;
+    const message = std.fmt.bufPrint(&msg_buf, "Bash [MEDIUM]: {s}", .{long_command}) catch unreachable;
+
+    var name_buf: [64]u8 = undefined;
+    var body_buf: [2048]u8 = undefined;
+    const parts = parseApprovalMessage(message, &name_buf, &body_buf);
+    try testing.expectEqualStrings(long_command, parts.body);
+}
+
+// repl-ux-03: when a concrete allow-rule was derived upstream, the "don't
+// ask again" label names it directly ("for: <rule>") instead of the
+// generic tool-scoped wording.
+test "dontAskAgainLabel prefers a concrete rule over the generic tool-scoped label" {
+    var buf: [200]u8 = undefined;
+    try testing.expectEqualStrings(
+        "Yes, and don't ask again for: Bash(npm run)",
+        dontAskAgainLabel(&buf, "Bash", "Bash(npm run)"),
+    );
+
+    var buf2: [200]u8 = undefined;
+    try testing.expectEqualStrings(
+        "Yes, and don't ask again for Bash this session",
+        dontAskAgainLabel(&buf2, "Bash", ""),
+    );
 }
 
 test "plan review overlay functions exist" {

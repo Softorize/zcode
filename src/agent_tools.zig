@@ -17,6 +17,7 @@ const security_mod = @import("core/security.zig");
 const agents_mod = @import("core/agents.zig");
 const permission_rules_mod = @import("core/permission_rules.zig");
 const bash_segment_permission = @import("core/bash_segment_permission.zig");
+const command_prefix = @import("core/command_prefix.zig");
 const destructive_warning = @import("core/destructive_warning.zig");
 const path_safety_mod = @import("core/path_safety.zig");
 const arg_parse = @import("tools/arg_parse.zig");
@@ -601,26 +602,120 @@ pub fn approvalStateToString(state: types.ApprovalState) []const u8 {
     };
 }
 
-fn buildApprovalDescription(out: []u8, name: []const u8, args: []const u8, risk: types.RiskTier) []const u8 {
-    var summary_buf: [256]u8 = undefined;
-    const summary = summarizeToolCallForProgress(&summary_buf, name, args);
-    const base = std.fmt.bufPrint(out, "{s} [{s}]: {s}", .{ name, types.riskTierToString(risk), summary }) catch return name;
+/// Append `text` as a new "\n{text}" line onto `out[0..pos.*]`, truncating
+/// (rather than dropping) `text` if it does not fully fit. Shared by every
+/// advisory/suggestion line `buildApprovalDescription` appends so a long
+/// note degrades gracefully instead of vanishing outright.
+fn appendApprovalLine(out: []u8, pos: *usize, text: []const u8) void {
+    if (pos.* >= out.len or out.len - pos.* < 2) return; // need "\n" + >=1 byte
+    out[pos.*] = '\n';
+    const room = out.len - pos.* - 1;
+    const take = @min(text.len, room);
+    @memcpy(out[pos.* + 1 ..][0..take], text[0..take]);
+    pos.* += 1 + take;
+}
+
+/// Copy as much of `text` as fits into `out` verbatim (no `bufPrint`
+/// template, so nothing is lost to formatting overhead). Used by
+/// `fullDetailForApproval` so a Bash command/URL/query longer than any
+/// fixed prefix-formatted line still comes through in full up to the
+/// buffer's real capacity, instead of collapsing to a generic fallback
+/// string the instant it does not fit a `bufPrint` call exactly.
+fn copyFullOrClip(out: []u8, text: []const u8) []const u8 {
+    const take = @min(text.len, out.len);
+    @memcpy(out[0..take], text[0..take]);
+    return out[0..take];
+}
+
+/// repl-ux-03: like `summarizeToolCallForProgress`, but for the approval
+/// DIALOG BODY specifically -- the text a human reads before approving a
+/// potentially dangerous action must never be silently clipped to a
+/// spinner-line length (the old 60/80-char `clipText` calls the progress
+/// line legitimately wants). The progress/spinner line stays short
+/// (`summarizeToolCallForProgress` is unchanged and still used there);
+/// this is the "show the whole thing" counterpart, used only when
+/// building the approval message. Tool names with no full-detail case
+/// here fall back to the (unclipped-for-them-anyway) progress summary.
+pub fn fullDetailForApproval(out: []u8, name: []const u8, args: []const u8) []const u8 {
+    const command = tool_registry.getArg(args, "command");
+    const url = tool_registry.getArg(args, "url");
+    const query = tool_registry.getArg(args, "query") orelse tool_registry.getArg(args, "q");
+
+    if (matchesToolName(name, &.{ "shell", "Bash", "bash" })) {
+        if (tool_registry.getArg(args, "description")) |d| {
+            const trimmed = std.mem.trim(u8, d, " \t\r\n\"'");
+            if (trimmed.len > 0) {
+                if (command) |cmd| {
+                    if (std.fmt.bufPrint(out, "{s} -- {s}", .{ trimmed, cmd }) catch null) |line| return line;
+                    return copyFullOrClip(out, cmd);
+                }
+                return copyFullOrClip(out, trimmed);
+            }
+        }
+        if (command) |cmd| return copyFullOrClip(out, cmd);
+        return "shell command";
+    }
+    if (matchesToolName(name, &.{ "WebFetch", "web_fetch", "HttpRequest", "http_request" })) {
+        if (url) |u| {
+            if (std.fmt.bufPrint(out, "fetch {s}", .{u}) catch null) |line| return line;
+            return copyFullOrClip(out, u);
+        }
+        return "http request";
+    }
+    if (matchesToolName(name, &.{ "WebSearch", "web_search" })) {
+        if (query) |q| {
+            if (std.fmt.bufPrint(out, "search {s}", .{q}) catch null) |line| return line;
+            return copyFullOrClip(out, q);
+        }
+        return "web search";
+    }
+    if (matchesToolName(name, &.{ "TaskRun", "task_run" })) {
+        if (command) |cmd| {
+            if (std.fmt.bufPrint(out, "run {s}", .{cmd}) catch null) |line| return line;
+            return copyFullOrClip(out, cmd);
+        }
+    }
+    return summarizeToolCallForProgress(out, name, args);
+}
+
+fn buildApprovalDescription(allocator: std.mem.Allocator, out: []u8, name: []const u8, args: []const u8, risk: types.RiskTier) []const u8 {
+    var summary_buf: [4096]u8 = undefined;
+    const summary = fullDetailForApproval(&summary_buf, name, args);
+
+    // Write "{name} [{risk}]: " (always short) then copy as much of the
+    // full-detail summary as fits, rather than a single `bufPrint` over
+    // the whole line -- a `bufPrint` that overflows fails atomically and
+    // used to fall back to the bare tool name, discarding the command
+    // entirely. This way a command longer than `out` still comes through
+    // up to the buffer's real capacity instead of vanishing outright.
+    const prefix = std.fmt.bufPrint(out, "{s} [{s}]: ", .{ name, types.riskTierToString(risk) }) catch return name;
+    var pos: usize = prefix.len;
+    const room = if (out.len > pos) out.len - pos else 0;
+    const take = @min(summary.len, room);
+    @memcpy(out[pos..][0..take], summary[0..take]);
+    pos += take;
 
     // bash-shell-05: append an advisory note for reversible-but-risky bash
     // commands (git force-push, rm -rf, DROP TABLE, ...). Advisory only -- this
-    // does not change risk tier or auto-approval. Best-effort: if the combined
-    // text would overflow `out`, keep the base description without the note.
+    // does not change risk tier or auto-approval.
     if (matchesToolName(name, &.{ "shell", "Bash", "bash" })) {
         if (tool_registry.getArg(args, "command")) |command| {
             if (destructive_warning.warning(command)) |note| {
-                // `base` aliases the front of `out`; append "\n{note}" after it
-                // in place rather than re-running bufPrint over `out` (which
-                // would alias src and dst and corrupt the result).
-                const needed = base.len + 1 + note.len;
-                if (needed <= out.len) {
-                    out[base.len] = '\n';
-                    @memcpy(out[base.len + 1 .. needed], note);
-                    return out[0..needed];
+                appendApprovalLine(out, &pos, note);
+            }
+
+            // repl-ux-03: derive a concrete "Suggested allow-rules: Bash(<rule>)"
+            // line for a single (non-compound) Bash command, the same static
+            // command_prefix heuristic already used for compound/piped Bash
+            // asks (bash_segment_permission.zig) -- so the overlay's "don't
+            // ask again" option can name an actual command/prefix instead of
+            // only the generic "for Bash this session" (mirrors the
+            // reference's Haiku-suggested prefix row / generateShellSuggestionsLabel).
+            if (command_prefix.extract(allocator, command) catch null) |prefix_text| {
+                defer allocator.free(prefix_text);
+                var rule_buf: [160]u8 = undefined;
+                if (std.fmt.bufPrint(&rule_buf, "Suggested allow-rules: {s}({s})", .{ name, prefix_text }) catch null) |line| {
+                    appendApprovalLine(out, &pos, line);
                 }
             }
         }
@@ -629,23 +724,18 @@ fn buildApprovalDescription(out: []u8, name: []const u8, args: []const u8, risk:
     // Phase 9 Task 3 (tools-03): for a WebFetch against a non-preapproved host,
     // append a suggested `domain:<host>` allow-rule so the user can grant the
     // host once and skip future prompts (mirrors the reference's
-    // webFetchToolInputToPermissionRuleContent suggestion). Best-effort: only
-    // when there is room in `out`. Preapproved hosts never reach the ask path
-    // (policy downgrades them to LOW), so we skip the note for them too.
+    // webFetchToolInputToPermissionRuleContent suggestion). Preapproved hosts
+    // never reach the ask path (policy downgrades them to LOW), so we skip
+    // the note for them too.
     if (matchesToolName(name, &.{ "WebFetch", "web_fetch" })) {
         if (tool_registry.getArg(args, "url")) |url| {
             var note_buf: [128]u8 = undefined;
             if (webFetchSuggestionNote(&note_buf, url)) |note| {
-                const needed = base.len + 1 + note.len;
-                if (needed <= out.len) {
-                    out[base.len] = '\n';
-                    @memcpy(out[base.len + 1 .. needed], note);
-                    return out[0..needed];
-                }
+                appendApprovalLine(out, &pos, note);
             }
         }
     }
-    return base;
+    return out[0..pos];
 }
 
 /// Build the "approve once, or add allow rule `domain:<host>`" advisory note for
@@ -961,8 +1051,8 @@ fn promptForPermissionRule(
     var stdin_prompt_token: u8 = 0;
     const approver = effectiveApproval(ctx, &stdin_prompt_token);
 
-    var desc_buf: [512]u8 = undefined;
-    const tool_description = buildApprovalDescription(&desc_buf, name, args, risk);
+    var desc_buf: [4096]u8 = undefined;
+    const tool_description = buildApprovalDescription(ctx.allocator, &desc_buf, name, args, risk);
     const rule_reason = try formatPermissionRuleReason(ctx.allocator, "permission rule asks before running tool", matched);
     defer ctx.allocator.free(rule_reason);
     const message = try std.fmt.allocPrint(ctx.allocator, "{s}\n{s}", .{ rule_reason, tool_description });
@@ -1295,8 +1385,8 @@ fn buildSegmentedAskMessage(
     errdefer out.deinit();
     const writer = out.writer();
 
-    var desc_buf: [512]u8 = undefined;
-    const tool_description = buildApprovalDescription(&desc_buf, name, args, risk);
+    var desc_buf: [4096]u8 = undefined;
+    const tool_description = buildApprovalDescription(allocator, &desc_buf, name, args, risk);
     try writer.print("{s}\n{s}", .{ reason, tool_description });
     if (suggestions.len > 0) {
         try writer.writeAll("\nSuggested allow-rules:");
@@ -1451,8 +1541,8 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
             // non-interactive run cannot prompt, so the tool is blocked.
             var ask_token: u8 = 0;
             const approver = effectiveApproval(ctx, &ask_token);
-            var desc_buf: [512]u8 = undefined;
-            const tool_description = buildApprovalDescription(&desc_buf, effective_name, args, risk);
+            var desc_buf: [4096]u8 = undefined;
+            const tool_description = buildApprovalDescription(ctx.allocator, &desc_buf, effective_name, args, risk);
             const message = if (pre_hook.permission_reason) |r|
                 try std.fmt.allocPrint(ctx.allocator, "pre-tool-use hook asks before running tool: {s}\n{s}", .{ r, tool_description })
             else
@@ -1559,8 +1649,8 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
     }
 
     // Build descriptive approval message
-    var desc_buf: [512]u8 = undefined;
-    const tool_description = buildApprovalDescription(&desc_buf, effective_name, args, risk);
+    var desc_buf: [4096]u8 = undefined;
+    const tool_description = buildApprovalDescription(ctx.allocator, &desc_buf, effective_name, args, risk);
 
     const approver = effectiveApproval(ctx, &stdin_prompt_token);
     const approval = try approval_mod.evaluate(
@@ -4290,6 +4380,7 @@ test "dangerouslyDisableSandbox ignored for non-bash tools" {
 test "buildApprovalDescription appends destructive advisory note for Bash" {
     var buf: [512]u8 = undefined;
     const desc = buildApprovalDescription(
+        testing.allocator,
         &buf,
         "Bash",
         "command=\"git push --force origin main\"",
@@ -4305,6 +4396,7 @@ test "buildApprovalDescription appends destructive advisory note for Bash" {
 test "buildApprovalDescription omits note for benign Bash command" {
     var buf: [512]u8 = undefined;
     const desc = buildApprovalDescription(
+        testing.allocator,
         &buf,
         "Bash",
         "command=\"ls -la\"",
@@ -4319,6 +4411,7 @@ test "buildApprovalDescription does not add note for non-Bash tools" {
     // A non-Bash tool whose args happen to contain a destructive-looking
     // command must NOT get the advisory (it is bash-only).
     const desc = buildApprovalDescription(
+        testing.allocator,
         &buf,
         "Read",
         "command=\"git push --force\"",
@@ -4330,6 +4423,7 @@ test "buildApprovalDescription does not add note for non-Bash tools" {
 test "buildApprovalDescription appends domain allow-rule suggestion for non-preapproved WebFetch" {
     var buf: [512]u8 = undefined;
     const desc = buildApprovalDescription(
+        testing.allocator,
         &buf,
         "WebFetch",
         "url=\"https://blog.example.com/post\"",
@@ -4339,6 +4433,34 @@ test "buildApprovalDescription appends domain allow-rule suggestion for non-prea
     try testing.expect(parse_helpers.containsIgnoreCase(desc, "WebFetch"));
     // domain allow-rule suggestion appended for the URL's host
     try testing.expect(parse_helpers.containsIgnoreCase(desc, "domain:blog.example.com"));
+}
+
+// repl-ux-03: the approval dialog body must show the FULL command, not a
+// spinner-length summary truncated to ~60-80 chars (the old
+// `summarizeToolCallForProgress`-derived body did exactly that).
+test "buildApprovalDescription shows the full Bash command, not a ~80-char clipped summary" {
+    const long_command = "npm test -- --coverage --reporter=verbose --very-long-flag-that-pushes-this-command-well-past-eighty-characters-total";
+    try testing.expect(long_command.len > 100);
+    var args_buf: [256]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "command=\"{s}\"", .{long_command});
+
+    var buf: [4096]u8 = undefined;
+    const desc = buildApprovalDescription(testing.allocator, &buf, "Bash", args, .MEDIUM);
+
+    // The entire command must appear verbatim -- not clipped at 60 or 80
+    // characters the way the old clipText(cmd, 80) summary was.
+    try testing.expect(std.mem.indexOf(u8, desc, long_command) != null);
+}
+
+// repl-ux-03: a single (non-compound) Bash command with a derivable static
+// prefix gets a concrete "Suggested allow-rules: Bash(<rule>)" line, the
+// same convention already used for compound/piped Bash asks -- so the
+// overlay's "don't ask again" option can name an actual command/prefix
+// instead of only "for Bash this session".
+test "buildApprovalDescription suggests a concrete allow-rule for a single Bash command" {
+    var buf: [4096]u8 = undefined;
+    const desc = buildApprovalDescription(testing.allocator, &buf, "Bash", "command=\"npm run test\"", .MEDIUM);
+    try testing.expect(std.mem.indexOf(u8, desc, "Suggested allow-rules: Bash(npm run)") != null);
 }
 
 test "webFetchSuggestionNote: non-preapproved host yields a domain suggestion" {

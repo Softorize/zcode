@@ -7272,7 +7272,7 @@ fn renderUsageSummary(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u
         .used_tokens = metrics.last_input_tokens,
         .compact_threshold_percent = 60,
         .force_threshold_percent = 80,
-        .auto_compact_enabled = true,
+        .auto_compact_enabled = runtime.cfg.auto_compact_enabled,
         .memory_file_bytes = 0,
         .suppress_near_capacity = suppress_near_capacity,
     };
@@ -8061,11 +8061,17 @@ fn handleConfigCommand(allocator: std.mem.Allocator, runtime: *AgentRuntime, com
     const args_raw = if (command.len > prefix_len) command[prefix_len..] else "";
     const args = std.mem.trim(u8, args_raw, " \t");
 
-    // /config -- show all. repl-ux-07: prefix with the same "zcode
-    // <name>" title row /status now opens with (renderStatusSectionedText)
-    // so the two commands visibly share one panel heading style, mirroring
-    // the reference's single Settings dialog on two different default tabs.
+    // /config -- show all. repl-ux-07: routed through the SAME sectioned,
+    // Title-Case `renderStatusPanel` surface `/status` uses (not just a
+    // shared title prefix), so the two commands genuinely share one panel
+    // implementation, mirroring the reference's single Settings dialog on
+    // two different default tabs. The old snake_case `cfg.renderAll` dump
+    // is kept verbatim behind `/config raw` for scripting/diffing.
     if (args.len == 0) {
+        return @as(?[]u8, try renderConfigSectionedText(allocator, runtime));
+    }
+
+    if (std.mem.eql(u8, args, "raw")) {
         const raw = try runtime.cfg.renderAll(allocator);
         defer allocator.free(raw);
         return @as(?[]u8, try std.fmt.allocPrint(allocator, "\nzcode config\n\n{s}", .{raw}));
@@ -8162,17 +8168,15 @@ fn handlePromptInspectCommand(allocator: std.mem.Allocator, runtime: *AgentRunti
     }));
 }
 
-/// repl-ux-07: render `/status` as a sectioned, Title-Case panel via the
-/// shared `repl_render.renderStatusPanel` surface, instead of the raw
-/// snake_case `key={value}` dump (still available verbatim via
-/// `/status raw` for scripting). Groups mirror the reference's named
-/// Settings property builders (Version, Model, Safety, Provider,
-/// Preprocessor, UI, Session) without claiming to be Claude Code.
-fn renderStatusSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
+/// repl-ux-07: build the named, Title-Case section groups shared by BOTH
+/// `/status` and bare `/config` -- one `repl_render.renderStatusPanel`
+/// surface, two entry points, mirroring the reference's single Settings
+/// dialog opened on two different default tabs. Groups mirror the
+/// reference's named Settings property builders (Version, Model, Safety,
+/// Provider, Preprocessor, UI, Session) without claiming to be Claude
+/// Code. `arena` owns every field/section returned (freed by the caller's
+/// arena teardown, not individually).
+fn buildStatusSections(arena: std.mem.Allocator, runtime: *AgentRuntime) ![]repl_render_mod.StatusSection {
     const boolStr = struct {
         fn f(v: bool) []const u8 {
             return if (v) "true" else "false";
@@ -8187,10 +8191,10 @@ fn renderStatusSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntim
     const metrics = runtime.statusMetrics();
     const pre_settings = runtime.resolvedPreprocessorSettings();
 
-    const version_fields = [_]repl_render_mod.StatusField{
+    const version_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
         .{ .label = "Version", .value = build_options.app_version },
-    };
-    const model_fields = [_]repl_render_mod.StatusField{
+    });
+    const model_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
         .{ .label = "Provider", .value = runtime.active_provider },
         .{ .label = "Model", .value = runtime.active_model },
         .{ .label = "Active Agent", .value = runtime.activeAgentName() orelse "<none>" },
@@ -8198,51 +8202,84 @@ fn renderStatusSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntim
         .{ .label = "Default Model", .value = runtime.cfg.default_model },
         .{ .label = "Fallback Provider", .value = agent_runtime.displayValueOr(runtime.cfg.fallback_provider, "<none>") },
         .{ .label = "Fallback Model", .value = agent_runtime.displayValueOr(runtime.cfg.fallback_model, "<none>") },
-    };
-    const safety_fields = [_]repl_render_mod.StatusField{
+    });
+    const safety_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
         .{ .label = "Approval Mode", .value = runtime.cfg.approval_mode },
         .{ .label = "Sandbox", .value = runtime.cfg.sandbox },
         .{ .label = "Strict", .value = boolStr(runtime.strict) },
         .{ .label = "Yolo Mode", .value = boolStr(runtime.yolo_mode) },
-    };
-    const provider_fields = [_]repl_render_mod.StatusField{
+    });
+    const provider_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
         .{ .label = "Base URL", .value = agent_runtime.displayValueOr(runtime.cfg.provider_base_url, "<env/default>") },
         .{ .label = "API Key Configured", .value = boolStr(runtime.cfg.provider_api_key.len > 0) },
         .{ .label = "Timeout (ms)", .value = numStr(arena, runtime.cfg.provider_timeout_ms) },
         .{ .label = "Retry Count", .value = numStr(arena, runtime.cfg.provider_retry_count) },
-    };
-    const preprocessor_fields = [_]repl_render_mod.StatusField{
+    });
+    const preprocessor_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
         .{ .label = "Enabled", .value = boolStr(runtime.preprocessor_enabled) },
         .{ .label = "Provider", .value = agent_runtime.displayValueOr(pre_settings.provider, "<none>") },
         .{ .label = "Model", .value = agent_runtime.displayValueOr(pre_settings.model, "<none>") },
-    };
-    const ui_fields = [_]repl_render_mod.StatusField{
+    });
+    const ui_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
         .{ .label = "Fullscreen", .value = boolStr(runtime.cfg.ui_fullscreen) },
         .{ .label = "Theme", .value = runtime.cfg.ui_theme },
         .{ .label = "Color", .value = boolStr(runtime.cfg.ui_color_enabled) },
         .{ .label = "Vim Mode", .value = boolStr(runtime.cfg.ui_vim_mode) },
         .{ .label = "Brief Mode", .value = boolStr(runtime.cfg.ui_brief_mode) },
-    };
-    const session_fields = [_]repl_render_mod.StatusField{
+    });
+    const session_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
         .{ .label = "Last Prompt Tokens", .value = numStr(arena, metrics.last_prompt_tokens) },
         .{ .label = "Total Input Tokens", .value = numStr(arena, metrics.total_input_tokens) },
         .{ .label = "Total Output Tokens", .value = numStr(arena, metrics.total_output_tokens) },
-    };
+    });
 
-    const sections = [_]repl_render_mod.StatusSection{
-        .{ .title = "Version", .fields = version_fields[0..] },
-        .{ .title = "Model", .fields = model_fields[0..] },
-        .{ .title = "Safety", .fields = safety_fields[0..] },
-        .{ .title = "Provider", .fields = provider_fields[0..] },
-        .{ .title = "Preprocessor", .fields = preprocessor_fields[0..] },
-        .{ .title = "UI", .fields = ui_fields[0..] },
-        .{ .title = "Session", .fields = session_fields[0..] },
-    };
+    return arena.dupe(repl_render_mod.StatusSection, &[_]repl_render_mod.StatusSection{
+        .{ .title = "Version", .fields = version_fields },
+        .{ .title = "Model", .fields = model_fields },
+        .{ .title = "Safety", .fields = safety_fields },
+        .{ .title = "Provider", .fields = provider_fields },
+        .{ .title = "Preprocessor", .fields = preprocessor_fields },
+        .{ .title = "UI", .fields = ui_fields },
+        .{ .title = "Session", .fields = session_fields },
+    });
+}
+
+/// repl-ux-07: render `/status` as a sectioned, Title-Case panel via the
+/// shared `repl_render.renderStatusPanel` surface, instead of the raw
+/// snake_case `key={value}` dump (still available verbatim via
+/// `/status raw` for scripting).
+fn renderStatusSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const sections = try buildStatusSections(arena, runtime);
 
     var out = std_io.StringBuilder.init(allocator);
     errdefer out.deinit();
-    try repl_render_mod.renderStatusPanel(out.writer(), "zcode status", sections[0..], runtime.cfg.ui_color_enabled);
+    try repl_render_mod.renderStatusPanel(out.writer(), "zcode status", sections, runtime.cfg.ui_color_enabled);
     try out.writer().writeAll("(full machine-readable dump: /status raw)\n");
+    return out.toOwnedSlice();
+}
+
+/// repl-ux-07: bare `/config` renders through the SAME `renderStatusPanel`
+/// surface as `/status` (only the title and footer hint differ) so the two
+/// commands genuinely share one panel implementation -- chrome, section
+/// headers, and Title-Case "Label: value" rows -- instead of `/config`
+/// staying on the old `cfg.renderAll` snake_case-with-comment-header dump.
+/// That raw dump is kept verbatim behind `/config raw` for scripting and
+/// diffing, mirroring `/status raw`.
+fn renderConfigSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const sections = try buildStatusSections(arena, runtime);
+
+    var out = std_io.StringBuilder.init(allocator);
+    errdefer out.deinit();
+    try repl_render_mod.renderStatusPanel(out.writer(), "zcode config", sections, runtime.cfg.ui_color_enabled);
+    try out.writer().writeAll("(edit a value: /config set <key> <value>; full machine-readable dump: /config raw)\n");
     return out.toOwnedSlice();
 }
 
@@ -9381,6 +9418,43 @@ test "bare /config shares the /status panel heading style" {
 
     try testing.expect(std.mem.indexOf(u8, status_out.?, "zcode status") != null);
     try testing.expect(std.mem.indexOf(u8, config_out.?, "zcode config") != null);
+
+    // repl-ux-07: the two commands must share the actual PANEL BODY, not
+    // just a title prefix -- Title-Case "Label: value" rows and named
+    // section headers, not the old `cfg.renderAll` snake_case-with-
+    // comment-header dump (`# GroupName` + `snake_case_key={value}`).
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "Version:") != null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "Provider:") != null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "Model") != null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "version=") == null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "# ") == null);
+
+    // Both panels are rendered by the exact same section-title vocabulary.
+    inline for (.{ "Version", "Model", "Safety", "Provider", "Preprocessor", "UI", "Session" }) |section_title| {
+        try testing.expect(std.mem.indexOf(u8, status_out.?, section_title) != null);
+        try testing.expect(std.mem.indexOf(u8, config_out.?, section_title) != null);
+    }
+}
+
+test "/config raw preserves the original snake_case key=value dump for scripting" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/config raw");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "zcode config") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "=") != null);
+    // The sectioned panel's Title-Case rows must NOT be on this path.
+    try testing.expect(std.mem.indexOf(u8, out.?, "Version:") == null);
 }
 
 test "bare /btw returns the usage string and leaves history untouched" {

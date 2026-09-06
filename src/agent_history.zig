@@ -968,6 +968,23 @@ const ChunkBridge = struct {
     }
 };
 
+/// repl-ux-04: bridges `common.RetryStatusCallback`'s `(?*anyopaque,
+/// []const u8)` shape onto `repl.ProgressReporter.update`'s
+/// `(*anyopaque, []const u8)` shape, same idiom as `ChunkBridge` above.
+/// `callWithAdapterOnce` registers one of these as the process-wide retry
+/// sink for the duration of a single adapter call, so a real 503/timeout
+/// retry inside the provider's own manual retry loop drives THIS turn's
+/// spinner instead of only a synthetic unit test.
+const RetryStatusBridge = struct {
+    reporter_ctx: *anyopaque,
+    update_fn: *const fn (*anyopaque, []const u8) void,
+
+    fn dispatch(ctx: ?*anyopaque, status: []const u8) void {
+        const bridge: *RetryStatusBridge = @ptrCast(@alignCast(ctx orelse return));
+        bridge.update_fn(bridge.reporter_ctx, status);
+    }
+};
+
 var debug_llm_log: ?std.Io.File = null;
 var debug_llm_log_checked: bool = false;
 
@@ -1015,6 +1032,20 @@ fn callWithAdapterOnce(
     adapter: *types.ProviderAdapter,
     request: types.ModelRequest,
 ) !types.ModelResponse {
+    // repl-ux-04: register this turn's reporter as the process-wide
+    // retry-status sink for the duration of the adapter call below (both
+    // branches), so a real 503/timeout retry inside the provider's own
+    // manual retry loop shows the reference's escalating retry line on
+    // THIS turn's spinner. Cleared unconditionally on return so a
+    // background/internal adapter call made afterward (compaction,
+    // preprocessing, hook prompts, tool-use summaries) never inherits it.
+    var retry_bridge: RetryStatusBridge = undefined;
+    if (current_reporter) |r| {
+        retry_bridge = .{ .reporter_ctx = r.ctx, .update_fn = r.update };
+        common.setGlobalRetryStatusCallback(.{ .ctx = &retry_bridge, .on_retry = RetryStatusBridge.dispatch });
+    }
+    defer if (current_reporter != null) common.setGlobalRetryStatusCallback(null);
+
     if (!interactive or !cfg.interactive_streaming) {
         const response = try adapter.send(allocator, request);
         debugLlmLog(allocator, adapter.name, request, &response);

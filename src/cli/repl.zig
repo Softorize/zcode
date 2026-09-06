@@ -159,6 +159,14 @@ pub const Options = struct {
     status_workspace: []const u8 = "",
     status_branch: []const u8 = "",
     status_model_context_window: usize = 0,
+    /// repl-ux-missed-128/130: mirrors `Config.auto_compact_enabled`.
+    /// Consulted by `repl_render.computeContextLowWarning` to pick the
+    /// reference's "auto-compact is off · /config to turn it on" wording
+    /// instead of suggesting `/compact` once context is low, when the
+    /// user has turned auto-compaction off. Defaults true so every
+    /// existing `Options` literal (tests included) keeps the prior
+    /// "/compact" wording unless it opts in.
+    autocompact_enabled: bool = true,
     status_approval_mode: []const u8 = "tiered-auto",
     /// repl-ux-01: the live reference permission mode (default/acceptEdits/
     /// plan/bypassPermissions/dontAsk), refreshed every render tick from the
@@ -9930,6 +9938,59 @@ test "writeWelcomeHeader (default) shows the condensed glyph header and no termi
     try testing.expect(std.mem.indexOf(u8, out, figures.CONDENSED_LOGO_ROWS[1]) != null);
     try testing.expect(std.mem.indexOf(u8, out, "terminal workbench") == null);
     try testing.expect(std.mem.indexOf(u8, out, "Quick reference") == null);
+}
+
+// identity-leak: zcode must never claim to be Claude Code or Anthropic in
+// any USER-VISIBLE surface. Source comments explaining parity intent are
+// fine (and plentiful, deliberately, throughout this file); what must
+// never appear is a rendered string a real session would print. Locks in
+// the every welcome-banner variant (condensed default, legacy inline,
+// and the fullscreen-transcript equivalents) plus the sectioned
+// /status-style panel this package owns, rather than relying solely on a
+// point-in-time grep.
+test "identity-leak: welcome banners never self-identify as Claude Code or Anthropic" {
+    const allocator = testing.allocator;
+
+    const assertClean = struct {
+        fn check(text: []const u8) !void {
+            try testing.expect(std.mem.indexOf(u8, text, "Claude Code") == null);
+            try testing.expect(std.mem.indexOf(u8, text, "Anthropic") == null);
+        }
+    }.check;
+
+    // Non-fullscreen: condensed (2.1.261-parity default) and legacy banner.
+    inline for (.{ false, true }) |legacy| {
+        var buf = std_io.StringBuilder.init(allocator);
+        defer buf.deinit();
+        const options = Options{
+            .app_version = "0.12.50",
+            .status_provider = "anthropic",
+            .status_model = "claude-opus-4-6",
+            .status_workspace = "",
+            .status_approval_mode = "tiered-auto",
+            .color_enabled = false,
+            .legacy_banner = legacy,
+        };
+        try writeWelcomeHeader(allocator, buf.writer(), options);
+        try assertClean(buf.items());
+    }
+
+    // Fullscreen-transcript equivalents (appendWelcomeBanner{,Legacy}).
+    inline for (.{ false, true }) |legacy| {
+        var transcript = UiTranscript.init(allocator, 200);
+        defer transcript.deinit(allocator);
+        const options = Options{
+            .app_version = "0.12.50",
+            .status_provider = "anthropic",
+            .status_model = "claude-opus-4-6",
+            .status_workspace = "",
+            .status_approval_mode = "tiered-auto",
+            .color_enabled = false,
+            .legacy_banner = legacy,
+        };
+        try appendWelcomeBanner(allocator, &transcript, options);
+        for (transcript.lines.items) |line| try assertClean(line);
+    }
 }
 
 test "writeWelcomeHeader (default) shows a one-line /init nudge instead of the legacy Quick-reference card" {

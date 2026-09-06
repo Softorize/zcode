@@ -159,6 +159,17 @@ pub const Config = struct {
     /// not yet threaded into the live compaction-trigger math (a separate,
     /// larger wiring across agent_history.zig/compaction.zig).
     auto_compact_window: u32 = 0,
+    /// repl-ux-missed-128/130: settings.json `autoCompactEnabled` (default
+    /// true) -- whether auto-compaction is allowed to fire at all. Round-
+    /// trippable via `/config`/the settings.json bridge and consulted by
+    /// the proactive "Context low" footer warning (repl_render.zig) to
+    /// pick the reference's "auto-compact is off · /config to turn it on"
+    /// wording instead of suggesting `/compact` when it will not
+    /// self-trigger. Like `auto_compact_window` above, NOT YET threaded
+    /// into the live compaction-trigger math itself (reactive_compaction.zig/
+    /// compaction.zig, outside this package) -- setting it false today
+    /// changes the warning's wording, not whether compaction still fires.
+    auto_compact_enabled: bool = true,
     /// config-layout-17: settings.json `includeCoAuthoredBy` (default true).
     /// Gates the `Co-Authored-By: zcode <noreply@zcode.dev>` trailer
     /// instruction the `/commit` slash command's prompt template tells the
