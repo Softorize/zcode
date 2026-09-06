@@ -32,7 +32,9 @@ import pty
 import select
 import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -47,6 +49,84 @@ def load_meta(scenario_name: str) -> dict:
     if not meta_path.exists():
         raise SystemExit(f"scenario not found: {meta_path}")
     return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+def resolve_seed_cwd(meta: dict) -> str:
+    """Resolve seed.cwd to an absolute path.
+
+    Shared by zcode_runner.py and reference_runner.py (r3-mock-02 follow-up):
+    a path already rooted at "/" is used as-is (matches most existing
+    scenarios, e.g. command-commit-basic's "/tmp"). A scenario that ships its
+    own fixture directory (so the capture is self-contained and reproducible
+    in CI, not just on the machine that first recorded it) instead names it
+    relative to the repo root, e.g. "scenarios/ux-spinner-basic/fixture" --
+    resolve that against the repo root (SCENARIOS_ROOT's parent).
+    """
+    cwd = meta.get("seed", {}).get("cwd", "")
+    if not cwd:
+        return os.getcwd()
+    if os.path.isabs(cwd):
+        return cwd
+    return str((SCENARIOS_ROOT.parent / cwd).resolve())
+
+
+def prepare_git_fixture(cwd: str) -> str:
+    """Materialize a throwaway git repo seeded from a fixture directory.
+
+    Some scenarios (e.g. ux-spinner-basic) exercise a tool that only runs
+    inside a git repository -- zcode's dispatch gate refuses GitStatus/
+    GitDiff/GitLog/GitCommit outside one (src/agent_tools.zig's
+    `executeToolCall`: "Refuse git tools in a non-git workspace at
+    dispatch"), and the real `claude` binary applies the same real-world
+    constraint. Rather than committing a nested `.git/` into the checked-in
+    fixture (git would track that as an embedded-repo gitlink, not plain
+    files), copy the fixture into a fresh temp directory and `git init` +
+    one commit there, per run.
+
+    A scenario opts in with `"seed": {"git_repo": true, ...}` in meta.json.
+
+    Returns the temp directory path. Not a context manager: callers already
+    manage their own tempdir-scoped HOME with `with tempfile.
+    TemporaryDirectory()`, and this needs to outlive that block in
+    run_pty_scenario's flow (the fixture and the scratch HOME are cleaned up
+    together) -- so the caller is responsible for `shutil.rmtree` when done.
+    """
+    workdir = tempfile.mkdtemp(prefix="zcode-pty-fixture-")
+    dest = os.path.join(workdir, "repo")
+    shutil.copytree(cwd, dest)
+    git_env = os.environ.copy()
+    git_env.update({
+        "GIT_AUTHOR_NAME": "zcode-capture",
+        "GIT_AUTHOR_EMAIL": "zcode-capture@example.invalid",
+        "GIT_COMMITTER_NAME": "zcode-capture",
+        "GIT_COMMITTER_EMAIL": "zcode-capture@example.invalid",
+    })
+    for git_cmd in (
+        ["git", "init", "-q"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-q", "-m", "seed fixture for capture"],
+    ):
+        subprocess.run(git_cmd, cwd=dest, env=git_env, check=True,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return dest
+
+
+def build_interactive_command(mode: str, bin_path: str, meta: dict) -> list[str]:
+    """Build the argv for a genuinely interactive (fullscreen REPL) session.
+
+    Distinct from build_command below, which builds the headless `-p`
+    invocation used by spawn_pty/write_frames (the single-shot path this
+    module started with). run_interactive needs the CLI to actually start
+    its REPL and idle at a prompt, so neither side may pass `-p`/`--print`.
+    """
+    if mode == "reference":
+        return [bin_path]
+    elif mode == "zcode":
+        seed = meta.get("seed", {})
+        return [bin_path, "--provider", seed.get("provider", "mock"),
+                "--model", seed.get("model", "mock-agent")]
+    else:
+        raise SystemExit(f"unknown mode: {mode}")
 
 
 def build_command(mode: str, bin_path: str, meta: dict) -> list[str]:

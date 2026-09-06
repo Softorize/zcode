@@ -147,3 +147,15 @@ for machine-readable wire-level I/O, which maps directly to
 - The reference is a moving target (the installed binary auto-updates).
   Fixtures must record the reference version in `meta.json` so drift is
   detectable. Re-capture is a recurring cost, not a one-time event.
+- (r3-mock-02) A UX-class scenario is driven interactively over a real PTY
+  by `zcode_runner.py <name> --pty` and `reference_runner.py <name> --pty`
+  (both built on `pty_capture.run_interactive`), instead of the headless
+  `-p` path above. A scenario whose tool call only dispatches inside a git
+  repository (e.g. `git_status`) opts in with `"seed": {"git_repo": true}`:
+  both runners then stage the scenario's checked-in fixture directory into
+  a fresh temp git repo per run (`pty_capture.prepare_git_fixture`) rather
+  than committing a nested `.git/` into the fixture itself. `compare.py`'s
+  `frame_diff.kind` distinguishes `not_captured` (neither side), `zcode_
+  only_capture` / `reference_only_capture` (one side -- the normal state
+  today, since `reference/` is gitignored per-machine output, not source),
+  and `diffed` (both sides, genuinely compared).

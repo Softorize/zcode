@@ -1,9 +1,10 @@
 {
   "scenario_name": "ux-spinner-basic",
   "scenario_class": "UX",
-  "description": "A single-turn prompt against the mock provider that triggers a tool call (git_status), so the run passes through the full spinner lifecycle: capturing the request, gathering context, calling the model, an interactive tool-approval prompt, running the tool, and the post-turn memory-extraction spinner phases, before returning to an idle prompt and exiting via /exit. Covers: spinner render frames (glyph + verb + elapsed time), spinner stop on completion, and (as of r3-mock-01) submitting a slash command from the fullscreen composer.",
+  "description": "A single-turn prompt against the mock provider whose first response proposes a real tool call (git_status against the seeded fixture repo -- see seed.git_repo), so the run passes through the full spinner lifecycle: capturing the request, gathering context, calling the model, running the tool, a second model call with the tool result, and the post-turn memory-extraction spinner phases, before returning to an idle prompt and exiting via /exit. git_status is a read-only tool (src/agent_tools.zig's read_only_tool_names) so it auto-approves and never raises an interactive permission prompt -- that flow is ux-permission-prompt's job (docs/capture/scenario_corpus.md #9), not this one. Covers: spinner render frames (glyph + verb + elapsed time) across a real tool round-trip, spinner stop on completion, and (as of r3-mock-01) submitting a slash command from the fullscreen composer.",
   "seed": {
     "cwd": "scenarios/ux-spinner-basic/fixture",
+    "git_repo": true,
     "env_denylist": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
     "env_fixed": { "TZ": "UTC", "LC_ALL": "C" },
     "terminal_size": { "cols": 110, "rows": 36 },
@@ -13,9 +14,7 @@
   "inputs": [
     { "type": "command", "value": "hello" },
     { "type": "keystroke", "value": "Enter" },
-    { "type": "wait_ms", "value": 1200 },
-    { "type": "keystroke", "value": "Enter" },
-    { "type": "wait_ms", "value": 9000 },
+    { "type": "wait_ms", "value": 3000 },
     { "type": "command", "value": "/exit" },
     { "type": "keystroke", "value": "Enter" }
   ],

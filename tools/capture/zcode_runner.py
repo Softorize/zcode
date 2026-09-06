@@ -228,9 +228,20 @@ def run_pty_scenario(bin_path: str, meta: dict, out_dir: Path) -> int:
     path above but named to match this gap's acceptance test verbatim).
     """
     seed = meta.get("seed", {})
-    cwd = resolve_seed_cwd(meta)
-    if not os.path.isdir(cwd):
-        raise SystemExit(f"scenario cwd does not exist: {cwd}")
+    fixture_cwd = resolve_seed_cwd(meta)
+    if not os.path.isdir(fixture_cwd):
+        raise SystemExit(f"scenario cwd does not exist: {fixture_cwd}")
+    cwd = fixture_cwd
+
+    # r3-mock-02 follow-up: a scenario whose tool call only dispatches
+    # inside a git repo (e.g. ux-spinner-basic's git_status) opts in with
+    # `seed.git_repo: true` -- stage the checked-in fixture into a fresh
+    # temp git repo per run instead of committing a nested .git/ into the
+    # fixture itself (see pty_capture.prepare_git_fixture's doc comment).
+    fixture_workdir: str | None = None
+    if seed.get("git_repo"):
+        cwd = pty_capture.prepare_git_fixture(cwd)
+        fixture_workdir = cwd
 
     cols = seed.get("terminal_size", {}).get("cols", 110)
     rows = seed.get("terminal_size", {}).get("rows", 36)
@@ -241,21 +252,26 @@ def run_pty_scenario(bin_path: str, meta: dict, out_dir: Path) -> int:
     env["COLUMNS"] = str(cols)
     env["LINES"] = str(rows)
 
-    cmd = [bin_path, "--provider", seed.get("provider", "mock"), "--model", seed.get("model", "mock-agent")]
+    cmd = pty_capture.build_interactive_command("zcode", bin_path, meta)
     timeout_s = meta.get("timeout_ms", 30000) / 1000.0
 
     print(f"[zcode_runner] scenario={meta.get('scenario_name')} bin={bin_path} mode=pty")
     print(f"[zcode_runner] cwd={cwd} size={cols}x{rows}")
 
-    # A per-run scratch HOME (outside scenarios/, never committed) so the
-    # trust state / config the interactive session writes never touches the
-    # developer's real ~/.zcode and never lands in the captured fixture.
-    with tempfile.TemporaryDirectory(prefix="zcode-pty-home-") as home:
-        env["HOME"] = home
-        _pty_trust_cwd(bin_path, cwd, env)
-        frames = pty_capture.run_interactive(
-            cmd, cwd, env, meta.get("inputs", []), timeout_s, cols=cols, rows=rows
-        )
+    try:
+        # A per-run scratch HOME (outside scenarios/, never committed) so the
+        # trust state / config the interactive session writes never touches
+        # the developer's real ~/.zcode and never lands in the captured
+        # fixture.
+        with tempfile.TemporaryDirectory(prefix="zcode-pty-home-") as home:
+            env["HOME"] = home
+            _pty_trust_cwd(bin_path, cwd, env)
+            frames = pty_capture.run_interactive(
+                cmd, cwd, env, meta.get("inputs", []), timeout_s, cols=cols, rows=rows
+            )
+    finally:
+        if fixture_workdir:
+            shutil.rmtree(fixture_workdir, ignore_errors=True)
 
     frame_count = pty_capture.write_frames_multi(out_dir, frames)
     total_bytes = sum(len(c) for _, c in frames)
@@ -267,7 +283,8 @@ def run_pty_scenario(bin_path: str, meta: dict, out_dir: Path) -> int:
         "zcode_binary": bin_path,
         "zcode_version": version,
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "cwd": cwd,
+        "cwd": fixture_cwd,
+        "git_repo_staged": fixture_workdir is not None,
         "terminal_size": {"cols": cols, "rows": rows},
         "inputs_sent": len(meta.get("inputs", [])),
         "frame_count": frame_count,
