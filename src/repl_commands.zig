@@ -2996,7 +2996,13 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
     // skill -- no `/command`/`/skill` wrapper needed. Built-ins win because they
     // are matched first by construction; this block only sees names no built-in
     // claimed, so a user file named `help.md` can never shadow `/help`.
-    if (command.len > 1 and command[0] == '/') {
+    // cli-flags-15: --disable-slash-commands ("Disable all skills" per
+    // Claude's own help text, applied here to the broader literal
+    // flag-name reading too) -- skip custom-command AND skill resolution
+    // entirely, so an unrecognized `/name` falls through to the normal
+    // unknown-command path. Built-in commands (matched above by
+    // construction) are unaffected.
+    if (command.len > 1 and command[0] == '/' and !runtime.cfg.disable_slash_commands) {
         const outcome = try resolveCustomOrSkill(allocator, runtime.cwd, command, runtime.session_id);
         switch (outcome) {
             .none => {}, // fall through to the unknown-command path below
@@ -10384,6 +10390,54 @@ test "commands-23: /reload-skills picks up a skill added to disk mid-session" {
 
     // The new skill's count is reflected without any restart.
     try testing.expect(!std.mem.eql(u8, before.?, after.?));
+}
+
+test "cli-flags-15: --disable-slash-commands blocks skill resolution but not built-ins" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    // A NON-user-invocable skill: `resolveCustomOrSkill` returns `.message`
+    // directly for these (no model dispatch), so this test can observe
+    // resolution vs. non-resolution synchronously without a working provider.
+    const skill_dir = try std.fs.path.join(allocator, &.{ h.cwd, ".zcode", "skills", "secret" });
+    defer allocator.free(skill_dir);
+    try std.Io.Dir.cwd().createDirPath(rt.io, skill_dir);
+    const skill_file = try std.fs.path.join(allocator, &.{ skill_dir, "SKILL.md" });
+    defer allocator.free(skill_file);
+    try std.Io.Dir.cwd().writeFile(rt.io, .{
+        .sub_path = skill_file,
+        .data = "---\ndescription: a model-only skill\nuser-invocable: false\n---\nDo the secret thing.",
+    });
+
+    // Baseline: the skill resolves (its "not user-invocable" message proves
+    // `resolveCustomOrSkill` was actually consulted).
+    const before = try replCommandCallback(runtime, allocator, "/secret");
+    defer if (before) |b| allocator.free(b);
+    try testing.expect(before != null);
+    try testing.expect(std.mem.indexOf(u8, before.?, "not user-invocable") != null);
+
+    h.cfg.disable_slash_commands = true;
+
+    // Under --disable-slash-commands, resolution is skipped entirely --
+    // `replCommandCallback` falls through to its `return null` (the
+    // caller's own unknown-command UX takes over from there), not the
+    // skill's "not user-invocable" message.
+    const after = try replCommandCallback(runtime, allocator, "/secret");
+    defer if (after) |a| allocator.free(a);
+    try testing.expect(after == null);
+
+    // A genuine built-in command (matched well before the custom/skill
+    // fallthrough this test is exercising) is unaffected.
+    const reload_out = try replCommandCallback(runtime, allocator, "/reload-skills");
+    defer if (reload_out) |ro| allocator.free(ro);
+    try testing.expect(reload_out != null);
+    try testing.expect(std.mem.indexOf(u8, reload_out.?, "skills reloaded:") != null);
 }
 
 test "commands-24: /skill-doctor lists a never-invoked skill as unused and omits an invoked one" {

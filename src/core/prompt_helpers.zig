@@ -220,7 +220,11 @@ pub fn renderDynamicSystemPolicy(
     // the long-tail tools (MCP family, Task family, etc.).
     {
         const tool_schemas = @import("../tools/tool_schemas.zig");
-        const deferred_names = tool_schemas.renderDeferredToolNamesList(allocator) catch try allocator.dupe(u8, "");
+        // cli-flags-missed-113/117: --brief gates SendUserMessage -- hide its
+        // name from the deferred-tools advisory too (not just the direct
+        // schema list) unless the flag was passed, so a model cannot even
+        // ToolSearch its way to a tool it was never granted.
+        const deferred_names = tool_schemas.renderDeferredToolNamesListFor(allocator, false, !cfg.brief) catch try allocator.dupe(u8, "");
         defer allocator.free(deferred_names);
         if (deferred_names.len > 0) {
             try out.writer().print(

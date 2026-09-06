@@ -124,6 +124,12 @@ pub fn build(
     errdefer arena.deinit();
     const a = arena.allocator();
 
+    // cli-flags-12: --safe-mode disables custom output styles for this run
+    // -- render as though the default style were active, regardless of
+    // what the caller (REPL /output-style, config, or a saved session)
+    // resolved `output_style_name` to.
+    const effective_output_style_name: []const u8 = if (cfg.safe_mode) "default" else output_style_name;
+
     const budget = types.BudgetPlan.init(
         cfg.model_context_window,
         cfg.reserved_output_tokens,
@@ -170,22 +176,30 @@ pub fn build(
     // prompt view only; the stored transcript keeps full results. Best-effort.
     const effective_history = compaction.microcompact(a, tb_history, compaction.MICROCOMPACT_KEEP_LAST) catch tb_history;
 
-    const instruction_stack = try instructions.discover(
-        a,
-        cwd,
-        .{
-            .per_file_cap = cfg.instruction_file_cap_bytes,
-            .total_cap = cfg.instruction_total_cap_bytes,
-            .imports_enabled = cfg.instruction_imports_enabled,
-            .import_max_depth = cfg.instruction_import_max_depth,
-            .cache = instruction_cache,
-            .axis_epoch = instruction_axis_epoch,
-        },
-    );
+    // cli-flags-12: --safe-mode disables CLAUDE.md/AGENTS.md/GEMINI.md/
+    // ZCODE.md (and their .local variants) entirely for this run -- skip
+    // discovery altogether rather than discover-then-filter, so a broken or
+    // malicious instruction file can't even be stat'd/read while
+    // troubleshooting under --safe-mode.
+    const instruction_stack = if (cfg.safe_mode)
+        try a.alloc(types.InstructionEntry, 0)
+    else
+        try instructions.discover(
+            a,
+            cwd,
+            .{
+                .per_file_cap = cfg.instruction_file_cap_bytes,
+                .total_cap = cfg.instruction_total_cap_bytes,
+                .imports_enabled = cfg.instruction_imports_enabled,
+                .import_max_depth = cfg.instruction_import_max_depth,
+                .cache = instruction_cache,
+                .axis_epoch = instruction_axis_epoch,
+            },
+        );
 
     const tool_schemas_owned = try prompt_helpers.cloneToolSchemas(a, tool_schemas);
-    const system_policy = try prompt_helpers.renderSystemPolicy(a, cfg, policy, cwd, user_turn, output_style_name, session_system_prompt, preferred_language, prompt_mode);
-    const dynamic_policy = try prompt_helpers.renderDynamicSystemPolicy(a, cfg, policy, cwd, user_turn, output_style_name, session_system_prompt, preferred_language, prompt_mode, is_headless);
+    const system_policy = try prompt_helpers.renderSystemPolicy(a, cfg, policy, cwd, user_turn, effective_output_style_name, session_system_prompt, preferred_language, prompt_mode);
+    const dynamic_policy = try prompt_helpers.renderDynamicSystemPolicy(a, cfg, policy, cwd, user_turn, effective_output_style_name, session_system_prompt, preferred_language, prompt_mode, is_headless);
     const context_candidates = try context.gather(a, cwd, user_turn, snapshot, git_capture_cache);
     const context_blocks = try selectBudgetedContextBlocks(
         a,
@@ -228,29 +242,58 @@ pub fn build(
     // don't scan the real ~/.zcode/skills tree; a discovery error degrades to
     // no listing rather than failing the whole prompt build.
     const skill_listing_budget = getCharBudget(cfg.model_context_window, readCharBudgetEnvOverride());
-    const skills_listing = if (@import("builtin").is_test)
+    // cli-flags-12: --safe-mode disables skills (built-in, project, and
+    // plugin-contributed) too -- suppress the listing the same way the test
+    // guard does, so a skill's frontmatter/instructions never reach the
+    // model while troubleshooting under --safe-mode.
+    // cli-flags-15: --disable-slash-commands -- Claude's own help text
+    // describes this flag as "Disable all skills" (despite its
+    // slash-command-shaped name), so it shares the exact same suppression.
+    const skills_listing = if (@import("builtin").is_test or cfg.safe_mode or cfg.disable_slash_commands)
         try a.dupe(u8, "")
     else
         skills_mod.renderModelListing(a, cwd, snapshot.file_focus, snapshot.activated_conditional_skills, skill_listing_budget) catch try a.dupe(u8, "");
 
+    // regression fix: build the inner envelope (every field of which may
+    // call `a.dupe`, and `a.dupe` may grow the arena to a new backing block)
+    // as its OWN statement, completed before `arena` is copied by value into
+    // the returned `PromptEnvelopeOwned` below. Struct-literal fields
+    // evaluate in source order, so writing `.arena = arena` ahead of a
+    // nested `.envelope = .{ ... try a.dupe(...) ... }` (as this used to)
+    // snapshots the arena's buffer-list BEFORE those later dupes run --  any
+    // block a later dupe allocates is invisible to that snapshot and never
+    // freed by `PromptEnvelopeOwned.deinit`'s `arena.deinit()`, since it
+    // deinits the (stale) copy, not the one the later dupes actually grew.
+    // This was dormant while every dupe fit in the arena's first block;
+    // adding `system_prompt_override` (cli-flags-10) was enough combined
+    // allocation pressure to grow a second block on some inputs, at which
+    // point that block leaked every time. Splitting the two statements
+    // removes the ordering hazard regardless of how many fields are added
+    // later.
+    const envelope_out = types.PromptEnvelope{
+        .system_policy = system_policy,
+        .dynamic_policy = dynamic_policy,
+        .instruction_stack = instruction_stack,
+        .user_turn = try a.dupe(u8, user_turn),
+        .working_context = try a.dupe(u8, working_context),
+        .tool_schemas = tool_schemas_owned,
+        .history = effective_history,
+        .context_blocks = context_blocks,
+        .budget_plan = budget,
+        .cache_hints = cache_hints,
+        .preprocessor_intent = preprocessor_intent,
+        .focus_directive = focus,
+        .skills_listing = skills_listing,
+        // cli-flags-10: dupe into the arena so the envelope's lifetime
+        // rules stay uniform (every string field is arena-owned) even
+        // though `cfg` outlives it anyway.
+        .system_prompt_override = try a.dupe(u8, cfg.system_prompt_override),
+    };
+
     return .{
         .envelope = .{
             .arena = arena,
-            .envelope = .{
-                .system_policy = system_policy,
-                .dynamic_policy = dynamic_policy,
-                .instruction_stack = instruction_stack,
-                .user_turn = try a.dupe(u8, user_turn),
-                .working_context = try a.dupe(u8, working_context),
-                .tool_schemas = tool_schemas_owned,
-                .history = effective_history,
-                .context_blocks = context_blocks,
-                .budget_plan = budget,
-                .cache_hints = cache_hints,
-                .preprocessor_intent = preprocessor_intent,
-                .focus_directive = focus,
-                .skills_listing = skills_listing,
-            },
+            .envelope = envelope_out,
         },
         .compaction_applied = compact_result.did_compact,
         .compaction_hash = compact_result.summary_hash,
@@ -367,6 +410,16 @@ pub fn renderPromptPacket(allocator: std.mem.Allocator, env: *const types.Prompt
 }
 
 fn renderSystemPromptPacket(allocator: std.mem.Allocator, env: *const types.PromptEnvelope) ![]u8 {
+    // cli-flags-10: `--system-prompt`/`--system-prompt-file` replace the
+    // ENTIRE system prompt -- none of zcode's default sections (runtime
+    // policy, security advisory, epistemic honesty, tone/style, tool
+    // schemas, skills listing, etc) are included, matching Claude Code's own
+    // documented behavior for this flag (distinct from
+    // `--append-system-prompt`, which layers on top and is unaffected here).
+    if (env.system_prompt_override.len > 0) {
+        return allocator.dupe(u8, env.system_prompt_override);
+    }
+
     var buf = std_io.StringBuilder.init(allocator);
     defer buf.deinit();
 
@@ -1050,6 +1103,85 @@ test "renderPromptPacket builds system and user packets" {
     try testing.expect(std.mem.indexOf(u8, rendered.system, "Never claim a background service") != null);
 }
 
+test "cli-flags-10: system_prompt_override replaces the entire rendered system prompt" {
+    const allocator = testing.allocator;
+    const env = types.PromptEnvelope{
+        .system_policy = "base-policy",
+        .dynamic_policy = "# Environment\ncwd=/tmp/zcode-test\n",
+        .instruction_stack = &.{},
+        .user_turn = "inspect src/main.zig",
+        .tool_schemas = &.{},
+        .history = &.{},
+        .context_blocks = &.{},
+        .budget_plan = types.BudgetPlan.init(100, 10, 10),
+        .cache_hints = &.{},
+        .system_prompt_override = "You are a terse bot.",
+    };
+
+    var rendered = try renderPromptPacket(allocator, &env);
+    defer rendered.deinit(allocator);
+
+    try testing.expectEqualStrings("You are a terse bot.", rendered.system);
+    // None of the default sections leak through when the override is set.
+    try testing.expect(std.mem.indexOf(u8, rendered.system, "zcode-runtime-policy") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered.system, "zcode-epistemic-honesty") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered.system, "base-policy") == null);
+}
+
+test "cli-flags-10: build() threads cfg.system_prompt_override into the envelope" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(rt.io, "repo");
+    const cwd = try allocator.dupe(u8, "repo");
+    defer allocator.free(cwd);
+
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+    allocator.free(cfg.system_prompt_override);
+    cfg.system_prompt_override = try allocator.dupe(u8, "You are a terse bot.");
+
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const snapshot = types.SessionSnapshot{
+        .facts = &.{},
+        .decisions = &.{},
+        .open_tasks = &.{},
+        .file_focus = &.{},
+        .recent_tool_outcomes = &.{},
+        .handoff_summary = "",
+    };
+
+    var built = try build(
+        allocator,
+        &cfg,
+        &policy,
+        "hi",
+        &.{},
+        &.{},
+        cwd,
+        &snapshot,
+        null,
+        cfg.output_style,
+        "",
+        "",
+        null,
+        0,
+        null,
+        "",
+        .execution,
+        true,
+    );
+    defer built.envelope.deinit();
+
+    try testing.expectEqualStrings("You are a terse bot.", built.envelope.envelope.system_prompt_override);
+
+    var rendered = try renderPromptPacket(allocator, &built.envelope.envelope);
+    defer rendered.deinit(allocator);
+    try testing.expectEqualStrings("You are a terse bot.", rendered.system);
+}
+
 test "renderPromptPacket surfaces MCP server instructions when attached" {
     const allocator = testing.allocator;
     var schemas = [_]types.ToolSchema{
@@ -1238,6 +1370,77 @@ test "prompt fixture preserves instruction precedence" {
     const zig_idx = std.mem.indexOf(u8, rendered, "ZCODE.md") orelse return error.MissingZcodeInstruction;
     const agents_idx = std.mem.indexOf(u8, rendered, "AGENTS.md") orelse return error.MissingAgentsInstruction;
     try testing.expect(zig_idx < agents_idx);
+}
+
+test "cli-flags-12: --safe-mode drops CLAUDE.md/instruction-file content from the rendered prompt" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(rt.io, "repo");
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "repo/CLAUDE.md", .data = "ZCODE_UNIQUE_MARKER_XYZ123 do not forget this" });
+
+    const cwd = try @import("test_helpers.zig").tmpDirPath(allocator, &tmp, "repo");
+    defer allocator.free(cwd);
+
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+    cfg.model_context_window = 1024;
+    cfg.reserved_output_tokens = 128;
+    cfg.reserved_reasoning_tokens = 64;
+    cfg.instruction_file_cap_bytes = 1024;
+    cfg.instruction_total_cap_bytes = 2048;
+    cfg.max_history_turns = 8;
+    cfg.safe_mode = true;
+
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const snapshot = types.SessionSnapshot{
+        .facts = &.{},
+        .decisions = &.{},
+        .open_tasks = &.{},
+        .file_focus = &.{},
+        .recent_tool_outcomes = &.{},
+        .handoff_summary = "",
+    };
+
+    var built = try build(
+        allocator,
+        &cfg,
+        &policy,
+        "hi",
+        &.{},
+        &.{},
+        cwd,
+        &snapshot,
+        null,
+        "investigative", // a non-default style, to prove it gets overridden too
+        "",
+        "",
+        null,
+        0,
+        null,
+        "",
+        .execution,
+        false,
+    );
+    defer built.envelope.deinit();
+
+    // The instruction file was discovered on disk, but --safe-mode drops it
+    // before it ever reaches the envelope. (`[INSTRUCTIONS]` itself is
+    // unconditionally *mentioned* by name in the always-present prompt
+    // guide -- see the `project_rules=[INSTRUCTIONS] are ordered...` line
+    // above -- so the real assertion is that the actual CLAUDE.md CONTENT
+    // never appears, not that the literal string "[INSTRUCTIONS]" is gone.)
+    try testing.expectEqual(@as(usize, 0), built.envelope.envelope.instruction_stack.len);
+    try testing.expectEqualStrings("", built.envelope.envelope.skills_listing);
+
+    const rendered = try renderPromptText(allocator, &built.envelope.envelope);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "ZCODE_UNIQUE_MARKER_XYZ123") == null);
+    // The custom "investigative" output style did not leak through either.
+    try testing.expect(std.mem.indexOf(u8, rendered, "output_style=investigative") == null);
 }
 
 test "prompt build includes configured output style and orchestration reminder" {

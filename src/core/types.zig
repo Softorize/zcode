@@ -292,6 +292,15 @@ pub const PromptEnvelope = struct {
     /// native tool-calling, so telling the model to emit JSON is redundant and
     /// off-spec vs Claude Code (PRD #533). Set for native-capable providers.
     suppress_response_contract: bool = false,
+    /// cli-flags-10: `--system-prompt`/`--system-prompt-file`'s full-replacement
+    /// text (empty = flag absent). When non-empty,
+    /// `prompt_engine.renderSystemPromptPacket` returns this verbatim instead
+    /// of assembling `system_policy`/`dynamic_policy`/the tool schemas/skills
+    /// listing/etc -- mirroring Claude Code's own `--system-prompt`, which
+    /// replaces the whole default system prompt rather than layering on top
+    /// of it (contrast `--append-system-prompt`, which does layer on top and
+    /// is unaffected by this field).
+    system_prompt_override: []const u8 = "",
 };
 
 pub const PromptEnvelopeOwned = struct {

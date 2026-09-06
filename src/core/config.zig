@@ -340,6 +340,12 @@ pub const Config = struct {
     /// expose at all (Claude's own wording: "" disables every tool, absent
     /// (this field empty) or the literal "default" means unrestricted).
     tools_allowlist: []u8,
+    /// cli-flags-04: true once `--tools` was actually passed on the command
+    /// line, even with an empty value. `tools_allowlist.len == 0` alone is
+    /// ambiguous between "flag absent" (unrestricted) and `--tools ""`
+    /// (disable every tool) -- this flag disambiguates the two per Claude's
+    /// own documented wording for `--tools`.
+    tools_flag_set: bool,
     /// `--add-dir <dir>` (repeatable): comma-separated extra directories the
     /// "permissions" package grants sandbox/tool access to for THIS
     /// invocation only, distinct from the persisted, global
@@ -401,11 +407,21 @@ pub const Config = struct {
     /// auto-memory instead). `src/cli/args.zig` also sets the
     /// `ZCODE_SAFE_MODE`/`CLAUDE_CODE_SAFE_MODE` env-equivalent (mirroring
     /// the `--bare`/`ZCODE_SIMPLE` pattern) for child-process visibility;
-    /// this field is the in-process carrier. No zcode subsystem reads
-    /// either signal yet -- consulting them (per-surface: CLAUDE.md load,
-    /// skills, plugins, hooks, MCP, commands/agents, output styles,
-    /// keybindings) is a follow-on for whichever package owns each one.
+    /// this field is the in-process carrier. Consulted by
+    /// `core/prompt_engine.zig`'s `build()` (drops CLAUDE.md/AGENTS.md/etc
+    /// instruction-file content and the skills listing, and forces the
+    /// default output style) and by `main.zig` (skips enabling MCP scoped
+    /// config). Plugins, hooks, custom commands/agents, and keybindings are
+    /// not yet gated -- a follow-on for whichever package owns each one.
     safe_mode: bool,
+    /// `--brief`: enables the `SendUserMessage` tool (agent-to-user
+    /// proactive messaging), which is otherwise hidden from the advertised
+    /// tool set -- default OFF, matching Claude's own "Enable SendUserMessage
+    /// tool for agent-to-user communication" wording. Does not affect the
+    /// unrelated, pre-existing `AttachContext` file-attachment tool (that
+    /// tool used to be named `Brief`; a naming collision this flag's own
+    /// help text could be mistaken for, hence the callout).
+    brief: bool,
 
     /// Settings-sourced environment variables from a `[env]` table in any
     /// config layer (settings-02). Applied to spawned tools (shell, grep)
@@ -543,6 +559,7 @@ pub const Config = struct {
             .allowed_tools = try allocator.dupe(u8, ""),
             .disallowed_tools = try allocator.dupe(u8, ""),
             .tools_allowlist = try allocator.dupe(u8, ""),
+            .tools_flag_set = false,
             .additional_directories = try allocator.dupe(u8, ""),
             .session_id = try allocator.dupe(u8, ""),
             .no_session_persistence = false,
@@ -553,6 +570,7 @@ pub const Config = struct {
             .disable_slash_commands = false,
             .system_prompt_override = try allocator.dupe(u8, ""),
             .safe_mode = false,
+            .brief = false,
             .settings_env = std.array_list.Managed(EnvPair).init(allocator),
         };
     }
@@ -1171,6 +1189,7 @@ test "init sets empty defaults for the new CLI-flag-carrier fields" {
     try testing.expectEqualStrings("", cfg.allowed_tools);
     try testing.expectEqualStrings("", cfg.disallowed_tools);
     try testing.expectEqualStrings("", cfg.tools_allowlist);
+    try testing.expect(!cfg.tools_flag_set);
     try testing.expectEqualStrings("", cfg.additional_directories);
     try testing.expectEqualStrings("", cfg.session_id);
     try testing.expectEqualStrings("", cfg.permission_prompts);
@@ -1181,6 +1200,7 @@ test "init sets empty defaults for the new CLI-flag-carrier fields" {
     try testing.expect(!cfg.disable_slash_commands);
     try testing.expectEqualStrings("", cfg.system_prompt_override);
     try testing.expect(!cfg.safe_mode);
+    try testing.expect(!cfg.brief);
 
     // Every field is independently freeable without touching the others.
     try cfg.validate();

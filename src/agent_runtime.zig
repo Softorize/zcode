@@ -2039,6 +2039,16 @@ pub const AgentRuntime = struct {
                             tool_schemas = filtered;
                         }
                     }
+
+                    // cli-flags-04: --allowedTools/--disallowedTools/--tools
+                    // restrict the primary session's own advertised/dispatchable
+                    // tool set, on top of any agent-scoped restriction above.
+                    if (agent_tools.hasCliToolFilters(self.cfg)) {
+                        const filtered = try agent_tools.filterByCliToolFlags(self.allocator, tool_schemas, self.cfg);
+                        if (owned_tool_schemas) |schemas| tool_registry.freeSchemas(self.allocator, schemas);
+                        owned_tool_schemas = filtered;
+                        tool_schemas = filtered;
+                    }
                 }
 
                 const mcp_instruction_delta = try self.collectMcpInstructionDeltas(tool_schemas, true);
@@ -6622,6 +6632,16 @@ pub const AgentRuntime = struct {
                 owned_tool_schemas = filtered;
                 tool_schemas = filtered;
             }
+        }
+
+        // cli-flags-04: keep `prompt inspect --json` (the acceptance-test
+        // oracle for this flag family) honest about what a real turn would
+        // actually advertise.
+        if (agent_tools.hasCliToolFilters(self.cfg)) {
+            const filtered = try agent_tools.filterByCliToolFlags(self.allocator, tool_schemas, self.cfg);
+            if (owned_tool_schemas) |schemas| tool_registry.freeSchemas(self.allocator, schemas);
+            owned_tool_schemas = filtered;
+            tool_schemas = filtered;
         }
 
         const working_context = try self.buildWorkingContext(user_turn, .{

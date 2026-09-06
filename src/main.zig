@@ -23,6 +23,7 @@ const jwks_cache = @import("core/jwks_cache.zig");
 const policy_mod = @import("policy/policy.zig");
 const session_store = @import("session/store.zig");
 const mcp_client = @import("mcp/client.zig");
+const mcp_config = @import("core/mcp_config.zig");
 const browser_bridge_mod = @import("mcp/browser_bridge.zig");
 
 const session_mgmt = @import("session_mgmt.zig");
@@ -416,6 +417,50 @@ fn installInterruptHandlers() void {
     std.posix.sigaction(std.posix.SIG.QUIT, &act, null);
 }
 
+/// cli-flags-06: read every `--mcp-config <configs...>` entry (each already
+/// validated by `args.zig`'s `validateMcpConfigEntry` as either inline JSON
+/// -- a value that, once trimmed, starts with `{` -- or a path to a JSON
+/// file) and parse the servers out of each one's `mcpServers` block,
+/// concatenating them in flag order (a later `--mcp-config` wins a same-name
+/// collision, matching `mergeScopes`'s general later-wins rule). Parsed at
+/// `ConfigScope.local` with `${VAR}` expansion enabled, same as the rest of
+/// the local/project scope. The caller owns the returned slice.
+fn loadCliMcpConfig(allocator: std.mem.Allocator, entries: []const []const u8) ![]mcp_config.ServerConfig {
+    var servers: []mcp_config.ServerConfig = &.{};
+    errdefer mcp_config.freeServerConfigs(allocator, servers);
+
+    for (entries) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        var owned_bytes: ?[]u8 = null;
+        defer if (owned_bytes) |b| allocator.free(b);
+        const bytes: []const u8 = if (trimmed.len > 0 and trimmed[0] == '{')
+            trimmed
+        else blk: {
+            const b = std.Io.Dir.cwd().readFileAlloc(rt.io, trimmed, allocator, .limited(1 * 1024 * 1024)) catch |err| {
+                std.log.warn("--mcp-config: could not re-read '{s}' ({s}); skipping this entry", .{ trimmed, @errorName(err) });
+                continue;
+            };
+            owned_bytes = b;
+            break :blk b;
+        };
+
+        const result = try mcp_config.parseMcpJson(allocator, bytes, .local, true);
+        if (result.errors.len > 0) {
+            mcp_config.renderValidationErrors(std_io.stderrWriter(), result.errors) catch {};
+        }
+        // Free just the errors -- `result.servers` is about to be moved into
+        // `servers` via `concatServerConfigs`, which takes ownership of both
+        // the accumulator-so-far and this entry's slice (freeing only their
+        // container arrays; the individual `ServerConfig`s move across
+        // unchanged).
+        for (result.errors) |*e| e.deinit(allocator);
+        if (result.errors.len > 0) allocator.free(result.errors);
+        servers = try mcp_config.concatServerConfigs(allocator, servers, result.servers);
+    }
+
+    return servers;
+}
+
 /// wp4-cli-flags: copy the raw value of every CLI-flag-carrier field (see
 /// core/config.zig's field docs) from `opts` into `cfg`, for whichever
 /// parity package (permissions/sessions/sdk) reads it next. Deliberately
@@ -431,7 +476,10 @@ fn applyCliFlagCarrierFields(allocator: std.mem.Allocator, cfg: *config_mod.Conf
     }
     if (opts.allowed_tools) |v| try cfg.setOwnedString(allocator, &cfg.allowed_tools, v);
     if (opts.disallowed_tools) |v| try cfg.setOwnedString(allocator, &cfg.disallowed_tools, v);
-    if (opts.tools_flag) |v| try cfg.setOwnedString(allocator, &cfg.tools_allowlist, v);
+    if (opts.tools_flag) |v| {
+        try cfg.setOwnedString(allocator, &cfg.tools_allowlist, v);
+        cfg.tools_flag_set = true;
+    }
     if (opts.add_dir) |v| try cfg.setOwnedString(allocator, &cfg.additional_directories, v);
     if (opts.session_id) |v| try cfg.setOwnedString(allocator, &cfg.session_id, v);
     if (opts.permission_prompts) |v| try cfg.setOwnedString(allocator, &cfg.permission_prompts, v);
@@ -442,6 +490,7 @@ fn applyCliFlagCarrierFields(allocator: std.mem.Allocator, cfg: *config_mod.Conf
     cfg.verbose = cfg.verbose or opts.verbose;
     cfg.disable_slash_commands = cfg.disable_slash_commands or opts.disable_slash_commands;
     cfg.safe_mode = cfg.safe_mode or opts.safe_mode;
+    cfg.brief = cfg.brief or opts.brief;
 }
 
 /// cli-flags-23: apply `--autocompact <auto|N[k]>` as a process-wide
@@ -562,6 +611,18 @@ pub fn main(init: std.process.Init) !void {
     @import("core/resource_limits.zig").applyParentLimits();
 
     defer tool_dispatch.deinitCronStore();
+    // regression fix: core/env.zig's in-process override map (populated by
+    // --agents/--betas/--effort and friends via env.setOverride) is a
+    // process-lifetime global by design (see its doc comment), but Juicy
+    // Main's automatic leak check at the end of `main` still flags its
+    // still-live entries as leaked. Free them here, the same way
+    // deinitCronStore above tears down its own process-lifetime global,
+    // rather than leaving debug-build leak noise on every --agents/--betas
+    // run.
+    defer @import("core/env.zig").clearOverrides();
+    // Same class of fix, same reason: `-d, --debug <filter>` installs a
+    // process-lifetime allocation in log_runtime's category-filter global.
+    defer log_runtime.clearCategoryFilter();
     const allocator = init.gpa;
 
     // Convert init.minimal.args.vector ([*:0]const u8 sentinel ptrs)
@@ -669,13 +730,21 @@ pub fn main(init: std.process.Init) !void {
     // cli-flags-14: -d/--debug (and --debug-file, which implies it) enable
     // debug-level logging, equivalent to --log-level debug, unless an
     // explicit --log-level already won above. The category filter
-    // (--debug=<filter>/--debug-file's implicit filter) is recorded on
-    // opts.debug_filter but not yet enforced per call-site -- every
-    // std.log call already routes through log_runtime.logFn, which has no
-    // per-call category tag to filter on today; narrowing that is a
-    // follow-on rather than a per-call-site rewrite done here.
+    // (--debug=<filter>) narrows which `std.log.scoped(.<category>)`
+    // call sites actually emit at debug level -- see
+    // `log_runtime.debugCategoryAllowed`'s doc comment for the include/
+    // exclude ("api,hooks" vs "!1p,!file") syntax. Only scoped call sites
+    // participate; unscoped (`.default`-scope) debug lines are unaffected by
+    // an include-only filter (their scope name never matches a category) but
+    // ARE covered by an exclude-only filter unless "!default" is listed --
+    // this mirrors the reference's own category taxonomy, which only a
+    // subset of log call sites are tagged with today (a full retrofit of
+    // every debug call site in the codebase is a follow-on, not done here).
     if (opts.debug and opts.log_level == null) {
         log_runtime.setLevelFromString("debug") catch {};
+    }
+    if (opts.debug_filter) |filter| {
+        log_runtime.setCategoryFilter(filter) catch {};
     }
     if (opts.debug_file) |path| {
         log_runtime.setOutputFile(path) catch |err| {
@@ -723,12 +792,48 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // regression fix: `resolveWorktreePath` below hands back a heap-owned
+    // path that gets stashed into `opts.cwd`; `resolveWorkingDirectory`
+    // (right after this block) only ever reads through that pointer and
+    // returns its OWN independent dupe as `cwd`, so the worktree path
+    // itself is never freed once installed into `opts.cwd` -- tracked here
+    // so it can be freed right after `resolveWorkingDirectory` has made its
+    // copy (see the `defer` beside `cwd` below).
+    var worktree_owned_cwd: ?[]u8 = null;
+
     // cli-flags-08: -w/--worktree creates (or reuses) a git worktree for
     // this session BEFORE the working directory is resolved, by rewriting
     // opts.cwd -- resolveWorkingDirectory below then validates/adopts it
     // exactly like an explicit --cwd, with no other code path changes.
     if (opts.worktree_requested) {
-        const base_cwd = opts.cwd orelse std.process.currentPathAlloc(rt.io, allocator) catch ".";
+        // regression fix: when `--cwd` was not also passed, `base_cwd` is a
+        // fresh `currentPathAlloc` allocation used only to resolve the
+        // worktree path below (the worktree path itself, not this raw cwd,
+        // is what gets carried forward into `opts.cwd`) -- free it once
+        // `resolveWorktreePath` is done with it, whichever way that call
+        // returns, instead of leaking one cwd string per `--worktree`
+        // launch that omits an explicit `--cwd`.
+        //
+        // Sentinel gotcha (same class of bug as mcp/client.zig's scopedCwd,
+        // see its doc comment): `currentPathAlloc` returns a `[:0]u8` built
+        // via `dupeZ` (len+1 bytes allocated). Storing that value directly
+        // into a plain `?[]u8` and later calling `allocator.free` on it
+        // frees one byte short of what was allocated, corrupting the
+        // DebugAllocator. Dupe a plain, non-sentinel copy HERE while the
+        // original still has its correct sentinel-aware type, and free the
+        // original with that type via `defer` in the same scope.
+        var owned_base_cwd: ?[]u8 = null;
+        defer if (owned_base_cwd) |p| allocator.free(p);
+        const base_cwd: []const u8 = opts.cwd orelse blk: {
+            if (std.process.currentPathAlloc(rt.io, allocator)) |sentinel_cwd| {
+                defer allocator.free(sentinel_cwd);
+                const p = allocator.dupe(u8, sentinel_cwd) catch break :blk ".";
+                owned_base_cwd = p;
+                break :blk p;
+            } else |_| {
+                break :blk ".";
+            }
+        };
         const wt_path = worktree_launch.resolveWorktreePath(allocator, base_cwd, opts.worktree_name) catch |err| {
             try std_io.stderrWriter().print(
                 "error: --worktree: could not create/reuse a git worktree in {s} ({s}).\n  - --worktree requires the current directory to be inside a git repository.\n",
@@ -737,6 +842,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         };
         opts.cwd = wt_path;
+        worktree_owned_cwd = wt_path;
         if (opts.tmux_mode) |mode| {
             const session_name = std.fs.path.basename(wt_path);
             worktree_launch.spawnTmux(allocator, wt_path, session_name);
@@ -751,6 +857,10 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer allocator.free(cwd);
+    // `resolveWorkingDirectory` has now made its own independent copy of the
+    // worktree path (or errored/exited above) -- see the comment on
+    // `worktree_owned_cwd`'s declaration.
+    defer if (worktree_owned_cwd) |p| allocator.free(p);
 
     // Idempotent startup pass that renames/relocates deprecated config keys
     // before the config is parsed, so migrated keys are picked up by load().
@@ -1046,11 +1156,37 @@ pub fn main(init: std.process.Init) !void {
 
     var mcp = try mcp_client.Client.init(allocator, loaded_cfg.paths.mcp_registry_path);
     defer mcp.deinit();
+
+    // cli-flags-06: --mcp-config/--strict-mcp-config install CLI-supplied,
+    // this-process-only MCP servers before scoped config is enabled, so both
+    // `mcp list` and every tool call see them. `loadCliMcpConfig` takes
+    // ownership; `setCliMcpConfig` hands that ownership to `mcp`, which
+    // consumes it the first time it loads scoped config (or frees it in
+    // `mcp.deinit()` if that never happens, e.g. `mcp add`/`mcp remove`
+    // subcommands that never touch scoped config at all).
+    if (opts.mcp_config.len > 0 or opts.strict_mcp_config) {
+        var cli_servers: []mcp_config.ServerConfig = &.{};
+        if (opts.mcp_config.len > 0) {
+            cli_servers = loadCliMcpConfig(allocator, opts.mcp_config) catch |err| blk: {
+                std.log.warn("--mcp-config: failed to load one or more entries ({s})", .{@errorName(err)});
+                break :blk &.{};
+            };
+        }
+        mcp.setCliMcpConfig(cli_servers, opts.strict_mcp_config);
+    }
+
     // Enable structured scoped-config loading so servers declared in a project
     // `.mcp.json` (with command/args/env or url/headers/headersHelper) actually
     // drive live connections, merged with the legacy `mcp add` registry. Unit
     // tests never call this, so they stay hermetic.
-    mcp.enableScopedConfig();
+    //
+    // cli-flags-12: --safe-mode disables MCP servers for this run -- skip
+    // enabling scoped config entirely, so `.mcp.json`/`~/.claude.json`/
+    // enterprise-managed/plugin-contributed servers never load. (The
+    // legacy `zcode mcp add` registry is a narrower, disclosed exception:
+    // its entries are consulted by a few call sites outside the scoped-config
+    // path and are not suppressed here.)
+    if (!loaded_cfg.config.safe_mode) mcp.enableScopedConfig();
 
     // Chrome browser bridge (WebSocket server for lchrome extension)
     var browser_bridge = browser_bridge_mod.BrowserBridge.init(allocator, loaded_cfg.config.browser_bridge_port);
