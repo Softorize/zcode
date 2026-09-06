@@ -73,6 +73,12 @@ pub const Config = struct {
     /// reference's plain rules + single "? for shortcuts" line. Default
     /// false.
     ui_legacy_footer: bool,
+    /// r4-transcript-01/02: restores zcode's pre-2.1.261-parity transcript
+    /// look -- a bordered "╭─ ❯ You ─..." card for the user's
+    /// turn and a "╭─ ◆ Assistant ─..." divider + bordered box for
+    /// the reply -- instead of the reference's plain "> text" / "⏺ text"
+    /// single-line rows. Default false.
+    ui_legacy_transcript: bool,
     ui_show_shortcuts_panel: bool,
     ui_prompt_label: []u8,
     ui_transcript_max_lines: usize,
@@ -483,6 +489,7 @@ pub const Config = struct {
             .ui_show_top_bar = false,
             .ui_legacy_banner = false,
             .ui_legacy_footer = false,
+            .ui_legacy_transcript = false,
             .ui_show_shortcuts_panel = true,
             .ui_prompt_label = try allocator.dupe(u8, ">"),
             .ui_transcript_max_lines = 20_000,

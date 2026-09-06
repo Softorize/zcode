@@ -167,6 +167,7 @@ pub fn replOptionsFromConfig(cfg: *const config_mod.Config, yolo_mode: bool, cwd
         .show_top_bar = cfg.ui_show_top_bar,
         .legacy_banner = cfg.ui_legacy_banner,
         .legacy_footer = cfg.ui_legacy_footer,
+        .ui_legacy_transcript = cfg.ui_legacy_transcript,
         .shortcuts_panel_enabled = cfg.ui_show_shortcuts_panel,
         .vim_mode_enabled = cfg.ui_vim_mode,
         .input_mode_label = if (cfg.ui_vim_mode) "VIM INSERT" else "",

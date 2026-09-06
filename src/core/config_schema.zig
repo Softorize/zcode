@@ -101,6 +101,7 @@ pub const keys = [_]KeySpec{
     .{ .name = "ui_show_top_bar", .kind = .boolean },
     .{ .name = "ui_legacy_banner", .kind = .boolean },
     .{ .name = "ui_legacy_footer", .kind = .boolean },
+    .{ .name = "ui_legacy_transcript", .kind = .boolean },
     .{ .name = "ui_show_shortcuts_panel", .kind = .boolean },
     .{ .name = "ui_prompt_label", .kind = .string },
     .{ .name = "ui_transcript_max_lines", .kind = .integer },

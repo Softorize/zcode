@@ -899,6 +899,8 @@ pub fn applyKeyValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8
         cfg.ui_legacy_banner = parseBool(value);
     } else if (std.mem.eql(u8, key, "ui_legacy_footer")) {
         cfg.ui_legacy_footer = parseBool(value);
+    } else if (std.mem.eql(u8, key, "ui_legacy_transcript")) {
+        cfg.ui_legacy_transcript = parseBool(value);
     } else if (std.mem.eql(u8, key, "ui_show_shortcuts_panel")) {
         cfg.ui_show_shortcuts_panel = parseBool(value);
     } else if (std.mem.eql(u8, key, "ui_prompt_label")) {
@@ -1701,14 +1703,17 @@ test "r3-chrome: the top status bar and legacy chrome flags default off, and eac
     try testing.expect(!cfg.ui_show_top_bar);
     try testing.expect(!cfg.ui_legacy_banner);
     try testing.expect(!cfg.ui_legacy_footer);
+    try testing.expect(!cfg.ui_legacy_transcript);
 
     try mergeLine(allocator, &cfg, "ui_show_top_bar = true");
     try mergeLine(allocator, &cfg, "ui_legacy_banner = true");
     try mergeLine(allocator, &cfg, "ui_legacy_footer = true");
+    try mergeLine(allocator, &cfg, "ui_legacy_transcript = true");
 
     try testing.expect(cfg.ui_show_top_bar);
     try testing.expect(cfg.ui_legacy_banner);
     try testing.expect(cfg.ui_legacy_footer);
+    try testing.expect(cfg.ui_legacy_transcript);
 }
 
 test "merge ui and runtime behavior fields" {

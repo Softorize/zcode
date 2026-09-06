@@ -228,6 +228,14 @@ pub const Options = struct {
     /// reference's plain rules and single "? for shortcuts" + mode-chip
     /// line. Sourced from config `ui_legacy_footer` (default false).
     legacy_footer: bool = false,
+    /// r4-transcript-01/02: renders the pre-2.1.261-parity transcript --
+    /// a bordered "You"/"Assistant" divider card -- instead of the
+    /// reference's plain "> text" / "⏺ text" single-line rows. Also
+    /// controls whether bare `/help` opens the new tabbed overlay dialog
+    /// (r4-help-01) or keeps appending the old flat command dump to the
+    /// transcript. Sourced from config `ui_legacy_transcript` (default
+    /// false).
+    ui_legacy_transcript: bool = false,
     shortcuts_panel_enabled: bool = true,
     shortcuts_panel_visible: bool = false,
     vim_mode_enabled: bool = false,
@@ -1061,11 +1069,23 @@ test "writeAltScreenThenOutput writes nothing extra when not in fullscreen" {
     try std.testing.expectEqualStrings("hello\n", out.items());
 }
 
-fn appendInputLine(allocator: std.mem.Allocator, transcript: *UiTranscript, prompt_label: []const u8, line: []const u8) !void {
-    var buf: [16 * 1024]u8 = undefined;
-    const rendered = formatInputPreview(prompt_label, line, &buf);
+fn appendInputLine(allocator: std.mem.Allocator, transcript: *UiTranscript, prompt_label: []const u8, line: []const u8, legacy_transcript: bool) !void {
     try appendTranscriptDivider(allocator, transcript, "You");
-    try transcript.appendLine(allocator, rendered);
+    if (legacy_transcript) {
+        var buf: [16 * 1024]u8 = undefined;
+        const rendered = formatInputPreview(prompt_label, line, &buf);
+        try transcript.appendLine(allocator, rendered);
+        return;
+    }
+    // r4-transcript-01: echo the raw prompt text bounded by user-block
+    // markers instead of baking a literal "> " prefix into the transcript
+    // line -- the renderer draws the pointer itself (repl_render.zig's
+    // renderUserWrappedLineRows), so a prompt that happens to start with
+    // "> " text of its own is never misread as a markdown blockquote by
+    // the general transcript renderer (the bug this gap replaces).
+    try transcript.appendLine(allocator, repl_render_mod.transcriptUserBlockStartMarker());
+    try transcript.appendText(allocator, line);
+    try transcript.appendLine(allocator, repl_render_mod.transcriptUserBlockEndMarker());
 }
 
 fn appendTranscriptDivider(allocator: std.mem.Allocator, transcript: *UiTranscript, label: []const u8) !void {
@@ -1267,8 +1287,16 @@ fn buildMessageActionsData(allocator: std.mem.Allocator, transcript: *const UiTr
             continue;
         }
         if (std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockStartMarker()) or
-            std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockEndMarker()))
+            std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockEndMarker()) or
+            std.mem.eql(u8, line, repl_render_mod.transcriptUserBlockStartMarker()) or
+            std.mem.eql(u8, line, repl_render_mod.transcriptUserBlockEndMarker()))
         {
+            // r4-transcript-01: the non-legacy transcript wraps the user's
+            // raw echoed prompt in these markers instead of baking a
+            // literal "> " prefix into the content line (see
+            // appendInputLine) -- skip them here exactly like the
+            // assistant-block markers above so they never leak into a
+            // message-actions item's copied/edited content.
             continue;
         }
         if (current_label == null) continue;
@@ -1297,7 +1325,9 @@ fn buildTranscriptOverlayText(allocator: std.mem.Allocator, transcript: *const U
             continue;
         }
         if (std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockStartMarker()) or
-            std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockEndMarker()))
+            std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockEndMarker()) or
+            std.mem.eql(u8, line, repl_render_mod.transcriptUserBlockStartMarker()) or
+            std.mem.eql(u8, line, repl_render_mod.transcriptUserBlockEndMarker()))
         {
             continue;
         }
@@ -8498,7 +8528,7 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                 synthetic_prompt = try std.fmt.allocPrint(allocator, "{s} [yolo] auto-approved plan -> executing", .{options.prompt_label});
                 try transcript.appendLine(allocator, synthetic_prompt.?);
             } else {
-                try appendInputLine(allocator, &transcript, options.prompt_label, line);
+                try appendInputLine(allocator, &transcript, options.prompt_label, line, options.ui_legacy_transcript);
             }
             try renderFullScreen(writer, &transcript, false, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
         }
@@ -8588,7 +8618,27 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             // custom commands and skills so they are discoverable without first
             // running /help commands. status_workspace is the workspace root.
             const help_cwd = if (options.status_workspace.len > 0) options.status_workspace else ".";
-            if (use_fullscreen) {
+            if (use_fullscreen and !options.ui_legacy_transcript) {
+                // r4-help-01: HelpV2.tsx's tabbed dialog ("<product>
+                // v<version>" title, general | commands | custom-commands
+                // tabs) instead of a flat ~100-row dump appended to the
+                // scrolling transcript. `ui_legacy_transcript = true`
+                // keeps the old flat dump reachable below.
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const arena_alloc = arena.allocator();
+                const command_lines = repl_help_mod.buildHelpOverlayCommandLines(arena_alloc) catch &[_]repl_help_mod.HelpOverlayLine{};
+                const custom_lines = repl_help_mod.buildHelpOverlayCustomLines(arena_alloc, help_cwd) catch &[_]repl_help_mod.HelpOverlayLine{};
+                const help_data = repl_overlay_mod.HelpOverlayData{
+                    .app_name = "zcode",
+                    .app_version = options.app_version,
+                    .general_lines = repl_help_mod.helpOverlayGeneralLines(),
+                    .command_lines = command_lines,
+                    .custom_lines = custom_lines,
+                };
+                repl_overlay_mod.runHelpOverlayLoop(help_data, options.keybindings) catch {};
+                try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+            } else if (use_fullscreen) {
                 var help_buf = std_io.StringBuilder.init(allocator);
                 defer help_buf.deinit();
                 try repl_help_mod.writeOverviewScreen(help_buf.writer(), false);
@@ -10628,4 +10678,63 @@ test "inManagedWorktree detects zcode-managed worktree paths only" {
     try testing.expect(!inManagedWorktree("/home/u/proj/.zcode/sessions"));
     try testing.expect(!inManagedWorktree("/home/u/proj/worktrees/agent-x"));
     try testing.expect(!inManagedWorktree(""));
+}
+
+// ── r4-transcript-01: raw user-block markers never leak as content ──
+
+test "appendInputLine (non-legacy) wraps the raw prompt in user-block markers" {
+    const allocator = testing.allocator;
+    var transcript = UiTranscript.init(allocator, 100);
+    defer transcript.deinit(allocator);
+
+    try appendInputLine(allocator, &transcript, ">", "hello", false);
+
+    // divider, start marker, content, end marker -- exactly 4 lines, and
+    // the content line is the RAW text with no "> " baked in (the
+    // renderer draws the pointer itself).
+    try testing.expectEqual(@as(usize, 4), transcript.lines.items.len);
+    try testing.expectEqualStrings(repl_render_mod.transcriptUserBlockStartMarker(), transcript.lines.items[1]);
+    try testing.expectEqualStrings("hello", transcript.lines.items[2]);
+    try testing.expectEqualStrings(repl_render_mod.transcriptUserBlockEndMarker(), transcript.lines.items[3]);
+}
+
+test "appendInputLine (legacy) keeps the old baked-in '> text' single line" {
+    const allocator = testing.allocator;
+    var transcript = UiTranscript.init(allocator, 100);
+    defer transcript.deinit(allocator);
+
+    try appendInputLine(allocator, &transcript, ">", "hello", true);
+
+    try testing.expectEqual(@as(usize, 2), transcript.lines.items.len);
+    try testing.expectEqualStrings("> hello", transcript.lines.items[1]);
+}
+
+test "buildMessageActionsData never leaks the user-block marker strings into an item's content" {
+    const allocator = testing.allocator;
+    var transcript = UiTranscript.init(allocator, 100);
+    defer transcript.deinit(allocator);
+
+    try appendInputLine(allocator, &transcript, ">", "hello there", false);
+
+    var data = try buildMessageActionsData(allocator, &transcript, ">");
+    defer data.deinit();
+
+    try testing.expectEqual(@as(usize, 1), data.items.len);
+    try testing.expectEqual(MessageActionsItemKind.user, data.items[0].kind);
+    try testing.expectEqualStrings("hello there", data.items[0].content);
+    try testing.expect(std.mem.indexOf(u8, data.items[0].content, "[[user_block") == null);
+}
+
+test "buildTranscriptOverlayText never leaks the user-block marker strings" {
+    const allocator = testing.allocator;
+    var transcript = UiTranscript.init(allocator, 100);
+    defer transcript.deinit(allocator);
+
+    try appendInputLine(allocator, &transcript, ">", "hello there", false);
+
+    const text = try buildTranscriptOverlayText(allocator, &transcript);
+    defer allocator.free(text);
+
+    try testing.expect(std.mem.indexOf(u8, text, "hello there") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[[user_block") == null);
 }
