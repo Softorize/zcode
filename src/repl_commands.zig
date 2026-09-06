@@ -6351,37 +6351,44 @@ fn handleEffortSet(allocator: std.mem.Allocator, runtime: *AgentRuntime, arg: []
 /// description), distinct from `/branch`'s "switch the live session" (which
 /// `/fork` used to alias). Copies history+snapshot into a NEW session id via
 /// the same `session_bundles.forkSession` machinery `zcode session fork`
-/// already uses; the CURRENT runtime's session_id/history/snapshot are never
-/// touched. When `prompt` is given it is durably queued as the new session's
-/// next turn.
-///
-/// SCOPE NOTE: actually answering that queued prompt autonomously in a
-/// detached background process needs a headless (non-interactive) resume
-/// runner -- `session_mgmt.runHeadlessResumeResult` now exists as exactly
-/// that building block, but wiring a live, un-terminal-attached background
-/// PROCESS around it end-to-end is the same `--resume`-headless CLI plumbing
-/// gap noted on `session_mgmt.HeadlessCaps`'s doc comment, and is left to
-/// that follow-on. For now the new session is fully resumable
-/// (`/resume <id>` or `zcode --resume <id>`) with the prompt already queued.
+/// already uses, then starts that new session as a genuine DETACHED
+/// background process via `bg_cmds.spawnBackground` -- the same
+/// self-registering `--bg` re-invocation `/background` already uses (see
+/// `repl_commands_parity.handleBackground`), so the fork shows up in `zcode
+/// ps`/the session registry. When `prompt` is given it is forwarded as
+/// `ZCODE_BG_INITIAL_PROMPT`, which the detached child answers headlessly
+/// (`session_mgmt.resumeSessionHeadless`, routed to by main.zig's
+/// `.session_resume` dispatch when `ZCODE_SESSION_KIND=bg`) as the fork's
+/// next turn -- never a merely-queued, unanswered turn a human has to
+/// `/resume` by hand. The CURRENT runtime's session_id/history/snapshot are
+/// never touched: `spawnBackground` only spawns a child process; it has no
+/// effect on the calling (still fully interactive) session.
 fn handleForkSession(allocator: std.mem.Allocator, runtime: *AgentRuntime, prompt: ?[]const u8) ![]u8 {
     var forked = try session_bundles.forkSession(allocator, runtime.store, runtime.session_id, null);
     defer forked.deinit(allocator);
 
-    if (prompt) |p| {
-        runtime.store.appendTurn(forked.session_id, .user, p, "") catch |err| {
-            std.log.warn("session: /fork could not queue the prompt on {s}: {s}", .{ forked.session_id, @errorName(err) });
-        };
-        return std.fmt.allocPrint(
-            allocator,
-            "forked into new session {s} (current session {s} is unchanged); queued prompt: {s}\nResume it with /resume {s} or `zcode --resume {s}`.",
-            .{ forked.session_id, forked.source_session_id, p, forked.session_id, forked.session_id },
-        );
+    const argv = try repl_commands_parity.buildBackgroundResumeArgv(allocator, forked.session_id, runtime.active_provider, runtime.active_model);
+    defer {
+        for (argv) |item| allocator.free(item);
+        allocator.free(argv);
     }
-    return std.fmt.allocPrint(
-        allocator,
-        "forked into new session {s} (current session {s} is unchanged).\nResume it with /resume {s} or `zcode --resume {s}`.",
-        .{ forked.session_id, forked.source_session_id, forked.session_id, forked.session_id },
-    );
+
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    try out.writer().print("forked into new session {s} (current session {s} is unchanged).\n", .{ forked.session_id, forked.source_session_id });
+
+    bg_cmds.spawnBackground(allocator, argv, runtime.cwd, out.writer(), prompt) catch |err| {
+        try out.writer().print(
+            "failed to start the fork in the background ({s}). Resume it manually with /resume {s} or `zcode --resume {s}`.\n",
+            .{ @errorName(err), forked.session_id, forked.session_id },
+        );
+        return out.toOwnedSlice();
+    };
+
+    if (prompt) |p| {
+        try out.writer().print("queued prompt: {s} -- the background session will answer it before idling.\n", .{p});
+    }
+    return out.toOwnedSlice();
 }
 
 fn handleClearConversation(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
@@ -9225,12 +9232,16 @@ test "sessions-storage-09: /fork copies the conversation into a NEW session and 
     defer allocator.free(msg);
 
     // Unlike /branch, /fork never touches the LIVE runtime: same id, same
-    // in-memory history, exactly as it was before the command ran.
+    // in-memory history, exactly as it was before the command ran --
+    // spawnBackground only ever spawns a CHILD process (a no-op under
+    // `builtin.is_test`, see bg_cmds.zig); it has no effect on the caller.
     try testing.expectEqualStrings(original_session_id, runtime.session_id);
     try testing.expectEqual(@as(usize, 2), runtime.history.len());
 
-    // The message names a genuinely different session id.
+    // The message names a genuinely different session id, confirms the fork
+    // was started as a background session, and names the queued prompt.
     try testing.expect(std.mem.indexOf(u8, msg, original_session_id) != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "started background session") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "continue the refactor") != null);
 
     // The ORIGINAL session's own file is untouched (still exactly its 2 turns).
@@ -9248,14 +9259,39 @@ test "sessions-storage-09: /fork copies the conversation into a NEW session and 
     }
     const forked_id = new_id orelse return error.TestUnexpectedResult;
 
-    // The fork carries a COPY of the 2 prior turns PLUS the queued prompt
-    // as a 3rd turn.
+    // The fork carries an exact COPY of the 2 prior turns at the moment it
+    // was spun off -- the queued prompt is answered by the DETACHED
+    // background process as its next turn (headlessly, via
+    // ZCODE_BG_INITIAL_PROMPT -> session_mgmt.resumeSessionHeadless), not
+    // synchronously here, so it is not yet on disk when handleForkSession
+    // returns.
     var loaded_fork = try runtime.store.load(forked_id);
     defer loaded_fork.deinit(allocator);
-    try testing.expectEqual(@as(usize, 3), loaded_fork.history.len);
+    try testing.expectEqual(@as(usize, 2), loaded_fork.history.len);
     try testing.expectEqualStrings("first turn", loaded_fork.history[0].content);
     try testing.expectEqualStrings("first reply", loaded_fork.history[1].content);
-    try testing.expectEqualStrings("continue the refactor", loaded_fork.history[2].content);
+}
+
+test "sessions-storage-09: /fork with no prompt still starts the background session (no queued-prompt line)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    try runtime.history.append(runtime.session_id, .user, "solo turn");
+
+    const msg = try handleForkSession(allocator, runtime, null);
+    defer allocator.free(msg);
+
+    try testing.expect(std.mem.indexOf(u8, msg, "forked into new session") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "started background session") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "queued prompt") == null);
 }
 
 test "__sessions_overlay_data includes message_count for the session switcher (sessions-storage-05)" {

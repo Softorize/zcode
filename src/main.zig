@@ -1306,23 +1306,7 @@ fn dispatch(
             // when the model emitted only protocol bytes, which we
             // surface as "(no narration)" so the user gets a signal
             // the turn completed but had nothing text-worthy to say.
-            const assistant_render = @import("core/assistant_render.zig");
-            const cleaned = try assistant_render.cleanAssistantText(allocator, one_shot.body);
-            defer allocator.free(cleaned);
-            const rendered = if (cleaned.len == 0) "(no narration; see tool output above)" else cleaned;
-            const repl_markdown = @import("cli/repl_markdown.zig");
-            if (std.c.isatty(std.Io.File.stdout().handle) != 0) {
-                try repl_markdown.writeStyledText(stdout, rendered, .{
-                    .color_enabled = true,
-                    .highlight_code_blocks = true,
-                    .highlight_links = true,
-                    .highlight_paths = true,
-                    .color_lists = true,
-                });
-            } else {
-                try stdout.writeAll(rendered);
-            }
-            if (!std.mem.endsWith(u8, rendered, "\n")) try stdout.writeByte('\n');
+            try renderOneShotText(allocator, stdout, one_shot.body);
             if (one_shot.strict_violation) {
                 const stderr = std_io.stderrWriter();
                 try stderr.writeAll(
@@ -1636,6 +1620,36 @@ fn dispatch(
                 try session_mgmt.resumeSessionHeadless(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject.?, queued, auto_approve_high, opts.strict, yolo_mode, opts.agent);
                 break :blk;
             }
+
+            // sessions-storage-12: `--resume <id> [--fork-session] --print
+            // [prompt]` used to fall through to `cmdSessionResume` below
+            // unconditionally, which always ends by opening the interactive
+            // REPL (`resumeSessionInteractive`) -- wrong for a `--print`
+            // caller with no attached terminal, and it silently dropped the
+            // queued prompt entirely (args.zig never captured it for
+            // `.session_resume`). Answer it headlessly instead, exactly the
+            // way a brand-new `--print "<prompt>"` run does.
+            if (opts.print) {
+                const subject = opts.subject orelse {
+                    try std_io.stderrWriter().writeAll("error: --resume requires a session id when used with --print.\n");
+                    std.process.exit(2);
+                };
+                const prompt = opts.prompt orelse {
+                    try std_io.stderrWriter().writeAll(
+                        "error: --print without a prompt requires --input-format stream-json (the prompt arrives over stdin).\n",
+                    );
+                    std.process.exit(2);
+                };
+                store.active_cwd = cwd;
+                const session_id = session_mgmt.session_cmds.resolveResumeSubject(allocator, store, opts.all_projects, subject) catch |err| switch (err) {
+                    error.SessionNotFound => std.process.exit(2),
+                    else => return err,
+                };
+                defer allocator.free(session_id);
+                try runResumeOrContinuePrint(allocator, opts, cwd, cfg, policy, audit, store, mcp, browser, session_id, prompt, auto_approve_high, yolo_mode, stdout);
+                break :blk;
+            }
+
             session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session) catch |err| switch (err) {
                 // session_cmds printed the targeted message already; exit
                 // 2 cleanly without the Zig error trace.
@@ -1643,7 +1657,45 @@ fn dispatch(
                 else => return err,
             };
         },
-        .session_continue => try session_mgmt.cmdSessionContinue(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.prompt, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session),
+        .session_continue => blk: {
+            // sessions-storage-12: same headless-vs-interactive split as
+            // `.session_resume` above, for `--continue --print [prompt]`.
+            if (opts.print) {
+                store.active_cwd = cwd;
+                const maybe_id = try session_mgmt.session_cmds.resolveContinueTarget(allocator, store, opts.all_projects);
+                if (maybe_id) |session_id| {
+                    defer allocator.free(session_id);
+                    const prompt = opts.prompt orelse {
+                        try std_io.stderrWriter().writeAll(
+                            "error: --print without a prompt requires --input-format stream-json (the prompt arrives over stdin).\n",
+                        );
+                        std.process.exit(2);
+                    };
+                    try runResumeOrContinuePrint(allocator, opts, cwd, cfg, policy, audit, store, mcp, browser, session_id, prompt, auto_approve_high, yolo_mode, stdout);
+                    break :blk;
+                }
+                // No previous session: matches the interactive
+                // cmdSessionContinue's own "no previous sessions, starting
+                // new session" fallback, except this stays headless -- the
+                // interactive REPL would block forever reading stdin for a
+                // --print caller.
+                try stdout.writeAll("no previous sessions, starting new session\n");
+                if (try runHeadlessDispatch(allocator, opts, cwd, cfg, policy, audit, store, mcp, browser, auto_approve_high, yolo_mode)) break :blk;
+                const prompt = opts.prompt orelse {
+                    try std_io.stderrWriter().writeAll(
+                        "error: --print without a prompt requires --input-format stream-json (the prompt arrives over stdin).\n",
+                    );
+                    std.process.exit(2);
+                };
+                const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, prompt, false, auto_approve_high, opts.strict, yolo_mode, opts.agent);
+                defer allocator.free(one_shot.body);
+                defer allocator.free(one_shot.session_id);
+                if (opts.no_session_persistence) sdk_headless.removeSessionArtifacts(allocator, store, one_shot.session_id);
+                try renderOneShotText(allocator, stdout, one_shot.body);
+                break :blk;
+            }
+            try session_mgmt.cmdSessionContinue(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.prompt, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session);
+        },
         .session_compact => session_mgmt.cmdSessionCompact(allocator, cfg, store, opts.subject, stdout) catch |err| switch (err) {
             error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
             else => return err,
@@ -1990,6 +2042,88 @@ fn dispatch(
             if (code != 0) std.process.exit(code);
         },
     }
+}
+
+/// Render a one-shot assistant reply the same way the legacy plain-text
+/// `--print`/`run` path always has: strip tool-call envelopes down to
+/// narration (surfacing "(no narration; see tool output above)" when there
+/// is none), then markdown-style it on a tty or write it plain otherwise.
+/// Shared by `.run`'s legacy branch and the `--resume`/`--continue --print`
+/// headless paths (sessions-storage-12) so all three render identically.
+fn renderOneShotText(allocator: std.mem.Allocator, stdout: anytype, body: []const u8) !void {
+    const assistant_render = @import("core/assistant_render.zig");
+    const cleaned = try assistant_render.cleanAssistantText(allocator, body);
+    defer allocator.free(cleaned);
+    const rendered = if (cleaned.len == 0) "(no narration; see tool output above)" else cleaned;
+    const repl_markdown = @import("cli/repl_markdown.zig");
+    if (std.c.isatty(std.Io.File.stdout().handle) != 0) {
+        try repl_markdown.writeStyledText(stdout, rendered, .{
+            .color_enabled = true,
+            .highlight_code_blocks = true,
+            .highlight_links = true,
+            .highlight_paths = true,
+            .color_lists = true,
+        });
+    } else {
+        try stdout.writeAll(rendered);
+    }
+    if (!std.mem.endsWith(u8, rendered, "\n")) try stdout.writeByte('\n');
+}
+
+/// sessions-storage-12: answer `prompt` against an already-resolved
+/// `session_id` in one headless shot (applying `--fork-session` first via
+/// `session_cmds.runResumePrint`) and render the result -- `--output-format
+/// json` as a single SDK `result` object (matching a brand-new `--print
+/// --output-format json` run), anything else as plain/markdown text
+/// (matching a brand-new plain `--print` run). `--output-format
+/// stream-json` and `--input-format stream-json` are not supported on the
+/// resume/continue path yet (building the full `system:init` line needs the
+/// same tool/MCP enumeration `sdk_headless.runTurn` does for a fresh
+/// session; left to a follow-on) and report a clear error instead of
+/// emitting the wrong shape.
+fn runResumeOrContinuePrint(
+    allocator: std.mem.Allocator,
+    opts: *cli.CliOptions,
+    cwd: []const u8,
+    cfg: *config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    prompt: []const u8,
+    auto_approve_high: bool,
+    yolo_mode: bool,
+    stdout: anytype,
+) !void {
+    const transport = sdk_headless.resolve(opts.output_format, opts.input_format) catch {
+        std.process.exit(2);
+    };
+    if (transport.output_format == .stream_json or transport.input_format != .text) {
+        try std_io.stderrWriter().writeAll(
+            "error: --resume/--continue --print does not yet support --output-format stream-json or --input-format stream-json.\n",
+        );
+        std.process.exit(2);
+    }
+
+    var result = try session_mgmt.session_cmds.runResumePrint(allocator, cwd, cfg, policy, audit, store, mcp, browser, session_id, prompt, auto_approve_high, opts.strict, yolo_mode, opts.fork_session, stdout);
+    defer session_mgmt.freeHeadlessResult(allocator, &result);
+
+    if (opts.no_session_persistence) sdk_headless.removeSessionArtifacts(allocator, store, result.session_id);
+
+    if (transport.output_format == .json) {
+        const uuid_mod = @import("core/uuid.zig");
+        result.uuid = try uuid_mod.allocV4(allocator);
+        defer allocator.free(result.uuid);
+        const line = try sdk_output.serializeResult(allocator, result, &.{});
+        defer allocator.free(line);
+        try stdout.writeAll(line);
+        if (!std.mem.endsWith(u8, line, "\n")) try stdout.writeByte('\n');
+        return;
+    }
+
+    try renderOneShotText(allocator, stdout, result.result_text);
 }
 
 /// sdk-headless LIVE wiring entry. Routes a `.run`/`.exec` invocation into the

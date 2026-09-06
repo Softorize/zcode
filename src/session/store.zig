@@ -322,6 +322,37 @@ pub const Store = struct {
         const parent_uuid = self.lastRecordUuid(path);
         defer if (parent_uuid) |p| self.allocator.free(p);
 
+        // sessions-storage-missed-201: re-stamp the sidecar-backed metadata
+        // fields onto EVERY summary record (this runs after every turn --
+        // see agent_runtime.zig's call site) so the sidecar-absent jsonl
+        // fallback in readLabel/readAiTitle/readTags/readMode/readColor/
+        // readPrLinks always has a value as-of the last turn, even when the
+        // sidecars themselves never make it along with the `.jsonl` (copied
+        // to another machine, or simply deleted). customTitle/aiTitle/tag
+        // mirror the reference's own field names; zcodeMode/zcodeColor/
+        // prLinks are zcode extensions (coordinator mode, the prompt-bar
+        // accent color, and a flat PR-link list have no reference
+        // equivalent) -- consistent with every other zcode-only field
+        // already on this record (facts/decisions/etc).
+        const custom_title = try self.readLabel(session_id);
+        defer if (custom_title) |v| self.allocator.free(v);
+        const ai_title = try self.readAiTitle(session_id);
+        defer if (ai_title) |v| self.allocator.free(v);
+        const zcode_mode = try self.readMode(session_id);
+        defer if (zcode_mode) |v| self.allocator.free(v);
+        const zcode_color = try self.readColor(session_id);
+        defer if (zcode_color) |v| self.allocator.free(v);
+
+        const tags = try self.readTags(session_id);
+        defer self.freeTags(tags);
+        const tag_joined = try std.mem.join(self.allocator, ",", tags);
+        defer self.allocator.free(tag_joined);
+
+        const pr_links = try self.readPrLinks(session_id);
+        defer self.freeTags(pr_links);
+        const pr_joined = try std.mem.join(self.allocator, ",", pr_links);
+        defer self.allocator.free(pr_joined);
+
         var record_buf = std_io.StringBuilder.init(self.allocator);
         defer record_buf.deinit();
 
@@ -349,6 +380,12 @@ pub const Store = struct {
             .activated_conditional_skills = snapshot.activated_conditional_skills,
             .origin_cwd = origin_cwd,
             .message_count_at_snapshot = snapshot.message_count_at_snapshot,
+            .customTitle = custom_title,
+            .aiTitle = ai_title,
+            .tag = tag_joined,
+            .zcodeMode = zcode_mode,
+            .zcodeColor = zcode_color,
+            .prLinks = pr_joined,
         }, .{})});
 
         try self.appendRecordLine(file, record_buf.items());
@@ -799,12 +836,19 @@ pub const Store = struct {
         self.allocator.free(tags);
     }
 
+    /// Read the tag list for `session_id`. Prefers the `.tags` sidecar; when
+    /// it is missing (sessions-storage-missed-201 -- a session predating the
+    /// sidecar, or a `.jsonl` copied elsewhere without it) falls back to the
+    /// comma-joined `tag` field `appendSnapshot` stamps onto every summary
+    /// record with the tags current as of that turn, mirroring the
+    /// reference's own `tag` field. Returns an empty slice when neither
+    /// source has any tags. Caller owns the result (free via `freeTags`).
     pub fn readTags(self: *Store, session_id: []const u8) ![][]u8 {
         const path = try self.tagsPath(session_id);
         defer self.allocator.free(path);
 
         const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, self.allocator, .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => return try self.allocator.alloc([]u8, 0),
+            error.FileNotFound => return self.tagsFromJsonlFallback(session_id),
             else => return err,
         };
         defer self.allocator.free(bytes);
@@ -817,6 +861,29 @@ pub const Store = struct {
         var it = std.mem.splitScalar(u8, bytes, '\n');
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            try out.append(try self.allocator.dupe(u8, trimmed));
+        }
+        return out.toOwnedSlice();
+    }
+
+    /// sessions-storage-missed-201: split the last record's comma-joined
+    /// `tag` field back into individual tags. Returns an empty slice (never
+    /// an error) when the session file is missing or has no `tag` field.
+    fn tagsFromJsonlFallback(self: *Store, session_id: []const u8) ![][]u8 {
+        const session_path = self.sessionPath(session_id) catch return try self.allocator.alloc([]u8, 0);
+        defer self.allocator.free(session_path);
+        const joined = self.lastRecordField(session_path, "tag") orelse return try self.allocator.alloc([]u8, 0);
+        defer self.allocator.free(joined);
+
+        var out = std.array_list.Managed([]u8).init(self.allocator);
+        errdefer {
+            for (out.items) |item| self.allocator.free(item);
+            out.deinit();
+        }
+        var it = std.mem.splitScalar(u8, joined, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
             if (trimmed.len == 0) continue;
             try out.append(try self.allocator.dupe(u8, trimmed));
         }
@@ -900,16 +967,24 @@ pub const Store = struct {
         return self.sidecarPath(session_id, ".label");
     }
 
-    /// Read the human-readable label for `session_id` from the
-    /// sidecar file `<sessions_dir>/<session_id>.label`. Returns
-    /// null when the sidecar is missing (common case -- sessions
-    /// start without a label). Caller owns the returned slice.
+    /// Read the human-readable label for `session_id`. Prefers the
+    /// `.label` sidecar file `<sessions_dir>/<session_id>.label`; when it is
+    /// missing (sessions-storage-missed-201 -- a session predating the
+    /// sidecar, or a `.jsonl` copied elsewhere without it) falls back to the
+    /// `customTitle` field `appendSnapshot` stamps onto every summary
+    /// record, mirroring the reference's own `customTitle` field. Returns
+    /// null when neither source has one (the common case -- sessions start
+    /// without a label). Caller owns the returned slice.
     pub fn readLabel(self: *Store, session_id: []const u8) !?[]u8 {
         const path = try self.labelPath(session_id);
         defer self.allocator.free(path);
 
         const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, self.allocator, .limited(1024)) catch |err| switch (err) {
-            error.FileNotFound => return null,
+            error.FileNotFound => {
+                const session_path = self.sessionPath(session_id) catch return null;
+                defer self.allocator.free(session_path);
+                return self.lastRecordField(session_path, "customTitle");
+            },
             else => return err,
         };
         // Trim trailing whitespace so a newline at the end of an
@@ -954,16 +1029,25 @@ pub const Store = struct {
         return self.sidecarPath(session_id, ".aititle");
     }
 
-    /// Read the AI-generated title for `session_id` from the sidecar file
-    /// `<sessions_dir>/<session_id>.aititle`. Returns null when the sidecar
-    /// is missing (common case -- a title is generated best-effort after the
-    /// first turn and may never exist offline). Caller owns the returned slice.
+    /// Read the AI-generated title for `session_id`. Prefers the
+    /// `.aititle` sidecar file `<sessions_dir>/<session_id>.aititle`; when
+    /// it is missing (sessions-storage-missed-201 -- predates the sidecar,
+    /// or a `.jsonl` copied elsewhere without it) falls back to the
+    /// `aiTitle` field `appendSnapshot` stamps onto every summary record,
+    /// mirroring the reference's own `aiTitle` field. Returns null when
+    /// neither source has one (common case -- a title is generated
+    /// best-effort after the first turn and may never exist offline).
+    /// Caller owns the returned slice.
     pub fn readAiTitle(self: *Store, session_id: []const u8) !?[]u8 {
         const path = try self.aiTitlePath(session_id);
         defer self.allocator.free(path);
 
         const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, self.allocator, .limited(1024)) catch |err| switch (err) {
-            error.FileNotFound => return null,
+            error.FileNotFound => {
+                const session_path = self.sessionPath(session_id) catch return null;
+                defer self.allocator.free(session_path);
+                return self.lastRecordField(session_path, "aiTitle");
+            },
             else => return err,
         };
         const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
@@ -1059,13 +1143,22 @@ pub const Store = struct {
     }
 
     /// Read the persisted session mode for `session_id` (e.g. "coordinator" or
-    /// "normal"). Returns null when the sidecar is missing (pre-feature, or a
-    /// session that never recorded a mode). Caller owns the returned slice.
-    /// Used by the resume path to reconcile coordinator mode (remote-server-01).
+    /// "normal"). Prefers the `.mode` sidecar; when it is missing
+    /// (sessions-storage-missed-201 -- pre-feature, a session that never
+    /// recorded a mode, or a `.jsonl` copied elsewhere without its sidecar)
+    /// falls back to the `zcodeMode` field `appendSnapshot` stamps onto
+    /// every summary record (a zcode extension -- coordinator mode has no
+    /// reference equivalent). Returns null when neither source has one.
+    /// Caller owns the returned slice. Used by the resume path to
+    /// reconcile coordinator mode (remote-server-01).
     pub fn readMode(self: *Store, session_id: []const u8) !?[]u8 {
         const path = try self.modePath(session_id);
         defer self.allocator.free(path);
-        return readTrimmedSidecar(self.allocator, path, 256);
+        if (try readTrimmedSidecar(self.allocator, path, 256)) |sidecar| return sidecar;
+
+        const session_path = self.sessionPath(session_id) catch return null;
+        defer self.allocator.free(session_path);
+        return self.lastRecordField(session_path, "zcodeMode");
     }
 
     /// Persist the session mode for `session_id`. Empty input deletes the
@@ -1084,12 +1177,21 @@ pub const Store = struct {
     }
 
     /// Read the persisted prompt-bar accent color for `session_id`
-    /// (commands-sweep-03). Returns null when the sidecar is missing
-    /// (default color). Caller owns the returned slice.
+    /// (commands-sweep-03). Prefers the `.color` sidecar; when it is
+    /// missing (sessions-storage-missed-201 -- a `.jsonl` copied elsewhere
+    /// without its sidecar) falls back to the `zcodeColor` field
+    /// `appendSnapshot` stamps onto every summary record (a zcode
+    /// extension -- the accent color has no reference equivalent). Returns
+    /// null when neither source has one (default color). Caller owns the
+    /// returned slice.
     pub fn readColor(self: *Store, session_id: []const u8) !?[]u8 {
         const path = try self.colorPath(session_id);
         defer self.allocator.free(path);
-        return readTrimmedSidecar(self.allocator, path, 64);
+        if (try readTrimmedSidecar(self.allocator, path, 64)) |sidecar| return sidecar;
+
+        const session_path = self.sessionPath(session_id) catch return null;
+        defer self.allocator.free(session_path);
+        return self.lastRecordField(session_path, "zcodeColor");
     }
 
     /// Persist the prompt-bar accent color for `session_id`. Empty input
@@ -1327,8 +1429,13 @@ pub const Store = struct {
         writeJsonlAtomic(self.allocator, path, out.items()) catch {};
     }
 
-    /// Read the PR links for `session_id` (one per line). Returns a
-    /// heap-allocated slice (possibly empty when the sidecar is missing).
+    /// Read the PR links for `session_id` (one per line). Prefers the
+    /// `.prlinks` sidecar; when it is missing (sessions-storage-missed-201
+    /// -- a `.jsonl` copied elsewhere without its sidecar) falls back to
+    /// the comma-joined `prLinks` field `appendSnapshot` stamps onto every
+    /// summary record (a zcode extension bundling what the reference keeps
+    /// as separate `prNumber`/`prRepository` fields). Returns a
+    /// heap-allocated slice (possibly empty when neither source has any).
     /// Callers ALWAYS pair the return with `freeTags` to keep ownership
     /// uniform (same shape/free rule as readTags).
     pub fn readPrLinks(self: *Store, session_id: []const u8) ![][]u8 {
@@ -1336,7 +1443,7 @@ pub const Store = struct {
         defer self.allocator.free(path);
 
         const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, path, self.allocator, .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => return try self.allocator.alloc([]u8, 0),
+            error.FileNotFound => return self.prLinksFromJsonlFallback(session_id),
             else => return err,
         };
         defer self.allocator.free(bytes);
@@ -1349,6 +1456,30 @@ pub const Store = struct {
         var it = std.mem.splitScalar(u8, bytes, '\n');
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            try out.append(try self.allocator.dupe(u8, trimmed));
+        }
+        return out.toOwnedSlice();
+    }
+
+    /// sessions-storage-missed-201: split the last record's comma-joined
+    /// `prLinks` field back into individual links. Returns an empty slice
+    /// (never an error) when the session file is missing or has no
+    /// `prLinks` field.
+    fn prLinksFromJsonlFallback(self: *Store, session_id: []const u8) ![][]u8 {
+        const session_path = self.sessionPath(session_id) catch return try self.allocator.alloc([]u8, 0);
+        defer self.allocator.free(session_path);
+        const joined = self.lastRecordField(session_path, "prLinks") orelse return try self.allocator.alloc([]u8, 0);
+        defer self.allocator.free(joined);
+
+        var out = std.array_list.Managed([]u8).init(self.allocator);
+        errdefer {
+            for (out.items) |item| self.allocator.free(item);
+            out.deinit();
+        }
+        var it = std.mem.splitScalar(u8, joined, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
             if (trimmed.len == 0) continue;
             try out.append(try self.allocator.dupe(u8, trimmed));
         }
@@ -3822,6 +3953,121 @@ test "readFirstPrompt prefers the .firstprompt sidecar over the jsonl fallback" 
     const fp = (try store.readFirstPrompt("sess-fp-sidecar")) orelse return error.TestUnexpectedResult;
     defer testing.allocator.free(fp);
     try testing.expectEqualStrings("a cached, edited preview", fp);
+}
+
+/// Mirrors the private `sidecarPath` builder so a test can delete a sidecar
+/// directly (simulating a `.jsonl` copied elsewhere without it) without
+/// needing store-internal access.
+fn sidecarPathForTest(allocator: std.mem.Allocator, store: *Store, session_id: []const u8, suffix: []const u8) ![]u8 {
+    const session_file = try store.sessionPath(session_id);
+    defer allocator.free(session_file);
+    const base = session_file[0 .. session_file.len - ".jsonl".len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
+}
+
+fn deleteSidecarForTest(allocator: std.mem.Allocator, store: *Store, session_id: []const u8, suffix: []const u8) !void {
+    const path = try sidecarPathForTest(allocator, store, session_id, suffix);
+    defer allocator.free(path);
+    std.Io.Dir.cwd().deleteFile(rt.io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+test "sessions-storage-missed-201: readLabel/readAiTitle/readTags/readMode/readColor/readPrLinks fall back to the jsonl summary record when their sidecars are absent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    const id = "sess-meta-fallback";
+    try store.appendTurn(id, .user, "hi", "");
+
+    // Set every sidecar, then write a summary record -- appendSnapshot
+    // re-stamps the CURRENT sidecar values onto the record it writes
+    // (sessions-storage-missed-201), so this is exactly what a real
+    // session accumulates as it runs.
+    try store.setLabel(id, "My Custom Title");
+    try store.setAiTitle(id, "An AI-Generated Title");
+    try store.setTags(id, &.{ "alpha", "beta" });
+    try store.setMode(id, "coordinator");
+    try store.setColor(id, "blue");
+    _ = try store.addPrLink(id, "https://github.com/acme/widget/pull/7");
+
+    const snapshot = emptySnapshot();
+    try store.appendSnapshot(id, &snapshot, "summary", "");
+
+    // Now simulate the `.jsonl` being copied elsewhere WITHOUT its
+    // sidecars: delete every one of them.
+    try deleteSidecarForTest(testing.allocator, &store, id, ".label");
+    try deleteSidecarForTest(testing.allocator, &store, id, ".aititle");
+    try deleteSidecarForTest(testing.allocator, &store, id, ".tags");
+    try deleteSidecarForTest(testing.allocator, &store, id, ".mode");
+    try deleteSidecarForTest(testing.allocator, &store, id, ".color");
+    try deleteSidecarForTest(testing.allocator, &store, id, ".prlinks");
+
+    const label = (try store.readLabel(id)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(label);
+    try testing.expectEqualStrings("My Custom Title", label);
+
+    const ai_title = (try store.readAiTitle(id)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(ai_title);
+    try testing.expectEqualStrings("An AI-Generated Title", ai_title);
+
+    const tags = try store.readTags(id);
+    defer store.freeTags(tags);
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("alpha", tags[0]);
+    try testing.expectEqualStrings("beta", tags[1]);
+
+    const mode = (try store.readMode(id)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(mode);
+    try testing.expectEqualStrings("coordinator", mode);
+
+    const color = (try store.readColor(id)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(color);
+    try testing.expectEqualStrings("blue", color);
+
+    const pr_links = try store.readPrLinks(id);
+    defer store.freeTags(pr_links);
+    try testing.expectEqual(@as(usize, 1), pr_links.len);
+    try testing.expectEqualStrings("https://github.com/acme/widget/pull/7", pr_links[0]);
+}
+
+test "sessions-storage-missed-201: readLabel/readTags prefer their sidecar over the jsonl fallback" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sessions_dir = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(sessions_dir);
+
+    var store = try Store.init(testing.allocator, sessions_dir, false);
+    defer store.deinit();
+
+    const id = "sess-meta-sidecar-wins";
+    try store.appendTurn(id, .user, "hi", "");
+    try store.setLabel(id, "stamped title");
+    try store.setTags(id, &.{"stamped-tag"});
+
+    const snapshot = emptySnapshot();
+    try store.appendSnapshot(id, &snapshot, "summary", "");
+
+    // Sidecars are updated AFTER the stamp -- the sidecar (fresher) must win
+    // over the jsonl's now-stale value, exactly like readBranch/
+    // readFirstPrompt's existing sidecar-wins precedent.
+    try store.setLabel(id, "fresher title");
+    try store.setTags(id, &.{"fresher-tag"});
+
+    const label = (try store.readLabel(id)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(label);
+    try testing.expectEqualStrings("fresher title", label);
+
+    const tags = try store.readTags(id);
+    defer store.freeTags(tags);
+    try testing.expectEqual(@as(usize, 1), tags.len);
+    try testing.expectEqualStrings("fresher-tag", tags[0]);
 }
 
 // ── sessions-storage-03: UUIDv4 session ids, sessions-storage-missed-202 ──

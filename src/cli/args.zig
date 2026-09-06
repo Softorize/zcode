@@ -1397,6 +1397,15 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
         return options;
     }
     if (options.command == .session_resume) {
+        // sessions-storage-12: a trailing positional after `--resume <id>`
+        // (or `--resume=<id>`) is a queued prompt for `--print`, exactly
+        // like `--continue`'s handling just above -- previously this was
+        // silently dropped (never assigned to options.prompt), so `zcode
+        // --resume <id> --print "<prompt>"` had no way to say what the
+        // resumed session should answer.
+        if (positional.items.len > 0) {
+            options.prompt = try parsePrompt(allocator, positional.items, &options);
+        }
         return options;
     }
 
@@ -3501,6 +3510,29 @@ test "parse -r with session id" {
 
     try testing.expect(opts.command == .session_resume);
     try testing.expectEqualStrings("abc123", opts.subject.?);
+}
+
+test "sessions-storage-12: --resume <id> --print <prompt> captures the queued prompt" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--resume", "abc123", "--fork-session", "--print", "third", "turn" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+
+    try testing.expect(opts.command == .session_resume);
+    try testing.expectEqualStrings("abc123", opts.subject.?);
+    try testing.expect(opts.fork_session);
+    try testing.expect(opts.print);
+    try testing.expectEqualStrings("third turn", opts.prompt.?);
+}
+
+test "parse --resume with session id and no trailing prompt leaves prompt null" {
+    const allocator = testing.allocator;
+    const argv = [_][]const u8{ "--resume", "abc123" };
+    var opts = try parse(allocator, argv[0..]);
+    defer opts.deinit(allocator);
+
+    try testing.expect(opts.command == .session_resume);
+    try testing.expect(opts.prompt == null);
 }
 
 // ── settings-05: --setting-sources scope filtering ─────────────────
