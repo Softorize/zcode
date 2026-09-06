@@ -18,6 +18,13 @@ const TRANSCRIPT_DIVIDER_PREFIX = "[[divider:";
 const TRANSCRIPT_DIVIDER_SUFFIX = "]]";
 const TRANSCRIPT_ASSISTANT_BLOCK_START = "[[assistant_block:start]]";
 const TRANSCRIPT_ASSISTANT_BLOCK_END = "[[assistant_block:end]]";
+// r4-transcript-01: mirrors the assistant-block markers above, but for the
+// user's own echoed prompt. Only emitted by appendInputLine when
+// `!options.ui_legacy_transcript`, so the render loop's `in_user_block`
+// state (and the hanging-indent renderer it enables) never activates for
+// legacy transcripts -- a legacy caller simply never appends this marker.
+const TRANSCRIPT_USER_BLOCK_START = "[[user_block:start]]";
+const TRANSCRIPT_USER_BLOCK_END = "[[user_block:end]]";
 const PROMPT_PLACEHOLDER = "Type a task or use / for commands";
 const FOOTER_SEGMENT_SEPARATOR = " \xe2\x88\x99 ";
 const BRIEF_ASSISTANT_BODY_ROWS: usize = 6;
@@ -32,6 +39,19 @@ const TranscriptDecorState = struct {
     in_assistant_block: bool = false,
     assistant_brief_rows_used: usize = 0,
     assistant_brief_hidden_rows: usize = 0,
+    /// r4-transcript-02: 0-based index of the content line currently being
+    /// rendered within the assistant block (reset at block start). Row 0
+    /// of line index 0 gets the "⏺ " bullet; every other row gets the
+    /// plain 2-space hanging indent.
+    assistant_line_index: usize = 0,
+    /// r4-transcript-01: same idea as `in_assistant_block` for the user's
+    /// own echoed prompt.
+    in_user_block: bool = false,
+    /// r4-transcript-01: 0-based index of the content line currently being
+    /// rendered within the user block (reset at block start). Row 0 of
+    /// line index 0 gets the "> " pointer; every other row gets the plain
+    /// 2-space hanging indent (multi-line prompts).
+    user_line_index: usize = 0,
 };
 
 // repl-ux-07: shared "Settings"-style sectioned panel for /status and
@@ -98,6 +118,14 @@ pub fn transcriptAssistantBlockEndMarker() []const u8 {
     return TRANSCRIPT_ASSISTANT_BLOCK_END;
 }
 
+pub fn transcriptUserBlockStartMarker() []const u8 {
+    return TRANSCRIPT_USER_BLOCK_START;
+}
+
+pub fn transcriptUserBlockEndMarker() []const u8 {
+    return TRANSCRIPT_USER_BLOCK_END;
+}
+
 fn parseTranscriptDividerLabel(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, TRANSCRIPT_DIVIDER_PREFIX)) return null;
     if (!std.mem.endsWith(u8, line, TRANSCRIPT_DIVIDER_SUFFIX)) return null;
@@ -113,6 +141,14 @@ fn isTranscriptAssistantBlockStart(line: []const u8) bool {
 
 fn isTranscriptAssistantBlockEnd(line: []const u8) bool {
     return std.mem.eql(u8, line, TRANSCRIPT_ASSISTANT_BLOCK_END);
+}
+
+fn isTranscriptUserBlockStart(line: []const u8) bool {
+    return std.mem.eql(u8, line, TRANSCRIPT_USER_BLOCK_START);
+}
+
+fn isTranscriptUserBlockEnd(line: []const u8) bool {
+    return std.mem.eql(u8, line, TRANSCRIPT_USER_BLOCK_END);
 }
 
 pub fn inputContentRows(input_text: []const u8, cols: usize) usize {
@@ -315,6 +351,25 @@ fn isCleanDensity(options: anytype) bool {
     return @hasField(@TypeOf(options), "ui_density") and options.ui_density == .clean;
 }
 
+/// r4-transcript-01/02: gates the reference's plain "> text" / "⏺ text"
+/// transcript rendering against zcode's older bordered "You"/"Assistant"
+/// card look. Mirrors `composerUsesLegacyChrome`'s convention: a missing
+/// field (the many anonymous option literals in this file's older tests)
+/// defaults to legacy=true so those tests keep asserting the pre-existing
+/// output, while the real `Options` struct defaults the field to false
+/// (config `ui_legacy_transcript`, default off) so a fresh session gets
+/// the new look without every caller opting in.
+fn isLegacyTranscript(options: anytype) bool {
+    return !@hasField(@TypeOf(options), "ui_legacy_transcript") or options.ui_legacy_transcript;
+}
+
+/// The assistant card's top/bottom border (and the old always-BOX_V rail)
+/// disappear whenever either the existing "clean" density opted out of
+/// them, or the new (non-legacy) transcript look is active.
+fn suppressAssistantBorder(options: anytype) bool {
+    return isCleanDensity(options) or !isLegacyTranscript(options);
+}
+
 /// Whether to wrap the full-screen redraw in DEC 2026 BSU/ESU. The REPL sets
 /// `enable_synchronized_output` once from `terminal_caps.isSynchronizedOutputSupported`
 /// so this hot render path does not re-read env per frame. Defaults to false
@@ -325,7 +380,23 @@ fn synchronizedOutputEnabled(options: anytype) bool {
 }
 
 fn assistantInnerWidthForOptions(cols: usize, options: anytype) usize {
+    // r4-transcript-02: the new (non-legacy) hanging-indent layout uses a
+    // fixed 2-column left gutter on every row (the "⏺ " bullet on the
+    // first, a plain 2-space indent on every other), so the wrappable
+    // text width is `cols - 2` regardless of ui_density. Legacy mode
+    // keeps its pre-existing full-width-in-clean-density / cols-2-in-a-
+    // bordered-card split.
+    if (!isLegacyTranscript(options)) return if (cols > 2) cols - 2 else 1;
     return if (isCleanDensity(options)) @max(@as(usize, 1), cols) else assistantCardInnerWidth(cols);
+}
+
+/// r4-transcript-01: matching width helper for the user's own echoed
+/// prompt block. Always `cols - 2` in the new layout (the "> " pointer on
+/// the first row, a plain 2-space indent otherwise) -- there is no legacy
+/// counterpart because `appendInputLine` only ever emits the user-block
+/// markers this width feeds when `!ui_legacy_transcript`.
+fn userInnerWidthForOptions(cols: usize) usize {
+    return if (cols > 2) cols - 2 else 1;
 }
 
 fn assistantVisibleRowsForLine(line: []const u8, cols: usize, decor_state: TranscriptDecorState, options: anytype) usize {
@@ -343,15 +414,21 @@ fn assistantHiddenRowsForLine(line: []const u8, cols: usize, decor_state: Transc
 
 fn visualRowsForTranscriptLineWithState(line: []const u8, cols: usize, decor_state: TranscriptDecorState, options: anytype) usize {
     if (parseTranscriptDividerLabel(line) != null) return 1;
-    if (isTranscriptAssistantBlockStart(line)) return if (isCleanDensity(options)) 0 else 1;
+    const suppress_card = suppressAssistantBorder(options);
+    if (isTranscriptAssistantBlockStart(line)) return if (suppress_card) 0 else 1;
     if (isTranscriptAssistantBlockEnd(line)) {
-        if (isCleanDensity(options)) {
+        if (suppress_card) {
             return if (isBriefMode(options) and decor_state.assistant_brief_hidden_rows > 0) 1 else 0;
         }
         if (isBriefMode(options) and decor_state.assistant_brief_hidden_rows > 0) return 2;
         return 1;
     }
+    // r4-transcript-01: the user-block markers never carry a border in
+    // either mode -- legacy callers simply never emit them (see
+    // appendInputLine), so there is no legacy-preserving branch to guard.
+    if (isTranscriptUserBlockStart(line) or isTranscriptUserBlockEnd(line)) return 0;
     if (decor_state.in_assistant_block) return assistantVisibleRowsForLine(line, cols, decor_state, options);
+    if (decor_state.in_user_block) return wrappedRowsForLine(line, userInnerWidthForOptions(cols));
     return wrappedRowsForLine(line, cols);
 }
 
@@ -364,17 +441,35 @@ fn advanceTranscriptDecorState(line: []const u8, cols: usize, decor_state: *Tran
         decor_state.in_assistant_block = true;
         decor_state.assistant_brief_rows_used = 0;
         decor_state.assistant_brief_hidden_rows = 0;
+        decor_state.assistant_line_index = 0;
         return;
     }
     if (isTranscriptAssistantBlockEnd(line)) {
         decor_state.in_assistant_block = false;
         decor_state.assistant_brief_rows_used = 0;
         decor_state.assistant_brief_hidden_rows = 0;
+        decor_state.assistant_line_index = 0;
         return;
     }
-    if (decor_state.in_assistant_block and isBriefMode(options)) {
-        decor_state.assistant_brief_hidden_rows += assistantHiddenRowsForLine(line, cols, decor_state.*, options);
-        decor_state.assistant_brief_rows_used += assistantVisibleRowsForLine(line, cols, decor_state.*, options);
+    if (isTranscriptUserBlockStart(line)) {
+        decor_state.in_user_block = true;
+        decor_state.user_line_index = 0;
+        return;
+    }
+    if (isTranscriptUserBlockEnd(line)) {
+        decor_state.in_user_block = false;
+        decor_state.user_line_index = 0;
+        return;
+    }
+    if (decor_state.in_assistant_block) {
+        if (isBriefMode(options)) {
+            decor_state.assistant_brief_hidden_rows += assistantHiddenRowsForLine(line, cols, decor_state.*, options);
+            decor_state.assistant_brief_rows_used += assistantVisibleRowsForLine(line, cols, decor_state.*, options);
+        }
+        decor_state.assistant_line_index += 1;
+    }
+    if (decor_state.in_user_block) {
+        decor_state.user_line_index += 1;
     }
 }
 
@@ -490,17 +585,33 @@ fn renderAssistantWrappedLineRows(
     kind: repl_markdown.LineRenderKind,
     state: *repl_markdown.MarkdownRenderState,
     options: anytype,
+    is_first_line: bool,
 ) !void {
     const use_color = repl_markdown.shouldUseColor(options);
     const width = assistantInnerWidthForOptions(cols, options);
     if (row_from >= row_to) return;
+    const hanging_indent = !isLegacyTranscript(options);
 
     var row_idx = row_from;
     while (row_idx < row_to) : (row_idx += 1) {
         // Codepoint-safe slice (see renderWrappedLineRows above).
         const chunk = utf8RowSlice(line, row_idx, width);
 
-        if (!isCleanDensity(options)) {
+        if (hanging_indent) {
+            // r4-transcript-02: AssistantTextMessage.tsx's layout -- a
+            // 2-column gutter holding the "⏺ " bullet only on the very
+            // first visible row of the whole block, a plain indent on
+            // every other row (wrapped continuations and later lines
+            // alike) so the markdown body reads as one hanging paragraph.
+            if (is_first_line and row_idx == 0) {
+                if (use_color) try writer.writeAll(repl_markdown.promptAnsi(options));
+                try writer.writeAll(figures.toolCallGlyph());
+                if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
+                try writer.writeByte(' ');
+            } else {
+                try writer.writeAll("  ");
+            }
+        } else if (!isCleanDensity(options)) {
             if (use_color) try writer.writeAll(repl_markdown.ANSI_DIM);
             try writer.writeAll(repl_markdown.BOX_V);
             if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
@@ -524,8 +635,50 @@ fn renderAssistantWrappedLineRows(
     }
 }
 
+/// r4-transcript-01: the user-turn counterpart of
+/// `renderAssistantWrappedLineRows` -- UserPromptMessage.tsx's "{pointer}
+/// {text}" line, with the same 2-column hanging-indent gutter (pointer on
+/// the very first row, a plain indent on every wrapped/continuation row).
+/// Deliberately bypasses `repl_markdown.writeStyledLine`'s markdown
+/// parsing: the raw echoed prompt is not markdown, and running it through
+/// the parser is what made a prompt starting with "> " misrender as a
+/// blockquote in the old renderer (the exact bug this gap replaces).
+fn renderUserWrappedLineRows(
+    writer: anytype,
+    line: []const u8,
+    cols: usize,
+    row_from: usize,
+    row_to: usize,
+    options: anytype,
+    is_first_line: bool,
+) !void {
+    if (row_from >= row_to) return;
+    const use_color = repl_markdown.shouldUseColor(options);
+    const width = userInnerWidthForOptions(cols);
+    const prompt_label: []const u8 = if (@hasField(@TypeOf(options), "prompt_label")) options.prompt_label else ">";
+
+    var row_idx = row_from;
+    while (row_idx < row_to) : (row_idx += 1) {
+        const chunk = utf8RowSlice(line, row_idx, width);
+
+        if (is_first_line and row_idx == 0) {
+            if (use_color) try writer.writeAll(repl_markdown.ANSI_DIM);
+            try writer.writeAll(prompt_label);
+            if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
+            try writer.writeByte(' ');
+        } else {
+            try writer.writeAll("  ");
+        }
+
+        var clean_buf: [8 * 1024]u8 = undefined;
+        const clean = repl_markdown.stripAnsiInto(&clean_buf, chunk);
+        try writer.writeAll(clean);
+        try writer.writeByte('\n');
+    }
+}
+
 fn writeAssistantCardBorder(writer: anytype, cols: usize, top: bool, options: anytype) !void {
-    if (isCleanDensity(options)) return;
+    if (suppressAssistantBorder(options)) return;
     const use_color = repl_markdown.shouldUseColor(options);
     if (cols <= 1) {
         if (use_color) try writer.writeAll(repl_markdown.ANSI_DIM);
@@ -548,7 +701,7 @@ fn writeAssistantBriefNotice(writer: anytype, cols: usize, hidden_rows: usize, o
     const use_color = repl_markdown.shouldUseColor(options);
     const width = assistantInnerWidthForOptions(cols, options);
 
-    if (!isCleanDensity(options)) {
+    if (!suppressAssistantBorder(options)) {
         if (use_color) try writer.writeAll(repl_markdown.ANSI_DIM);
         try writer.writeAll(repl_markdown.BOX_V);
         if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
@@ -576,14 +729,14 @@ fn renderAssistantEndRows(writer: anytype, cols: usize, row_from: usize, row_to:
             try writeAssistantBriefNotice(writer, cols, decor_state.assistant_brief_hidden_rows, options);
             try writer.writeByte('\n');
         }
-        if (!isCleanDensity(options) and row_to > 1) {
+        if (!suppressAssistantBorder(options) and row_to > 1) {
             try writeAssistantCardBorder(writer, cols, false, options);
             try writer.writeByte('\n');
         }
         return;
     }
 
-    if (isCleanDensity(options)) return;
+    if (suppressAssistantBorder(options)) return;
     try writeAssistantCardBorder(writer, cols, false, options);
     try writer.writeByte('\n');
 }
@@ -687,6 +840,9 @@ fn renderFullScreenInternal(
             const divider_label = parseTranscriptDividerLabel(line);
             const assistant_start = isTranscriptAssistantBlockStart(line);
             const assistant_end = isTranscriptAssistantBlockEnd(line);
+            const user_start = isTranscriptUserBlockStart(line);
+            const user_end = isTranscriptUserBlockEnd(line);
+            const is_structural = divider_label != null or assistant_start or assistant_end or user_start or user_end;
             const line_rows = visualRowsForTranscriptLineWithState(line, cols, decor_state, options);
             const line_start = row_cursor;
             const line_end = row_cursor + line_rows;
@@ -698,7 +854,13 @@ fn renderFullScreenInternal(
             const block_end = line_end + spacing_rows;
 
             if (block_end <= start_row) {
-                if (divider_label == null and !assistant_start and !assistant_end) {
+                // r4-transcript-01: also skip markdown-state tracking for
+                // the raw user-block content itself (not just its
+                // start/end markers) -- `renderUserWrappedLineRows` never
+                // parses it as markdown, so nothing should update
+                // `md_state` on its account either, matching how the
+                // structural marker lines are already excluded below.
+                if (!is_structural and !decor_state.in_user_block) {
                     repl_markdown.advanceMarkdownStateForLine(line, &md_state);
                 }
                 decor_state = next_decor_state;
@@ -722,17 +884,23 @@ fn renderFullScreenInternal(
                     }
                 } else if (assistant_end) {
                     try renderAssistantEndRows(writer, cols, row_from, row_to, decor_state, options);
+                } else if (user_start or user_end) {
+                    // r4-transcript-01: never a border in either mode
+                    // (see visualRowsForTranscriptLineWithState) -- these
+                    // markers only exist to flip in_user_block.
+                } else if (decor_state.in_user_block) {
+                    try renderUserWrappedLineRows(writer, line, cols, row_from, row_to, options, decor_state.user_line_index == 0);
                 } else {
                     const render_kind = repl_markdown.classifyLineRenderKind(line, &md_state);
                     if (decor_state.in_assistant_block) {
-                        try renderAssistantWrappedLineRows(writer, line, cols, row_from, row_to, render_kind, &md_state, options);
+                        try renderAssistantWrappedLineRows(writer, line, cols, row_from, row_to, render_kind, &md_state, options, decor_state.assistant_line_index == 0);
                     } else {
                         try renderWrappedLineRows(writer, line, cols, row_from, row_to, render_kind, &md_state, options);
                     }
                 }
             }
 
-            if (divider_label == null and !assistant_start and !assistant_end) {
+            if (!is_structural and !decor_state.in_user_block) {
                 repl_markdown.advanceMarkdownStateForLine(line, &md_state);
             }
             decor_state = next_decor_state;
@@ -798,7 +966,7 @@ fn renderFullScreenInternal(
 
     if (show_prompt) {
         // Place cursor at the input_cursor position within the rendered input
-        const cursor_pos = computeMultilineCursorPosition(options.prompt_label, actual_input, input_cursor, cols, input_rows);
+        const cursor_pos = computeMultilineCursorPosition(options.prompt_label, actual_input, input_cursor, cols, input_rows, composerUsesLegacyChrome(options));
         const target_row = input_first_row + cursor_pos.row;
         try writer.print("\x1b[{d};{d}H", .{ target_row, cursor_pos.col });
     }
@@ -1580,7 +1748,7 @@ const CursorPos = struct {
     col: usize,
 };
 
-fn computeMultilineCursorPosition(prompt_label: []const u8, input_text: []const u8, cursor_byte: usize, cols: usize, num_rows: usize) CursorPos {
+fn computeMultilineCursorPosition(prompt_label: []const u8, input_text: []const u8, cursor_byte: usize, cols: usize, num_rows: usize, legacy_chrome: bool) CursorPos {
     if (cols <= 4) return .{ .row = 0, .col = 1 };
     const content_max = cols - 4;
     var content_buf: [16 * 1024]u8 = undefined;
@@ -1624,7 +1792,13 @@ fn computeMultilineCursorPosition(prompt_label: []const u8, input_text: []const 
     }
     const skip = if (total_rows > num_rows) total_rows - num_rows else 0;
     const visible_row = if (row >= skip) row - skip else 0;
-    return .{ .row = visible_row, .col = 3 + col };
+    // r4-prompt-01: the legacy composer reserves 2 leading columns for
+    // "│ " before the content starts (1-indexed column 3); the reference
+    // layout has no left border, just the unconditional pad space
+    // renderMultiLineInput still writes before the content, so the
+    // content starts at column 1.
+    const col_offset: usize = if (legacy_chrome) 3 else 1;
+    return .{ .row = visible_row, .col = col_offset + col };
 }
 
 fn renderTopContextBar(writer: anytype, options: anytype, mode: anytype, cols: usize) !void {
@@ -1892,14 +2066,26 @@ pub fn renderStatusLine(writer: anytype, options: anytype, mode: anytype, offset
 }
 
 fn writeTranscriptDivider(writer: anytype, label: []const u8, cols: usize, options: anytype) !void {
+    const is_you = repl_markdown.containsIgnoreCase(label, "You");
+    const is_assistant = repl_markdown.containsIgnoreCase(label, "Assistant");
+
+    // r4-transcript-01/02: the reference has no divider/label row at all
+    // for the user's or the assistant's turn -- UserPromptMessage.tsx
+    // renders one "{pointer} {text}" line and AssistantTextMessage.tsx a
+    // "{bullet} {markdown}" line, neither with a role-name heading. This
+    // row still occupies its one visual row (see
+    // visualRowsForTranscriptLineWithState), which becomes the
+    // reference's `marginTop 1` blank line ahead of the turn.
+    if (!isLegacyTranscript(options) and (is_you or is_assistant)) return;
+
     const use_color = repl_markdown.shouldUseColor(options);
     const tone = dividerToneFromLabel(label);
 
     // Role-specific icons: keep the transcript scannable without
     // repeating the role name in noisy chrome.
-    const role_icon = if (repl_markdown.containsIgnoreCase(label, "You"))
+    const role_icon = if (is_you)
         "\xe2\x9d\xaf " // ❯
-    else if (repl_markdown.containsIgnoreCase(label, "Assistant"))
+    else if (is_assistant)
         figures.BLACK_DIAMOND ++ " "
     else
         "";
@@ -2319,16 +2505,31 @@ fn renderComposerBorder(writer: anytype, cols: usize, top: bool, mode: anytype, 
     if (cols < 4) return renderHorizontalBorder(writer, cols);
 
     const use_color = repl_markdown.shouldUseColor(options);
+    const use_legacy_labels = composerUsesLegacyChrome(options);
+
+    // r4-prompt-01: the reference's PromptInput draws `borderStyle="round"
+    // borderLeft={false} borderRight={false}` -- a full-width "─" rule
+    // with no corner glyphs, since there is no left/right edge left to
+    // connect them to. zcode's default (non-legacy) composer used to keep
+    // the rounded BOX_TL/BOX_TR corners at both ends even after dropping
+    // the embedded title/hint text, which still read as "a box" instead
+    // of "two plain rules". Render a bare BOX_H run instead.
+    if (!use_legacy_labels) {
+        if (use_color) try writer.writeAll(if (top) repl_markdown.promptAnsi(options) else repl_markdown.ANSI_DIM);
+        var plain_i: usize = 0;
+        while (plain_i < cols) : (plain_i += 1) try writer.writeAll(repl_markdown.BOX_H);
+        if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
+        return;
+    }
+
     const left = if (top) repl_markdown.BOX_TL else repl_markdown.BOX_BL;
     const right = if (top) repl_markdown.BOX_TR else repl_markdown.BOX_BR;
 
-    const use_legacy_labels = composerUsesLegacyChrome(options);
-
     var label_buf: [160]u8 = undefined;
     const mode_word = shortModeLabel(mode);
-    const label = if (!use_legacy_labels)
-        ""
-    else if (top)
+    // use_legacy_labels is always true past this point (see the early
+    // return above), so the label is always the legacy title/hint text.
+    const label = if (top)
         std.fmt.bufPrint(&label_buf, " ask zcode  {s} ", .{mode_word}) catch " ask zcode "
     else if (@hasField(@TypeOf(options), "ui_leader_key"))
         std.fmt.bufPrint(&label_buf, " Enter submit  Shift+Enter newline  ? shortcuts  {s} h palette ", .{options.ui_leader_key}) catch " Enter submit "
@@ -2616,8 +2817,8 @@ fn renderMultiLineInput(writer: anytype, prompt_label: []const u8, input_text: [
             try writer.writeAll(repl_markdown.ANSI_DIM);
             try writer.writeAll(repl_markdown.BOX_V);
             try writer.writeAll(repl_markdown.ANSI_RESET);
+            try writer.writeByte(' ');
         }
-        try writer.writeByte(' ');
 
         if (row < visible_count) {
             const row_info = visual_rows[row];
@@ -3973,6 +4174,33 @@ test "renderComposerBorder (default) draws a plain rule with no title or hint te
     try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), "? shortcuts") == null);
 }
 
+test "renderComposerBorder (default) draws a full-width rule with no corner glyphs (r4-prompt-01)" {
+    // Reference: PromptInput.tsx borderStyle="round" borderLeft={false}
+    // borderRight={false} -- with both side borders off there is no edge
+    // left to anchor a rounded corner to, so the rule is bare BOX_H run
+    // to run, not BOX_TL/.../BOX_TR.
+    var top_buf = std_io.StringBuilder.init(testing.allocator);
+    defer top_buf.deinit();
+    var bottom_buf = std_io.StringBuilder.init(testing.allocator);
+    defer bottom_buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+        .ui_leader_key = @as([]const u8, "ctrl+x"),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderComposerBorder(top_buf.writer(), 60, true, TestMode.execution, options);
+    try renderComposerBorder(bottom_buf.writer(), 60, false, TestMode.execution, options);
+
+    try testing.expect(std.mem.indexOf(u8, top_buf.items(), repl_markdown.BOX_TL) == null);
+    try testing.expect(std.mem.indexOf(u8, top_buf.items(), repl_markdown.BOX_TR) == null);
+    try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), repl_markdown.BOX_BL) == null);
+    try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), repl_markdown.BOX_BR) == null);
+    try testing.expectEqual(@as(usize, 60), std.mem.count(u8, top_buf.items(), repl_markdown.BOX_H));
+    try testing.expectEqual(@as(usize, 60), std.mem.count(u8, bottom_buf.items(), repl_markdown.BOX_H));
+}
+
 test "renderMultiLineInput (default) omits the left/right BOX_V pipes around the prompt content" {
     var buf = std_io.StringBuilder.init(testing.allocator);
     defer buf.deinit();
@@ -3987,6 +4215,24 @@ test "renderMultiLineInput (default) omits the left/right BOX_V pipes around the
     try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_V) == null);
     try testing.expect(std.mem.indexOf(u8, out, ">") != null);
     try testing.expect(std.mem.indexOf(u8, out, PROMPT_PLACEHOLDER) != null);
+}
+
+test "renderMultiLineInput (default) places the prompt at column 1, no leading pad space (r4-prompt-01)" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+    };
+    try renderMultiLineInput(buf.writer(), ">", "hello", 60, 1, 1, false, options);
+
+    const out = buf.items();
+    const marker = "\x1b[2K";
+    const start = (std.mem.indexOf(u8, out, marker) orelse return error.TestUnexpectedResult) + marker.len;
+    // The very next byte after the clear-line escape is the prompt
+    // character itself -- no pad space pushing it to column 2.
+    try testing.expectEqualStrings(">", out[start .. start + 1]);
 }
 
 test "renderMultiLineInput (legacy_footer=true) keeps the left/right BOX_V pipes" {
@@ -4223,4 +4469,236 @@ test "assistant transcript block wraps to inner width" {
         .transcript_line_spacing = @as(usize, 0),
     };
     try testing.expectEqual(@as(usize, 5), transcriptVisualRows(&transcript, 4, options));
+}
+
+// ── r4-transcript-01/02: reference-style transcript rendering ──
+
+test "renderFullScreen (r4-transcript-01) draws the user turn as one '> text' line, no card" {
+    var transcript = UiTranscript.init(testing.allocator, 100);
+    defer transcript.deinit(testing.allocator);
+
+    var divider_buf: [96]u8 = undefined;
+    try transcript.appendLine(testing.allocator, formatTranscriptDivider(divider_buf[0..], "You"));
+    try transcript.appendLine(testing.allocator, transcriptUserBlockStartMarker());
+    try transcript.appendLine(testing.allocator, "hello");
+    try transcript.appendLine(testing.allocator, transcriptUserBlockEndMarker());
+
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .prompt_label = @as([]const u8, ">"),
+        .app_version = @as([]const u8, "test"),
+        .status_provider = @as([]const u8, "test-provider"),
+        .status_model = @as([]const u8, "test-model"),
+        .status_workspace = @as([]const u8, "/tmp"),
+        .status_branch = @as([]const u8, "main"),
+        .status_model_context_window = @as(usize, 100_000),
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_workspace = true,
+        .status_show_model = true,
+        .status_show_safety = true,
+        .status_show_tokens = false,
+        .status_show_hint = true,
+        .yolo_mode = false,
+        .color_enabled = false,
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+        .enable_fullscreen = true,
+        .enable_alt_screen = false,
+        .enable_spinner = false,
+        .enable_thinking_summary = false,
+        .transcript_max_lines = @as(usize, 20_000),
+        .show_scroll_hint = true,
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .status_metrics_provider = null,
+        .status_identity_provider = null,
+        .initial_prompt = null,
+        .ui_legacy_transcript = false,
+        // Also opt the composer into its own non-legacy look (r4-prompt-01)
+        // so its border doesn't contribute a stray BOX_V/BOX_TL of its own
+        // to the assertions below -- this test is about the transcript,
+        // not the composer.
+        .legacy_footer = false,
+    };
+
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderFullScreen(buf.writer(), &transcript, false, "", 0, "", TestMode.execution, options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "> hello") != null);
+    // No card rail (U+2502/U+2503) and no role-name heading.
+    try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_V) == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\xe2\x94\x83") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "You") == null);
+}
+
+test "renderFullScreen (r4-transcript-01, legacy) keeps the bordered 'You' card" {
+    var transcript = UiTranscript.init(testing.allocator, 100);
+    defer transcript.deinit(testing.allocator);
+
+    var divider_buf: [96]u8 = undefined;
+    try transcript.appendLine(testing.allocator, formatTranscriptDivider(divider_buf[0..], "You"));
+    try transcript.appendLine(testing.allocator, "> hello");
+
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .prompt_label = @as([]const u8, ">"),
+        .app_version = @as([]const u8, "test"),
+        .status_provider = @as([]const u8, "test-provider"),
+        .status_model = @as([]const u8, "test-model"),
+        .status_workspace = @as([]const u8, "/tmp"),
+        .status_branch = @as([]const u8, "main"),
+        .status_model_context_window = @as(usize, 100_000),
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_workspace = true,
+        .status_show_model = true,
+        .status_show_safety = true,
+        .status_show_tokens = false,
+        .status_show_hint = true,
+        .yolo_mode = false,
+        .color_enabled = false,
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+        .enable_fullscreen = true,
+        .enable_alt_screen = false,
+        .enable_spinner = false,
+        .enable_thinking_summary = false,
+        .transcript_max_lines = @as(usize, 20_000),
+        .show_scroll_hint = true,
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .status_metrics_provider = null,
+        .status_identity_provider = null,
+        .initial_prompt = null,
+        .ui_legacy_transcript = true,
+    };
+
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderFullScreen(buf.writer(), &transcript, false, "", 0, "", TestMode.execution, options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "You") != null);
+}
+
+test "renderFullScreen (r4-transcript-02) draws the assistant turn as '<bullet> text', no box" {
+    var transcript = UiTranscript.init(testing.allocator, 100);
+    defer transcript.deinit(testing.allocator);
+
+    var divider_buf: [96]u8 = undefined;
+    try transcript.appendLine(testing.allocator, formatTranscriptDivider(divider_buf[0..], "Assistant"));
+    try transcript.appendLine(testing.allocator, transcriptAssistantBlockStartMarker());
+    try transcript.appendLine(testing.allocator, "Git status collected. No further tools needed.");
+    try transcript.appendLine(testing.allocator, transcriptAssistantBlockEndMarker());
+
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .prompt_label = @as([]const u8, ">"),
+        .app_version = @as([]const u8, "test"),
+        .status_provider = @as([]const u8, "test-provider"),
+        .status_model = @as([]const u8, "test-model"),
+        .status_workspace = @as([]const u8, "/tmp"),
+        .status_branch = @as([]const u8, "main"),
+        .status_model_context_window = @as(usize, 100_000),
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_workspace = true,
+        .status_show_model = true,
+        .status_show_safety = true,
+        .status_show_tokens = false,
+        .status_show_hint = true,
+        .yolo_mode = false,
+        .color_enabled = false,
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+        .enable_fullscreen = true,
+        .enable_alt_screen = false,
+        .enable_spinner = false,
+        .enable_thinking_summary = false,
+        .transcript_max_lines = @as(usize, 20_000),
+        .show_scroll_hint = true,
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .status_metrics_provider = null,
+        .status_identity_provider = null,
+        .initial_prompt = null,
+        .ui_legacy_transcript = false,
+        // See the r4-transcript-01 test above: keep the composer out of
+        // its own legacy look so its border glyphs can't contaminate the
+        // BOX_TL/BOX_BL absence assertions below.
+        .legacy_footer = false,
+    };
+
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderFullScreen(buf.writer(), &transcript, false, "", 0, "", TestMode.execution, options);
+
+    const out = buf.items();
+    var expected_buf: [96]u8 = undefined;
+    const expected = std.fmt.bufPrint(&expected_buf, "{s} Git status collected. No further tools needed.", .{figures.toolCallGlyph()}) catch unreachable;
+    try testing.expect(std.mem.indexOf(u8, out, expected) != null);
+    try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_TL) == null);
+    try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_BL) == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Assistant") == null);
+}
+
+test "renderAssistantWrappedLineRows (r4-transcript-02) indents a wrapped continuation by 2 spaces" {
+    var md_state = repl_markdown.MarkdownRenderState{};
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .color_enabled = false,
+        .ui_legacy_transcript = false,
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+    };
+    // cols=9 -> inner width 7 ("cols - 2"): row0 "one two", row1 "three".
+    try renderAssistantWrappedLineRows(buf.writer(), "one two three", 9, 0, 2, .plain, &md_state, options, true);
+
+    const out = buf.items();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    const first = lines.next() orelse return error.TestUnexpectedResult;
+    const second = lines.next() orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, first, figures.toolCallGlyph()));
+    try testing.expect(std.mem.startsWith(u8, second, "  "));
+    try testing.expect(!std.mem.startsWith(u8, second, figures.toolCallGlyph()));
+}
+
+test "renderUserWrappedLineRows (r4-transcript-01) draws the pointer only on the very first row" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .color_enabled = false,
+        .ui_legacy_transcript = false,
+        .prompt_label = @as([]const u8, ">"),
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+    };
+    // cols=9 -> inner width 7: row0 "hello w", row1 "orld".
+    try renderUserWrappedLineRows(buf.writer(), "hello world", 9, 0, 2, options, true);
+
+    const out = buf.items();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    const first = lines.next() orelse return error.TestUnexpectedResult;
+    const second = lines.next() orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("> hello w", first);
+    try testing.expectEqualStrings("  orld", second);
 }

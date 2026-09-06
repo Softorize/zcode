@@ -15,6 +15,7 @@ const repl_input = @import("repl_input.zig");
 const repl_quick_open = @import("repl_quick_open.zig");
 const repl_markdown = @import("repl_markdown.zig");
 const repl_spinner_mod = @import("repl_spinner.zig");
+const repl_help = @import("repl_help.zig");
 const fuzzy = @import("../core/parse_helpers.zig");
 
 // ── Overlay UI module ──
@@ -3238,6 +3239,178 @@ fn clearStylePickerOverlay(item_count: usize, bottom_margin_rows: usize) void {
         appendLiteral(&seq, &pos, "\x1b[2K");
     }
     appendLiteral(&seq, &pos, "\x1b8");
+    _ = std.c.write(std.Io.File.stdout().handle, (seq[0..pos]).ptr, (seq[0..pos]).len);
+}
+
+// ── /help dialog (r4-help-01) ──────────────────────────────────────────────
+// Reference: HelpV2.tsx -- a dialog titled "<product> v<version>" with tabs
+// general | commands | custom-commands (tab/shift+tab or arrows to switch,
+// up/down to scroll, esc to close). zcode's `/help` used to spill ~100
+// flat rows into the scrolling transcript instead.
+
+/// The three tabs of the /help overlay, in reference left-to-right order.
+/// `next`/`prev` wrap around so tab/shift+tab can cycle indefinitely.
+pub const HelpOverlayTab = enum {
+    general,
+    commands,
+    custom,
+
+    pub fn label(self: HelpOverlayTab) []const u8 {
+        return switch (self) {
+            .general => "general",
+            .commands => "commands",
+            .custom => "custom-commands",
+        };
+    }
+
+    pub fn next(self: HelpOverlayTab) HelpOverlayTab {
+        return switch (self) {
+            .general => .commands,
+            .commands => .custom,
+            .custom => .general,
+        };
+    }
+
+    pub fn prev(self: HelpOverlayTab) HelpOverlayTab {
+        return switch (self) {
+            .general => .custom,
+            .commands => .general,
+            .custom => .commands,
+        };
+    }
+};
+
+/// Pre-built content for all three tabs. The caller (repl.zig's `/help`
+/// handler) builds `command_lines`/`custom_lines` once from an arena
+/// before the loop starts -- disk I/O and command-catalog assembly
+/// happen once per `/help` invocation, not once per keystroke/redraw.
+pub const HelpOverlayData = struct {
+    app_name: []const u8,
+    app_version: []const u8,
+    general_lines: []const repl_help.HelpOverlayLine,
+    command_lines: []const repl_help.HelpOverlayLine,
+    custom_lines: []const repl_help.HelpOverlayLine,
+};
+
+fn helpOverlayLinesForTab(data: HelpOverlayData, tab: HelpOverlayTab) []const repl_help.HelpOverlayLine {
+    return switch (tab) {
+        .general => data.general_lines,
+        .commands => data.command_lines,
+        .custom => data.custom_lines,
+    };
+}
+
+/// Chrome rows consumed around the scrollable body: top border, title,
+/// tab bar, divider, footer, bottom border (6 total, none reserved as a
+/// blank margin -- the dialog fills essentially the whole terminal).
+fn helpOverlayBodyRows(rows: usize) usize {
+    return if (rows > 7) rows - 6 else 1;
+}
+
+fn helpOverlayTabBarText(buf: []u8, active: HelpOverlayTab) []const u8 {
+    var pos: usize = 0;
+    const tabs = [_]HelpOverlayTab{ .general, .commands, .custom };
+    for (tabs, 0..) |tab, i| {
+        if (i > 0) appendLiteral(buf, &pos, "   ");
+        if (tab == active) {
+            appendLiteral(buf, &pos, "[");
+            appendLiteral(buf, &pos, tab.label());
+            appendLiteral(buf, &pos, "]");
+        } else {
+            appendLiteral(buf, &pos, tab.label());
+        }
+    }
+    return buf[0..pos];
+}
+
+pub fn runHelpOverlayLoop(data: HelpOverlayData, bindings: ?*const keybindings.RuntimeKeybindings) !void {
+    const fd = std.Io.File.stdin().handle;
+    var active: HelpOverlayTab = .general;
+    var scroll: usize = 0;
+    const contexts = [_]keybindings.BindingContext{.Select};
+
+    while (true) {
+        const rows = terminalRows();
+        const cols = terminalCols();
+        const body_rows = helpOverlayBodyRows(rows);
+        const lines = helpOverlayLinesForTab(data, active);
+        const max_scroll = if (lines.len > body_rows) lines.len - body_rows else 0;
+        if (scroll > max_scroll) scroll = max_scroll;
+
+        renderHelpOverlay(data, active, scroll, rows, cols);
+
+        var chord_buf: [24]u8 = undefined;
+        const key = readPickerKey(fd, &chord_buf) catch {
+            _ = std.c.write(std.Io.File.stdout().handle, "\x1b[2J\x1b[H", 8);
+            return;
+        };
+        const ev = resolvePickerBinding(bindings, &contexts, key.chord, key.event);
+
+        switch (ev) {
+            .up => scroll = if (scroll > 0) scroll - 1 else 0,
+            .down => scroll = if (scroll < max_scroll) scroll + 1 else max_scroll,
+            .tab => {
+                active = active.next();
+                scroll = 0;
+            },
+            .shift_tab => {
+                active = active.prev();
+                scroll = 0;
+            },
+            .cancel, .select => {
+                _ = std.c.write(std.Io.File.stdout().handle, "\x1b[2J\x1b[H", 8);
+                return;
+            },
+            .toggle, .backspace, .char, .next, .none => {},
+        }
+    }
+}
+
+fn renderHelpOverlay(data: HelpOverlayData, active: HelpOverlayTab, scroll: usize, rows: usize, cols: usize) void {
+    const body_rows = helpOverlayBodyRows(rows);
+    const lines = helpOverlayLinesForTab(data, active);
+
+    var box_w: usize = if (cols < 40) 40 else if (cols > 100) 100 else cols;
+    if (box_w > cols) box_w = cols;
+    const inner = if (box_w > 2) box_w - 2 else 1;
+
+    var seq: [32768]u8 = undefined;
+    var pos: usize = 0;
+    appendLiteral(&seq, &pos, "\x1b[2J\x1b[H");
+
+    appendSimpleOverlayBorder(&seq, &pos, 1, inner);
+
+    var title_buf: [160]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, " {s} v{s}", .{ data.app_name, data.app_version }) catch data.app_name;
+    appendSimpleOverlayLine(&seq, &pos, 2, inner, title);
+
+    var tab_bar_buf: [96]u8 = undefined;
+    var tab_line_buf: [112]u8 = undefined;
+    const tab_bar = helpOverlayTabBarText(&tab_bar_buf, active);
+    const tab_line = std.fmt.bufPrint(&tab_line_buf, " {s}", .{tab_bar}) catch tab_bar;
+    appendSimpleOverlayLine(&seq, &pos, 3, inner, tab_line);
+
+    appendSimpleOverlayDivider(&seq, &pos, 4, inner);
+
+    var row: usize = 0;
+    while (row < body_rows) : (row += 1) {
+        const idx = scroll + row;
+        const text = if (idx < lines.len) lines[idx].text else "";
+        var row_buf: [512]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&row_buf, " {s}", .{text}) catch text;
+        appendSimpleOverlayLine(&seq, &pos, 5 + row, inner, rendered);
+    }
+
+    const footer_row = 5 + body_rows;
+    appendSimpleOverlayLine(
+        &seq,
+        &pos,
+        footer_row,
+        inner,
+        " tab / shift+tab switch tabs  \xe2\x80\xa2  \xe2\x86\x91/\xe2\x86\x93 scroll  \xe2\x80\xa2  esc to cancel",
+    );
+    appendSimpleOverlayBottomBorder(&seq, &pos, footer_row + 1, inner);
+
     _ = std.c.write(std.Io.File.stdout().handle, (seq[0..pos]).ptr, (seq[0..pos]).len);
 }
 
@@ -6625,6 +6798,42 @@ pub fn parsePlanAction(text: []const u8) ?PlanAction {
 // ── Tests ──
 
 const testing = std.testing;
+
+// ── r4-help-01: /help overlay tab model ──
+
+test "HelpOverlayTab.next cycles general -> commands -> custom -> general" {
+    try testing.expectEqual(HelpOverlayTab.commands, HelpOverlayTab.general.next());
+    try testing.expectEqual(HelpOverlayTab.custom, HelpOverlayTab.commands.next());
+    try testing.expectEqual(HelpOverlayTab.general, HelpOverlayTab.custom.next());
+}
+
+test "HelpOverlayTab.prev is the exact inverse of next" {
+    const tabs = [_]HelpOverlayTab{ .general, .commands, .custom };
+    for (tabs) |tab| {
+        try testing.expectEqual(tab, tab.next().prev());
+        try testing.expectEqual(tab, tab.prev().next());
+    }
+}
+
+test "HelpOverlayTab.label matches the reference's tab names" {
+    try testing.expectEqualStrings("general", HelpOverlayTab.general.label());
+    try testing.expectEqualStrings("commands", HelpOverlayTab.commands.label());
+    try testing.expectEqualStrings("custom-commands", HelpOverlayTab.custom.label());
+}
+
+test "helpOverlayBodyRows leaves room for the 6 chrome rows" {
+    try testing.expectEqual(@as(usize, 30), helpOverlayBodyRows(36));
+    try testing.expectEqual(@as(usize, 1), helpOverlayBodyRows(4));
+}
+
+test "helpOverlayTabBarText brackets only the active tab" {
+    var buf: [96]u8 = undefined;
+    const text = helpOverlayTabBarText(&buf, .commands);
+    try testing.expect(std.mem.indexOf(u8, text, "[commands]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "general") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[general]") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "custom-commands") != null);
+}
 
 test "applyModeCycles equals getNext applied N times" {
     // P3 (PRD #534): N Shift+Tab presses inside the approval overlay must land
