@@ -1247,7 +1247,11 @@ fn dispatch(
     allocator: std.mem.Allocator,
     opts: *cli.CliOptions,
     cwd: []const u8,
-    cfg: *const config_mod.Config,
+    // headless-sdk-missed-183: widened from `*const` to `*` (the caller's
+    // `&loaded_cfg.config` was always a mutable pointer to begin with) so
+    // runHeadlessDispatch can hand a genuinely mutable Config to
+    // sdk_headless.RunContext -- see that struct field's doc comment.
+    cfg: *config_mod.Config,
     policy: *policy_mod.Policy,
     audit: *logger_mod.AuditLogger,
     store: *session_store.Store,
@@ -1288,6 +1292,14 @@ fn dispatch(
             };
             const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, run_prompt, false, auto_approve_high, opts.strict, yolo_mode, opts.agent);
             defer allocator.free(one_shot.body);
+            defer allocator.free(one_shot.session_id);
+            // headless-sdk-02: `--no-session-persistence` used to be a silent
+            // no-op here -- this LEGACY plain-text `--print` path (no
+            // --output-format json|stream-json) never routed through
+            // sdk_headless.runOutput/removeSessionFile at all, so a session
+            // file (and its `.origin` sidecar) was always left behind despite
+            // the flag. Clean up the same way the SDK-transport path does.
+            if (opts.no_session_persistence) sdk_headless.removeSessionArtifacts(allocator, store, one_shot.session_id);
             // Clean tool-call envelopes out of the one-shot body so
             // `zcode run "..."` matches the REPL's rendering discipline
             // (pass 12). Leaves ordinary prose intact; returns empty
@@ -1334,6 +1346,9 @@ fn dispatch(
             };
             const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, exec_prompt, true, auto_approve_high, opts.strict, yolo_mode, opts.agent);
             defer allocator.free(one_shot.body);
+            defer allocator.free(one_shot.session_id);
+            // headless-sdk-02: see the identical comment in the .run branch above.
+            if (opts.no_session_persistence) sdk_headless.removeSessionArtifacts(allocator, store, one_shot.session_id);
             try stdout.writeAll(one_shot.body);
             if (!std.mem.endsWith(u8, one_shot.body, "\n")) try stdout.writeByte('\n');
             if (one_shot.strict_violation) {
@@ -1994,7 +2009,7 @@ fn runHeadlessDispatch(
     allocator: std.mem.Allocator,
     opts: *cli.CliOptions,
     cwd: []const u8,
-    cfg: *const config_mod.Config,
+    cfg: *config_mod.Config,
     policy: *policy_mod.Policy,
     audit: *logger_mod.AuditLogger,
     store: *session_store.Store,
@@ -2025,6 +2040,13 @@ fn runHeadlessDispatch(
         std.process.exit(2);
     };
 
+    // headless-sdk-15: --prompt-suggestions requires --print and
+    // --output-format=stream-json, matching the reference's own gate. Same
+    // print-equivalence reasoning as --forward-subagent-text above.
+    sdk_output.validatePromptSuggestionsGate(opts.print or opts.headless, transport.output_format, opts.prompt_suggestions) catch {
+        std.process.exit(2);
+    };
+
     const rc = sdk_headless.RunContext{
         .allocator = allocator,
         .cwd = cwd,
@@ -2046,6 +2068,8 @@ fn runHeadlessDispatch(
             .session_id_override = opts.session_id_override,
             .no_session_persistence = opts.no_session_persistence,
             .forward_subagent_text = opts.forward_subagent_text,
+            .prompt_suggestions = opts.prompt_suggestions,
+            .enable_auth_status = opts.enable_auth_status,
         },
     };
 

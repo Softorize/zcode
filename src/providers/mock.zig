@@ -60,6 +60,21 @@ fn listModels(ctx: *anyopaque, allocator: std.mem.Allocator) ![]types.ModelInfo 
     return out;
 }
 
+/// headless-sdk-missed-184: `ZCODE_MOCK_THINKING`, when set, becomes this
+/// response's `reasoning_text`. Lets a real, CLI-observable end-to-end run
+/// exercise the stream-json `thinking` content-block pipeline
+/// (sdk/output.zig's `.thinking` block, agent_runtime.zig's
+/// `thinkingForFinalText`) -- which, before this, could only be reached by
+/// an isolated agent_runtime unit test with a hand-built history, since NO
+/// provider adapter (mock included) had any way to inject mock thinking
+/// text at all. Absent -> "" (unchanged default behavior for every existing
+/// test/run that doesn't set it). Owned when non-empty, matching every
+/// `ModelResponse.reasoning_text` producer's ownership contract (callers
+/// `allocator.free` it when `.len > 0`).
+fn mockReasoningText(allocator: std.mem.Allocator) []const u8 {
+    return @import("../core/env.zig").getOwned(allocator, "ZCODE_MOCK_THINKING") catch "";
+}
+
 fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelRequest) !types.ModelResponse {
     const self: *MockAdapter = @ptrCast(@alignCast(ctx));
 
@@ -71,6 +86,7 @@ fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReque
             .text = try allocator.dupe(u8, response_text),
             .usage_input_tokens = tokenizer.estimateText("mock", request.model, request.prompt),
             .usage_output_tokens = tokenizer.estimateText("mock", request.model, response_text),
+            .reasoning_text = mockReasoningText(allocator),
         };
     }
 
@@ -80,6 +96,7 @@ fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReque
             .text = try allocator.dupe(u8, env_response),
             .usage_input_tokens = tokenizer.estimateText("mock", request.model, request.prompt),
             .usage_output_tokens = tokenizer.estimateText("mock", request.model, env_response),
+            .reasoning_text = mockReasoningText(allocator),
         };
     } else |_| {}
 
@@ -93,6 +110,7 @@ fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReque
         .text = try allocator.dupe(u8, response_text),
         .usage_input_tokens = tokenizer.estimateText("mock", request.model, request.prompt),
         .usage_output_tokens = tokenizer.estimateText("mock", request.model, response_text),
+        .reasoning_text = mockReasoningText(allocator),
     };
 }
 
@@ -248,6 +266,45 @@ test "mock send honors ZCODE_MOCK_RESPONSE for a fixed canned reply" {
     defer alloc.free(response.raw);
     defer alloc.free(response.text);
     try testing.expectEqualStrings("canned reply for a deterministic test", response.text);
+}
+
+test "headless-sdk-missed-184: mock send honors ZCODE_MOCK_THINKING as reasoning_text" {
+    env.setOverride("ZCODE_MOCK_RESPONSE", "canned reply for a deterministic test") catch unreachable;
+    env.setOverride("ZCODE_MOCK_THINKING", "reasoning through the deterministic test") catch unreachable;
+    defer env.clearOverrides();
+
+    const alloc = testing.allocator;
+    var p = try create(alloc, .{ .name = "mock", .api_key = null, .base_url = null });
+    defer p.deinit(alloc);
+
+    const response = try p.send(alloc, .{
+        .model = "mock-agent",
+        .prompt = "anything at all",
+        .max_output_tokens = 64,
+    });
+    defer alloc.free(response.raw);
+    defer alloc.free(response.text);
+    defer if (response.reasoning_text.len > 0) alloc.free(response.reasoning_text);
+    try testing.expectEqualStrings("canned reply for a deterministic test", response.text);
+    try testing.expectEqualStrings("reasoning through the deterministic test", response.reasoning_text);
+}
+
+test "headless-sdk-missed-184: mock send reasoning_text is empty when ZCODE_MOCK_THINKING is unset" {
+    env.setOverride("ZCODE_MOCK_RESPONSE", "canned reply, no thinking") catch unreachable;
+    defer env.clearOverrides();
+
+    const alloc = testing.allocator;
+    var p = try create(alloc, .{ .name = "mock", .api_key = null, .base_url = null });
+    defer p.deinit(alloc);
+
+    const response = try p.send(alloc, .{
+        .model = "mock-agent",
+        .prompt = "anything at all",
+        .max_output_tokens = 64,
+    });
+    defer alloc.free(response.raw);
+    defer alloc.free(response.text);
+    try testing.expectEqual(@as(usize, 0), response.reasoning_text.len);
 }
 
 test "mock send cycles through ZCODE_MOCK_RESPONSES and holds the last entry" {

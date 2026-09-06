@@ -59,15 +59,26 @@ pub const ControlSubtype = enum {
     /// / headless.zig's `.mcp_status` branch.
     mcp_status,
     /// headless-sdk-11: "Rewinds file changes made since a specific user
-    /// message." Recognized (distinguishable from a truly unsupported
-    /// subtype in logs/metrics) but NOT YET actually wired to zcode's
-    /// checkpoint/undo mechanism -- that lives in session_cmds.zig /
-    /// session_mgmt.zig, keyed by session id + a user-supplied label, not by
-    /// the reference's `user_message_id`, and reconciling the two keying
-    /// schemes is a bigger design task than this package's scope. Answered
-    /// with an error response (see the dispatcher), same as `.unsupported`,
-    /// but the subtype itself is no longer silently misclassified.
+    /// message." Wired to zcode's REAL checkpoint/undo mechanism --
+    /// `AgentRuntime.restoreCheckpoint` / `History.truncateFrom`, the same
+    /// primitives repl_commands.zig's own code-restoring `/rewind` calls --
+    /// keyed by resolving `user_message_id` against `HistoryTurn.uuid` (see
+    /// headless.zig's `.rewind_files` branch / `handleRewindFiles`).
     rewind_files,
+    /// headless-sdk-11: "Carries one MCP JSON-RPC message for an SDK-hosted
+    /// MCP server (one named in initialize.sdkMcpServers or added later with
+    /// mcp_set_servers)." Recognized (distinguishable from a truly
+    /// unsupported subtype in logs/metrics -- an improvement over its prior
+    /// total absence from this enum) but NOT YET functional: zcode has no
+    /// "SDK-hosted MCP server" concept at all (a server the SDK HOST runs
+    /// in-process, with the CLI proxying JSON-RPC frames to it via this
+    /// control_request) -- `missed-183`'s `registerSdkMcpServersFn` only
+    /// stores the registered NAMES for visibility, there is nothing to
+    /// proxy a message TO. This is a deliberate, documented deferral (the
+    /// gap's own proposed_change flagged it as needing its own design pass),
+    /// not an oversight -- unlike rewind_files above, it is answered with an
+    /// error response, same as `.unsupported`.
+    mcp_message,
     unsupported,
 
     pub fn toString(self: ControlSubtype) []const u8 {
@@ -82,6 +93,7 @@ pub const ControlSubtype = enum {
             .elicitation => "elicitation",
             .mcp_status => "mcp_status",
             .rewind_files => "rewind_files",
+            .mcp_message => "mcp_message",
             .unsupported => "unsupported",
         };
     }
@@ -99,6 +111,7 @@ pub const ControlSubtype = enum {
         if (std.mem.eql(u8, s, "elicitation")) return .elicitation;
         if (std.mem.eql(u8, s, "mcp_status")) return .mcp_status;
         if (std.mem.eql(u8, s, "rewind_files")) return .rewind_files;
+        if (std.mem.eql(u8, s, "mcp_message")) return .mcp_message;
         return .unsupported;
     }
 };
@@ -112,6 +125,45 @@ pub const ControlSubtype = enum {
 /// returned slice.
 pub fn buildMcpStatusResponse(allocator: std.mem.Allocator, servers_json: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"mcpServers\":{s}}}", .{if (servers_json.len > 0) servers_json else "[]"});
+}
+
+/// The two fields the reference's `rewind_files` request schema declares:
+/// `user_message_id` (required) and `dry_run` (optional, default false).
+/// Parsed straight off the raw inner request like the other live-control
+/// fields in this file.
+pub const RewindFilesRequest = struct {
+    user_message_id: ?[]const u8,
+    dry_run: bool,
+};
+
+/// Parse a `rewind_files` control_request's raw inner request into its two
+/// fields (headless-sdk-11). `user_message_id` is null when absent/malformed
+/// -- the caller (headless.zig) turns that into a "missing user_message_id"
+/// error response, matching every other required-field check in this file.
+pub fn parseRewindFilesRequest(raw: []const u8) RewindFilesRequest {
+    return .{
+        .user_message_id = parseStringField(raw, "user_message_id"),
+        .dry_run = parseBoolField(raw, "dry_run") orelse false,
+    };
+}
+
+/// Build the inner `rewind_files` success response body as raw JSON:
+/// `{"message":"...","dry_run":bool}` (headless-sdk-11). The extracted
+/// strings dump (cc_strings.txt) preserves the reference's DESCRIBE text
+/// ("Result of a rewindFiles operation.") and one of its message fragments
+/// ("Files rewound to state at message ") but not the surrounding object literal
+/// source, so the exact reference field name for this response is not
+/// independently confirmed -- `message` is a documented, reasonable
+/// approximation carrying that same confirmed text. Caller owns the
+/// returned slice.
+pub fn buildRewindFilesResponse(allocator: std.mem.Allocator, message: []const u8, dry_run: bool) ![]u8 {
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"message\":");
+    try writeJsonString(w, message);
+    try w.print(",\"dry_run\":{}}}", .{dry_run});
+    return allocator.dupe(u8, out.items());
 }
 
 /// Dispatch an `mcp_status` control_request: build the success
@@ -1168,7 +1220,7 @@ test "ControlSubtype round-trips through strings; unknown maps to unsupported" {
     const all = [_]ControlSubtype{
         .interrupt,   .can_use_tool,            .initialize,     .set_permission_mode,
         .set_model,   .set_max_thinking_tokens, .hook_callback,  .elicitation,
-        .mcp_status,  .rewind_files,
+        .mcp_status,  .rewind_files,           .mcp_message,
     };
     for (all) |s| {
         try testing.expectEqual(s, ControlSubtype.fromString(s.toString()));
@@ -1194,6 +1246,33 @@ test "buildMcpStatusResponse: empty input defaults to an empty array" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 0), parsed.value.object.get("mcpServers").?.array.items.len);
+}
+
+test "parseRewindFilesRequest: parses user_message_id and dry_run" {
+    const req = parseRewindFilesRequest("{\"subtype\":\"rewind_files\",\"user_message_id\":\"u-1\",\"dry_run\":true}");
+    try testing.expectEqualStrings("u-1", req.user_message_id.?);
+    try testing.expect(req.dry_run);
+}
+
+test "parseRewindFilesRequest: dry_run defaults to false when absent" {
+    const req = parseRewindFilesRequest("{\"subtype\":\"rewind_files\",\"user_message_id\":\"u-1\"}");
+    try testing.expectEqualStrings("u-1", req.user_message_id.?);
+    try testing.expect(!req.dry_run);
+}
+
+test "parseRewindFilesRequest: missing user_message_id is null" {
+    const req = parseRewindFilesRequest("{\"subtype\":\"rewind_files\"}");
+    try testing.expect(req.user_message_id == null);
+}
+
+test "buildRewindFilesResponse: carries the message and dry_run flag" {
+    const allocator = testing.allocator;
+    const body = try buildRewindFilesResponse(allocator, "Files rewound to state at message u-1.", false);
+    defer allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Files rewound to state at message u-1.", parsed.value.object.get("message").?.string);
+    try testing.expect(!parsed.value.object.get("dry_run").?.bool);
 }
 
 test "dispatchMcpStatus: encodes a success control_response carrying mcpServers" {

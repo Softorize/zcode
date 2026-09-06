@@ -205,6 +205,13 @@ pub const TurnResult = struct {
 pub const OneShotOutput = struct {
     body: []u8,
     strict_violation: bool,
+    /// headless-sdk-02: the session id the turn actually ran under, duped out
+    /// before the owning `AgentRuntime` is torn down (which frees its own
+    /// copy). Lets a caller honor `--no-session-persistence` on the LEGACY
+    /// (non-SDK-transport) `--print`/`run`/`exec` path, where no `RunContext`
+    /// is ever built -- see `sdk_headless.removeSessionArtifacts`. Callers
+    /// that don't need it still own it and must free it like `body`.
+    session_id: []u8,
 };
 
 pub const TokenStatus = struct {

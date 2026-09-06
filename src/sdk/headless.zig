@@ -57,6 +57,7 @@ const tool_schemas = @import("../tools/tool_schemas.zig");
 const uuid_mod = @import("../core/uuid.zig");
 const plugins_mod = @import("../core/plugins.zig");
 const permission_decision_mod = @import("../core/permission_decision.zig");
+const approval_mod = @import("../core/approval.zig");
 const env_mod = @import("../core/env.zig");
 const args_json = @import("args_json.zig");
 const skills_mod = @import("../core/skills.zig");
@@ -124,6 +125,21 @@ pub const RunCaps = struct {
     /// --output-format=stream-json) by
     /// `sdk_output.validateForwardSubagentTextGate` before a run starts.
     forward_subagent_text: bool = false,
+    /// headless-sdk-15: `--prompt-suggestions`. When true, a
+    /// `prompt_suggestion` NDJSON line is emitted after each turn's `result`
+    /// line in stream-json output -- see `maybeEmitPromptSuggestion`.
+    /// Validated (requires --print and --output-format=stream-json) by
+    /// `sdk_output.validatePromptSuggestionsGate` before a run starts.
+    prompt_suggestions: bool = false,
+    /// headless-sdk-missed-185: `--enable-auth-status` (hidden). When true,
+    /// a real `auth_status` message is emitted once at session start
+    /// (stream-json output only), reflecting the session's ACTUAL resolved
+    /// credential source (the same check `system:init.apiKeySource` already
+    /// uses) -- see `maybeEmitAuthStatus`. Previously this flag parsed and
+    /// the message serializer existed, but no call site anywhere ever
+    /// invoked it, so no real invocation could ever produce an `auth_status`
+    /// message regardless of the flag.
+    enable_auth_status: bool = false,
 };
 
 /// Everything a headless turn needs that is not part of the transport: the
@@ -132,7 +148,20 @@ pub const RunCaps = struct {
 pub const RunContext = struct {
     allocator: std.mem.Allocator,
     cwd: []const u8,
-    cfg: *const config_mod.Config,
+    /// headless-sdk-missed-183: MUTABLE (not `*const`) on purpose. main.zig
+    /// owns exactly one live `Config` value for the whole process and every
+    /// reader downstream (prompt_engine.zig, prompt_helpers.zig,
+    /// agent_runtime.zig) already borrows a pointer to that SAME storage --
+    /// widening this field from `*const` to `*` is what lets an
+    /// `initialize` control_request's `systemPrompt`/`appendSystemPrompt`
+    /// fields (applierSetSystemPrompt/applierSetAppendSystemPrompt) mutate
+    /// `cfg.system_prompt_override`/`cfg.append_system_prompt` -- the EXACT
+    /// same fields `--system-prompt`/`--append-system-prompt` already write
+    /// -- and have that change take effect on the session's NEXT turn, the
+    /// same "late injection" the reference's initialize handshake promises.
+    /// Every other reader in this file only ever reads through it, so this
+    /// is a pure widening: nothing that used to require `*const` breaks.
+    cfg: *config_mod.Config,
     policy: *policy_mod.Policy,
     audit: *logger_mod.AuditLogger,
     store: *session_store.Store,
@@ -180,6 +209,14 @@ fn freeToolEvents(allocator: std.mem.Allocator, events: []ToolEvent) void {
     for (events) |*e| e.deinit(allocator);
     allocator.free(events);
 }
+
+/// headless-sdk-11 (`rewind_files`): one entry in `StreamSession.
+/// known_user_messages` -- see that field's doc comment for why this
+/// mapping exists.
+const UserMessageRecord = struct {
+    message_uuid: []u8,
+    history_index: usize,
+};
 
 /// Free a slice of owned (duped) strings plus the slice itself. Used for the
 /// small string lists an `initialize` control_request registers
@@ -370,6 +407,54 @@ fn buildPermissionDenials(
     return out.toOwnedSlice(allocator);
 }
 
+/// headless-sdk-15 (`--prompt-suggestions`): a genuine, deterministic guess at
+/// the user's next prompt, derived from what actually happened in the turn
+/// that just finished -- never a fixed placeholder repeated regardless of
+/// input. This is a text heuristic, not an extra model call (see
+/// `output.serializePromptSuggestion`'s doc comment on why a full prediction
+/// call was judged not worth shipping half-built): it reads the turn's real
+/// tool events and final text, in priority order:
+///
+///   1. Any tool call failed -> ask to fix the error.
+///   2. Any tool call touched a file (Write/Edit/MultiEdit/NotebookEdit,
+///      via the same `approval_mod.isEditTool` classifier the permission
+///      gate itself uses) -> ask to verify the change.
+///   3. Any other tool ran (a read, a shell command, ...) -> ask what's next.
+///   4. The assistant's own final text reads as a question (ends in "?")
+///      -> answer it in the affirmative.
+///   5. Otherwise -> a generic "what's next" fallback.
+fn derivePromptSuggestion(result_text: []const u8, tool_events: []const ToolEvent) []const u8 {
+    for (tool_events) |ev| {
+        if (ev.is_error) return "Can you fix the error from the last command and try again?";
+    }
+    for (tool_events) |ev| {
+        if (approval_mod.isEditTool(ev.name)) return "Can you run the tests to confirm that change works?";
+    }
+    if (tool_events.len > 0) return "What should we do next?";
+    const trimmed = std.mem.trim(u8, result_text, " \t\r\n");
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '?') return "Yes, please go ahead.";
+    return "What should we do next?";
+}
+
+/// Build the `prompt_suggestion` NDJSON line for the turn that just finished,
+/// or `null` when `enabled` is false (the common case -- the flag defaults
+/// off). Shared by both the one-shot `runOutput` path and the persistent
+/// `StreamSession` path so the heuristic and wire format stay in one place.
+/// Caller frees the returned slice.
+fn buildPromptSuggestionLine(
+    allocator: std.mem.Allocator,
+    enabled: bool,
+    session_id: []const u8,
+    result_text: []const u8,
+    tool_events: []const ToolEvent,
+) !?[]u8 {
+    if (!enabled) return null;
+    const suggestion = derivePromptSuggestion(result_text, tool_events);
+    const line_uuid = try uuid_mod.allocV4(allocator);
+    defer allocator.free(line_uuid);
+    return try output.serializePromptSuggestion(allocator, suggestion, session_id, line_uuid);
+}
+
 /// The full outcome of one headless turn: the SDK `result` shape plus the
 /// per-tool-call events a stream-json caller replays as `tool_use`/
 /// `tool_result` message pairs before the final result line.
@@ -512,20 +597,49 @@ pub fn freeResult(allocator: std.mem.Allocator, result: *output.Result) void {
 }
 
 /// headless-sdk-02 (`--no-session-persistence`): remove the on-disk session
-/// file for `session_id` so the run leaves nothing behind. This is a
-/// best-effort write-then-remove -- the actual per-turn append happens deep
-/// inside agent_history.zig (outside this package's ownership), so
-/// "persistence" cannot be prevented at the source without a larger
-/// cross-package change. Deleting the file once the turn is done achieves the
-/// reference's observable contract (`--no-session-persistence ... sessions
-/// will not be saved to disk and cannot be resumed`) all the same. A missing
-/// file (nothing was ever written, e.g. an error before the first append) or
-/// any other filesystem error is silently ignored -- this is strictly a
+/// file (and its `.origin` sidecar -- see `removeSessionArtifacts`) for
+/// `session_id` so the run leaves nothing behind. This is a best-effort
+/// write-then-remove -- the actual per-turn append happens deep inside
+/// agent_history.zig (outside this package's ownership), so "persistence"
+/// cannot be prevented at the source without a larger cross-package change.
+/// Deleting the files once the turn is done achieves the reference's
+/// observable contract (`--no-session-persistence ... sessions will not be
+/// saved to disk and cannot be resumed`) all the same. A missing file
+/// (nothing was ever written, e.g. an error before the first append) or any
+/// other filesystem error is silently ignored -- this is strictly a
 /// best-effort cleanup, never a reason to fail the turn that already ran.
 fn removeSessionFile(rc: RunContext, session_id: []const u8) void {
-    const path = rc.store.sessionPath(session_id) catch return;
-    defer rc.allocator.free(path);
+    removeSessionArtifacts(rc.allocator, rc.store, session_id);
+}
+
+/// headless-sdk-02: shared implementation of the on-disk cleanup above,
+/// exposed as a free function (rather than only the `RunContext`-shaped
+/// `removeSessionFile`) so the LEGACY, non-SDK-transport `--print`/`run`/
+/// `exec` path in main.zig -- which never builds a `RunContext` -- can honor
+/// `--no-session-persistence` too instead of silently ignoring it (the flag
+/// used to be a no-op for a plain-text `--print "hi"` with no
+/// `--output-format json|stream-json`, since that path never reached
+/// `runOutput`/`removeSessionFile` at all).
+///
+/// Removes both the `<id>.jsonl` transcript AND the `<id>.origin` breadcrumb
+/// sidecar (`session/store.zig`'s `sidecarPath` derives the latter by
+/// stripping the `.jsonl` suffix off `sessionPath()`'s result and appending
+/// `.origin`; that derivation is duplicated here rather than exposing
+/// `sidecarPath` itself, since store.zig is owned by wp7 and this needs no
+/// new surface there). Leaving the `.origin` sidecar behind after deleting
+/// the transcript would still let a picker/resume flow discover the session
+/// existed, which defeats "leaves no session file behind".
+pub fn removeSessionArtifacts(allocator: std.mem.Allocator, store: *session_store.Store, session_id: []const u8) void {
+    const path = store.sessionPath(session_id) catch return;
+    defer allocator.free(path);
     std.Io.Dir.cwd().deleteFile(rt.io, path) catch {};
+
+    if (std.mem.endsWith(u8, path, ".jsonl")) {
+        const base = path[0 .. path.len - ".jsonl".len];
+        const origin_path = std.fmt.allocPrint(allocator, "{s}.origin", .{base}) catch return;
+        defer allocator.free(origin_path);
+        std.Io.Dir.cwd().deleteFile(rt.io, origin_path) catch {};
+    }
 }
 
 /// Credential source for `system:init.apiKeySource` (headless-sdk-03), mapped
@@ -539,6 +653,37 @@ fn apiKeySource() []const u8 {
         if (v.len > 0) return "ANTHROPIC_API_KEY";
     }
     return "none";
+}
+
+/// headless-sdk-missed-185 (`--enable-auth-status`): emit a real `auth_status`
+/// message once at session start (stream-json output only), reflecting the
+/// session's ACTUAL resolved credential state (`apiKeySource()` above -- the
+/// exact same check `system:init.apiKeySource` uses, never a fabrication).
+///
+/// Scope, stated honestly: this is NOT the reference's full "live OAuth
+/// device-code progress" story (`isAuthenticating` transitioning true->false
+/// mid-session) -- zcode's headless `--print` path has no interactive
+/// auth-flow concept to report progress FROM in the first place (`zcode
+/// login`'s OAuth/API-key flows are a wholly separate, always-interactive
+/// subcommand, never combined with `--print`/`--output-format`). What IS
+/// real and newly wired: a host that sets `--enable-auth-status` now
+/// actually receives a genuine `auth_status` message for every headless run
+/// instead of the flag being accepted and then producing no observable
+/// message at all, regardless of the flag, forever.
+fn maybeEmitAuthStatus(allocator: std.mem.Allocator, enabled: bool, session_id: []const u8, writer: anytype) !void {
+    if (!enabled) return;
+    const source = apiKeySource();
+    const line_text = if (std.mem.eql(u8, source, "none"))
+        "no credentials configured (apiKeySource=none)"
+    else
+        try std.fmt.allocPrint(allocator, "authenticated via {s}", .{source});
+    defer if (!std.mem.eql(u8, source, "none")) allocator.free(line_text);
+
+    const line_uuid = try uuid_mod.allocV4(allocator);
+    defer allocator.free(line_uuid);
+    const line = try output.serializeAuthStatus(allocator, false, &.{line_text}, "", session_id, line_uuid);
+    defer allocator.free(line);
+    try writer.writeAll(line);
 }
 
 /// Scratch storage for everything `buildInitInfo` gathers from live registries
@@ -572,6 +717,28 @@ const InitBuf = struct {
 /// caller's owned strings (model / permission_mode / session_id); both must
 /// outlive it. `sdk_agents` carries any agent names an `initialize`
 /// control_request registered this session (missed-183); empty otherwise.
+/// headless-sdk-18: resolve a configured MCP server's REAL status for
+/// system:init / mcp_status -- "connected" (already has a live session, or a
+/// fresh connect attempt just succeeded) or "failed" (a fresh attempt just
+/// failed). Actively probes (via `listTools`, a real MCP `initialize`
+/// handshake) when there is no live session yet, so a healthy server can
+/// report "connected" and a genuinely unreachable one "failed" instead of
+/// the CLI never having tried anything and reporting "pending" for every
+/// server on every run -- "pending" was previously the ONLY value any
+/// invocation could ever produce, which defeated the whole point of a
+/// status field. Bounded by the client's own connection timeout
+/// (`MCP_TIMEOUT`, default 30s) per unconnected server, same cost the
+/// reference itself pays to know a server's real status before reporting it.
+fn mcpServerStatus(mcp: *mcp_client.Client, allocator: std.mem.Allocator, name: []const u8) []const u8 {
+    if (mcp.isConnected(name)) return "connected";
+    if (mcp.listTools(name)) |tools| {
+        mcp_client.freeToolInfos(allocator, tools);
+        return "connected";
+    } else |_| {
+        return "failed";
+    }
+}
+
 pub fn buildInitInfo(
     rc: RunContext,
     buf: *InitBuf,
@@ -587,7 +754,7 @@ pub fn buildInitInfo(
 
     buf.server_list = rc.mcp.list() catch &.{};
     for (buf.server_list) |s| {
-        const status: []const u8 = if (rc.mcp.isConnected(s.name)) "connected" else "pending";
+        const status = mcpServerStatus(rc.mcp, allocator, s.name);
         try buf.mcp_servers.append(allocator, .{ .name = s.name, .status = status });
     }
 
@@ -628,24 +795,73 @@ pub fn buildInitInfo(
 /// tiered-auto/manual/strict vocabulary. A live `set_permission_mode`
 /// override (already a reference-spelled `permission_decision.Mode`) wins;
 /// otherwise the static config mode is mapped to its closest reference
-/// counterpart by actual gate behavior: tiered-auto behaves like the
-/// reference's default risk-based gate ("default"), manual prompts for
-/// everything above LOW ("dontAsk" is the closest reference mode that never
-/// auto-allows without an explicit rule), and strict runs everything without
-/// prompting ("bypassPermissions").
+/// counterpart by ACTUAL src/core/approval.zig gate behavior in a
+/// non-interactive (headless/SDK) run -- the only context this label is ever
+/// observed in -- rather than by name similarity:
 ///
-/// Known limitation: the reference's `auto` mode has no equivalent
-/// `permission_decision.Mode` variant in zcode (that enum -- and the
-/// REPL Shift+Tab cycle built on it -- is owned by another package), so a
-/// live override can never render as `auto`; it is only reachable from the
-/// static-mode fallback below, which also never selects it. This never
-/// produces an INVALID value (the acceptance bar for this gap), it just means
-/// `auto` is presently unreachable rather than misrendered.
+///   - tiered-auto auto-allows LOW and MEDIUM, only asking (or, headless,
+///     denying) above that -- the least restrictive of zcode's three modes,
+///     so it maps to the reference's own baseline, "default".
+///   - strict auto-allows only LOW; MEDIUM/HIGH prompt when interactive and
+///     are flatly denied when not (`evaluate()`'s "strict mode requires
+///     explicit approval" branch) -- it never runs anything unprompted above
+///     LOW, so headlessly it behaves exactly like the reference's "dontAsk"
+///     ("deny if not pre-approved, don't prompt"), NOT "bypassPermissions"
+///     (the reference's least restrictive mode, which skips checks
+///     entirely). Mapping strict -> bypassPermissions was inverted: it told
+///     an SDK host gauging session risk that zcode's most locked-down mode
+///     was its most permissive one.
+///   - manual prompts for literally everything regardless of tier and, when
+///     it cannot prompt (headless), denies literally everything including
+///     LOW -- strictly MORE restrictive than strict, so it must not collapse
+///     onto strict's "dontAsk" (which still auto-allows LOW) or, worse, land
+///     on "bypassPermissions". No reference mode models "never auto-allow
+///     anything"; "plan" (auto-allow only LOW, deny the rest, never prompt)
+///     is the closest available and, thematically, both modes mean "nothing
+///     proceeds without explicit approval first".
 fn permissionModeLabel(cfg: *const config_mod.Config, live_override: ?permission_decision_mod.Mode) []const u8 {
     if (live_override) |mode| return permission_decision_mod.modeToString(mode);
-    if (std.mem.eql(u8, cfg.approval_mode, "manual")) return "dontAsk";
-    if (std.mem.eql(u8, cfg.approval_mode, "strict")) return "bypassPermissions";
+    if (std.mem.eql(u8, cfg.approval_mode, "manual")) return "plan";
+    if (std.mem.eql(u8, cfg.approval_mode, "strict")) return "dontAsk";
     return "default"; // tiered-auto, and any other/unknown legacy spelling.
+}
+
+test "headless-sdk-04: permissionModeLabel maps by actual restrictiveness, never inverted" {
+    const alloc = testing.allocator;
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+
+    // tiered-auto: auto-allows LOW+MEDIUM (least restrictive of zcode's 3
+    // modes) -> the reference's baseline "default".
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "tiered-auto");
+    try testing.expectEqualStrings("default", permissionModeLabel(&cfg, null));
+
+    // strict: auto-allows only LOW, denies (headless) everything above it --
+    // must land on "dontAsk" ("deny if not pre-approved, don't prompt"), NOT
+    // "bypassPermissions" (the reference's LEAST restrictive mode). Mapping
+    // strict -> bypassPermissions was the exact inversion this test guards.
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "strict");
+    try testing.expectEqualStrings("dontAsk", permissionModeLabel(&cfg, null));
+    try testing.expect(!std.mem.eql(u8, permissionModeLabel(&cfg, null), "bypassPermissions"));
+
+    // manual: prompts for literally everything and, headless, denies
+    // literally everything (including LOW) -- strictly MORE restrictive than
+    // strict, so it must not collapse onto strict's "dontAsk" (which still
+    // auto-allows LOW) nor render as "bypassPermissions".
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "manual");
+    const manual_label = permissionModeLabel(&cfg, null);
+    try testing.expect(!std.mem.eql(u8, manual_label, "bypassPermissions"));
+    try testing.expect(!std.mem.eql(u8, manual_label, "dontAsk"));
+    try testing.expectEqualStrings("plan", manual_label);
+
+    // A live `set_permission_mode` override always wins over the static
+    // fallback, and now correctly reaches `.auto` too (permission_decision's
+    // `auto` variant is no longer folded into `.default`).
+    try testing.expectEqualStrings("auto", permissionModeLabel(&cfg, .auto));
+    try testing.expectEqualStrings("bypassPermissions", permissionModeLabel(&cfg, .bypassPermissions));
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +914,11 @@ pub fn runOutput(
             const init_line = try output.serializeInit(allocator, info);
             defer allocator.free(init_line);
             try writer.writeAll(init_line);
+
+            // headless-sdk-missed-185: --enable-auth-status emits a real
+            // auth_status line right after init (a no-op when the hidden
+            // flag is off, which is the default).
+            try maybeEmitAuthStatus(allocator, rc.caps.enable_auth_status, result.session_id, writer);
 
             // Emit each completed tool call as a tool_use/tool_result pair
             // BEFORE the final text, matching the reference's per-call
@@ -763,6 +984,14 @@ pub fn runOutput(
             const result_line = try output.serializeResult(allocator, result.*, denials);
             defer allocator.free(result_line);
             try writer.writeAll(result_line);
+
+            // headless-sdk-15: --prompt-suggestions emits a prompt_suggestion
+            // line after the result line for the turn (a no-op when the flag
+            // is off, which is the default).
+            if (try buildPromptSuggestionLine(allocator, rc.caps.prompt_suggestions, result.session_id, result.result_text, outcome.tool_events)) |suggestion_line| {
+                defer allocator.free(suggestion_line);
+                try writer.writeAll(suggestion_line);
+            }
         },
     }
 }
@@ -833,10 +1062,10 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
         /// already exists, otherwise on the next `ensureRuntime` build.
         sdk_json_schema: ?[]u8 = null,
         /// Whether an `initialize` control_request's `promptSuggestions` field
-        /// was set to true (missed-183). Not yet consumed by a live emission
-        /// path (headless-sdk-15 needs a CLI-flag-gated trigger point owned by
-        /// another package) -- stored so the toggle is no longer silently
-        /// dropped, ready for that trigger to consult.
+        /// was set to true (missed-183). Consumed alongside the
+        /// `--prompt-suggestions` CLI flag (headless-sdk-15) in `onUser`: a
+        /// `prompt_suggestion` line is emitted after each turn's result when
+        /// EITHER is set.
         sdk_prompt_suggestions_enabled: bool = false,
         /// headless-sdk-16: the skill/command names observed after the most
         /// recent turn, sorted, owned. Compared against the fresh snapshot
@@ -853,6 +1082,17 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
         /// and there were zero skills" -- both start as an empty slice, but
         /// only the latter should compare-and-emit on the next turn.
         has_command_baseline: bool = false,
+        /// headless-sdk-11 (`rewind_files`): maps a client-supplied user
+        /// message uuid (the same value `submitMessage options.uuid`/the
+        /// inbound `user` line's top-level `uuid` would carry -- missed-186)
+        /// to the history index its turn landed at, recorded once per turn
+        /// in `onUser` (only when the host actually supplied a uuid; most
+        /// zcode-internal turns have none to record). This is what lets a
+        /// REAL SDK host's `rewind_files.user_message_id` -- necessarily the
+        /// id IT assigned, not any zcode-internal id it was never shown --
+        /// resolve to a real point in the conversation. Owned; freed on
+        /// deinit.
+        known_user_messages: std.ArrayList(UserMessageRecord) = .empty,
 
         pub fn init(rc: RunContext, reader: Reader, writer: Writer, out_format: output.OutputFormat) Self {
             return .{ .rc = rc, .reader = reader, .writer = writer, .out_format = out_format };
@@ -881,6 +1121,8 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             self.known_command_names = &.{};
             freeOwnedStrings(self.rc.allocator, self.sdk_mcp_server_names);
             self.sdk_mcp_server_names = &.{};
+            for (self.known_user_messages.items) |rec| self.rc.allocator.free(rec.message_uuid);
+            self.known_user_messages.deinit(self.rc.allocator);
             if (self.sdk_json_schema) |s| {
                 self.rc.allocator.free(s);
                 self.sdk_json_schema = null;
@@ -1114,11 +1356,34 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
                 defer allocator.free(init_line);
                 try self.writeAll(init_line);
                 self.emitted_init = true;
+
+                // headless-sdk-missed-185: see the identical comment on the
+                // one-shot `runOutput` path.
+                try maybeEmitAuthStatus(allocator, self.rc.caps.enable_auth_status, runtime.session_id, self);
             }
+
+            // headless-sdk-11 (`rewind_files`): remember where THIS turn's
+            // own user message lands in history, keyed by the uuid the host
+            // supplied on it (if any) -- see `known_user_messages`'s doc
+            // comment. Captured before the turn runs so the scan below only
+            // has to look at what this turn itself appended.
+            const history_index_before = runtime.history.len();
 
             const result = try self.runTurnOnRuntime(runtime, prompt);
             const denials = try buildPermissionDenials(allocator, self.last_tool_events);
             defer allocator.free(denials);
+
+            if (message_uuid.len > 0) {
+                for (runtime.history.view()[history_index_before..], history_index_before..) |turn, idx| {
+                    if (turn.role == .user) {
+                        try self.known_user_messages.append(allocator, .{
+                            .message_uuid = try allocator.dupe(u8, message_uuid),
+                            .history_index = idx,
+                        });
+                        break;
+                    }
+                }
+            }
 
             // Emit each completed tool call as a tool_use/tool_result pair
             // BEFORE the final text (missed-182), matching the reference's
@@ -1187,6 +1452,15 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             const line = try output.serializeResult(allocator, result_with_uuid, denials);
             defer allocator.free(line);
             try self.writeAll(line);
+
+            // headless-sdk-15: --prompt-suggestions (CLI flag) OR a live
+            // `initialize.promptSuggestions` toggle (missed-183) emits a
+            // prompt_suggestion line after the result line for this turn.
+            const suggestions_enabled = self.rc.caps.prompt_suggestions or self.sdk_prompt_suggestions_enabled;
+            if (try buildPromptSuggestionLine(allocator, suggestions_enabled, result.session_id, result.result_text, self.last_tool_events)) |suggestion_line| {
+                defer allocator.free(suggestion_line);
+                try self.writeAll(suggestion_line);
+            }
 
             // headless-sdk-16: check for a real mid-session skill/command-list
             // change (e.g. the turn just ran `cd` into a subdirectory with its
@@ -1320,20 +1594,22 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             switch (decoded.request.subtype) {
                 .initialize => {
                     // missed-183: previously every field was silently dropped
-                    // (an empty applier with every callback null). Wire the
-                    // knobs zcode can genuinely apply: a structured-output
-                    // schema override and the promptSuggestions toggle take
-                    // full effect; registered agents/sdkMcpServers are parsed
-                    // and stored (surfaced in the init line / inspectable)
-                    // even though zcode has no live agent/SDK-MCP registry to
-                    // fully wire them into yet. systemPrompt/
-                    // appendSystemPrompt are NOT wired: zcode's prompt
-                    // composition (core/prompt_sections.zig's fixed,
-                    // by-name section list) lives outside this package and
-                    // does not support late injection of an arbitrary named
-                    // section without editing that composer.
+                    // (an empty applier with every callback null). Every
+                    // field is now wired to something real: systemPrompt/
+                    // appendSystemPrompt REPLACE/append the session's actual
+                    // rendered system prompt starting next turn (via
+                    // `rc.cfg.system_prompt_override`/`append_system_prompt`
+                    // -- the exact fields the CLI's own --system-prompt/
+                    // --append-system-prompt flags write); a structured-
+                    // output schema override and the promptSuggestions
+                    // toggle take full effect; registered agents/
+                    // sdkMcpServers are parsed and stored (surfaced in the
+                    // init line / inspectable) even though zcode has no live
+                    // agent/SDK-MCP registry to fully wire them into yet.
                     const applier: control.InitializeApplier = .{
                         .ctx = @ptrCast(self),
+                        .setSystemPromptFn = applierSetSystemPrompt,
+                        .setAppendSystemPromptFn = applierSetAppendSystemPrompt,
                         .setJsonSchemaFn = applierSetJsonSchema,
                         .setPromptSuggestionsFn = applierSetPromptSuggestions,
                         .registerAgentsFn = applierRegisterAgents,
@@ -1374,10 +1650,15 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
                     defer allocator.free(resp);
                     try self.writeAll(resp);
                 },
+                .rewind_files => {
+                    const resp = try self.handleRewindFiles(decoded.request.request_id, decoded.request.raw_request);
+                    defer allocator.free(resp);
+                    try self.writeAll(resp);
+                },
                 else => {
                     // can_use_tool / hook_callback / elicitation are CLI->host
-                    // (we originate them); rewind_files is recognized but not
-                    // yet wired (see ControlSubtype.rewind_files's doc
+                    // (we originate them); mcp_message is recognized but not
+                    // yet wired (see ControlSubtype.mcp_message's doc
                     // comment); a host sending any of these to us, or a truly
                     // unsupported subtype, gets an error response.
                     const resp = try control.encodeErrorResponse(
@@ -1390,6 +1671,100 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
                     try self.writeAll(resp);
                 },
             }
+        }
+
+        /// headless-sdk-11 (`rewind_files` control_request): "Rewinds file
+        /// changes made since a specific user message." Resolves
+        /// `user_message_id` to a history index two ways, in order:
+        ///
+        ///   1. `known_user_messages` -- the id the HOST itself assigned to
+        ///      one of its own `user` stream-json lines (submitMessage
+        ///      options.uuid / missed-186), the reference's actual intended
+        ///      meaning of "a specific user message". This is the path a
+        ///      real SDK host uses.
+        ///   2. A direct match against `HistoryTurn.uuid`, zcode's own
+        ///      internal per-turn id (the same one repl_commands.zig's
+        ///      `/rewind` picker keys off) -- a fallback so the id zcode
+        ///      itself would show a REPL user (or a test) also works.
+        ///
+        /// Either way, once resolved, this reuses the exact primitives the
+        /// REPL's own code-restoring `/rewind` already calls
+        /// (`AgentRuntime.restoreCheckpoint` / `History.truncateFrom`): a
+        /// REAL file + conversation restore, not a stub. `dry_run` reports
+        /// what would happen without mutating anything.
+        ///
+        /// Honest, documented scope limit (mirrors
+        /// `handleRewindToHistoryIndexWithCode`'s own doc comment in
+        /// repl_commands.zig): zcode's checkpoints are not indexed per-turn,
+        /// so "rewind to THIS message" is approximated as "restore the most
+        /// recent checkpoint, then truncate the conversation to this
+        /// message" rather than a message-precise file diff. When no
+        /// checkpoint exists at all, the working tree is left untouched and
+        /// the response says so -- never a silent partial rewind.
+        fn handleRewindFiles(self: *Self, request_id: []const u8, raw_request: []const u8) ![]u8 {
+            const allocator = self.rc.allocator;
+            const parsed = control.parseRewindFilesRequest(raw_request);
+            const user_message_id = parsed.user_message_id orelse {
+                return control.encodeErrorResponse(allocator, request_id, "rewind_files missing 'user_message_id'", &.{});
+            };
+
+            const runtime = try self.ensureRuntime();
+            var target_index: ?usize = null;
+            for (self.known_user_messages.items) |rec| {
+                if (std.mem.eql(u8, rec.message_uuid, user_message_id) and rec.history_index < runtime.history.len()) {
+                    target_index = rec.history_index;
+                }
+            }
+            if (target_index == null) {
+                for (runtime.history.view(), 0..) |turn, idx| {
+                    if (turn.role == .user and std.mem.eql(u8, turn.uuid, user_message_id)) target_index = idx;
+                }
+            }
+            const idx = target_index orelse {
+                const msg = try std.fmt.allocPrint(allocator, "'{s}' is not a user message in this session", .{user_message_id});
+                defer allocator.free(msg);
+                return control.encodeErrorResponse(allocator, request_id, msg, &.{});
+            };
+
+            if (parsed.dry_run) {
+                const dropped = runtime.history.len() - idx;
+                const message = try std.fmt.allocPrint(
+                    allocator,
+                    "would rewind {d} history entr{s} and restore the most recent checkpoint (dry run; nothing changed)",
+                    .{ dropped, if (dropped == 1) "y" else "ies" },
+                );
+                defer allocator.free(message);
+                const body = try control.buildRewindFilesResponse(allocator, message, true);
+                defer allocator.free(body);
+                return control.encodeSuccessResponse(allocator, request_id, body);
+            }
+
+            const restore_msg = runtime.restoreCheckpoint(null) catch |err| switch (err) {
+                error.CheckpointNotFound => {
+                    runtime.history.truncateFrom(idx);
+                    const message = try std.fmt.allocPrint(
+                        allocator,
+                        "no checkpoint found to restore code from; rewound the conversation only. Working tree is unchanged.",
+                        .{},
+                    );
+                    defer allocator.free(message);
+                    const body = try control.buildRewindFilesResponse(allocator, message, false);
+                    defer allocator.free(body);
+                    return control.encodeSuccessResponse(allocator, request_id, body);
+                },
+                else => return err,
+            };
+            defer allocator.free(restore_msg);
+
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "Files rewound to state at message {s}. {s}",
+                .{ user_message_id, restore_msg },
+            );
+            defer allocator.free(message);
+            const body = try control.buildRewindFilesResponse(allocator, message, false);
+            defer allocator.free(body);
+            return control.encodeSuccessResponse(allocator, request_id, body);
         }
 
         /// writeAll shim so the relay/control responses go out through the
@@ -1419,7 +1794,7 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             for (servers) |s| {
                 if (wrote) try w.writeByte(',');
                 wrote = true;
-                const status: []const u8 = if (self.rc.mcp.isConnected(s.name)) "connected" else "pending";
+                const status = mcpServerStatus(self.rc.mcp, allocator, s.name);
                 try w.print("{{\"name\":{f},\"status\":{f}}}", .{ std.json.fmt(s.name, .{}), std.json.fmt(status, .{}) });
             }
             for (self.sdk_mcp_server_names) |name| {
@@ -1432,6 +1807,34 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
         }
 
         // --- missed-183: InitializeApplier callbacks ------------------------
+
+        /// `initialize.systemPrompt` -> REPLACES the session's entire
+        /// rendered system prompt. Writes `rc.cfg.system_prompt_override`,
+        /// the EXACT field `--system-prompt` already writes
+        /// (main.zig's applyCliFlagCarrierFields) and the EXACT field
+        /// `prompt_engine.build()` already reads fresh on every turn
+        /// (`if (env.system_prompt_override.len > 0) return dupe(...)`) --
+        /// so this takes effect starting with the session's NEXT turn, no
+        /// new prompt-composition plumbing required. This is the real fix
+        /// for the previously-100%-unwired half of missed-183: an SDK host's
+        /// `initialize.systemPrompt` now genuinely changes the session that
+        /// follows, not just a success control_response with zero effect.
+        fn applierSetSystemPrompt(ctx: *anyopaque, prompt: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            try config_mod.Config.setOwnedString(self.rc.cfg, self.rc.allocator, &self.rc.cfg.system_prompt_override, prompt);
+        }
+
+        /// `initialize.appendSystemPrompt` -> appended AFTER the composed
+        /// system prompt. Writes `rc.cfg.append_system_prompt`, the EXACT
+        /// field `--append-system-prompt` already writes
+        /// (core/config_parse.zig) and the EXACT field
+        /// core/prompt_helpers.zig's dynamic section renderer already reads
+        /// fresh on every turn -- same "late injection, no new plumbing"
+        /// story as `applierSetSystemPrompt` above.
+        fn applierSetAppendSystemPrompt(ctx: *anyopaque, prompt: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            try config_mod.Config.setOwnedString(self.rc.cfg, self.rc.allocator, &self.rc.cfg.append_system_prompt, prompt);
+        }
 
         /// `initialize.jsonSchema` -> the live structured-output schema
         /// override. Applied to the runtime immediately when it already
@@ -1451,10 +1854,10 @@ pub fn StreamSession(comptime Reader: type, comptime Writer: type) type {
             }
         }
 
-        /// `initialize.promptSuggestions` -> stores the toggle. Not yet
-        /// consumed by a live emission path (headless-sdk-15 needs a
-        /// CLI-flag-gated trigger owned by another package), but no longer a
-        /// silent drop -- a future trigger has a real flag to consult.
+        /// `initialize.promptSuggestions` -> stores the toggle, consumed by
+        /// `onUser`'s per-turn prompt_suggestion emission alongside the
+        /// `--prompt-suggestions` CLI flag (headless-sdk-15) -- either
+        /// source enables it.
         fn applierSetPromptSuggestions(ctx: *anyopaque, enabled: bool) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             self.sdk_prompt_suggestions_enabled = enabled;
@@ -2111,6 +2514,269 @@ test "LIVE: --output-format stream-json emits system:init first then result" {
     try testing.expectEqualStrings("result", last.value.object.get("type").?.string);
 }
 
+test "LIVE headless-sdk-missed-185: --enable-auth-status emits a real auth_status message after init" {
+    const alloc = testing.allocator;
+    const env = @import("../core/env.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    // Deterministic credential state for the assertion below: no
+    // ANTHROPIC_API_KEY, so apiKeySource() resolves to "none".
+    env.setOverride("ANTHROPIC_API_KEY", "") catch unreachable;
+    defer env.clearOverrides();
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var buf = std_io.StringBuilder.init(alloc);
+    defer buf.deinit();
+    const Sink = struct {
+        sb: *std_io.StringBuilder,
+        fn writeAll(self: @This(), bytes: []const u8) !void {
+            try self.sb.appendSlice(bytes);
+        }
+    };
+
+    var rc = h.runContext();
+    rc.caps.enable_auth_status = true;
+    try runOutput(rc, .stream_json, "hello", Sink{ .sb = &buf });
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(alloc);
+    var it = std.mem.splitScalar(u8, buf.items(), '\n');
+    while (it.next()) |raw| {
+        if (raw.len == 0) continue;
+        try lines.append(alloc, raw);
+    }
+    try testing.expect(lines.items.len >= 3);
+
+    // Line 0 is system:init; line 1 must be the real auth_status message --
+    // previously no real invocation, with the flag on or off, could ever
+    // produce this message at all.
+    var first = try std.json.parseFromSlice(std.json.Value, alloc, lines.items[0], .{});
+    defer first.deinit();
+    try testing.expectEqualStrings("init", first.value.object.get("subtype").?.string);
+
+    var auth = try std.json.parseFromSlice(std.json.Value, alloc, lines.items[1], .{});
+    defer auth.deinit();
+    const obj = auth.value.object;
+    try testing.expectEqualStrings("auth_status", obj.get("type").?.string);
+    try testing.expect(!obj.get("isAuthenticating").?.bool);
+    try testing.expect(obj.get("output").?.array.items.len == 1);
+    try testing.expect(std.mem.indexOf(u8, obj.get("output").?.array.items[0].string, "none") != null);
+    try testing.expect(obj.get("session_id") != null);
+    try testing.expect(obj.get("uuid") != null);
+}
+
+test "LIVE headless-sdk-missed-185: without --enable-auth-status, no auth_status line is emitted" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var buf = std_io.StringBuilder.init(alloc);
+    defer buf.deinit();
+    const Sink = struct {
+        sb: *std_io.StringBuilder,
+        fn writeAll(self: @This(), bytes: []const u8) !void {
+            try self.sb.appendSlice(bytes);
+        }
+    };
+
+    try runOutput(h.runContext(), .stream_json, "hello", Sink{ .sb = &buf });
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "auth_status") == null);
+}
+
+test "LIVE headless-sdk-18: a healthy MCP server reports connected and an unreachable one reports failed -- distinct values" {
+    // Spawns a real subprocess as a fake MCP server (same fixture pattern as
+    // mcp/client.zig's "stdio MCP fixture" test) -- skipped where python3
+    // may not be reliably available (CI), same guard that test uses.
+    const env = @import("../core/env.zig");
+    if (env.getenv("CI") != null) return error.SkipZigTest;
+    // A nonexistent-binary "server" only fails once its connect attempt
+    // gives up -- bound that to a couple seconds instead of the 30s
+    // production default so this test can't blow the suite's time budget.
+    try env.setOverride("MCP_TIMEOUT", "2000");
+    defer env.clearOverrides();
+
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "mock_server.py", .data =
+        \\import json, sys
+        \\def read_frame():
+        \\    header = b""
+        \\    while b"\r\n\r\n" not in header:
+        \\        c = sys.stdin.buffer.read(1)
+        \\        if not c:
+        \\            return None
+        \\        header += c
+        \\    length = 0
+        \\    for line in header.decode("utf-8", errors="replace").split("\r\n"):
+        \\        if line.lower().startswith("content-length:"):
+        \\            length = int(line.split(":",1)[1].strip())
+        \\            break
+        \\    body = sys.stdin.buffer.read(length)
+        \\    return json.loads(body.decode("utf-8"))
+        \\def write_frame(obj):
+        \\    body = json.dumps(obj).encode("utf-8")
+        \\    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+        \\    sys.stdout.buffer.write(body)
+        \\    sys.stdout.buffer.flush()
+        \\while True:
+        \\    msg = read_frame()
+        \\    if msg is None:
+        \\        break
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0.1"}}})
+        \\    elif method == "tools/list":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"tools":[]}})
+    });
+    const script = try test_helpers.tmpDirPath(alloc, &tmp, "mock_server.py");
+    defer alloc.free(script);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    const healthy_transport = try std.fmt.allocPrint(alloc, "python3 '{s}'", .{script});
+    defer alloc.free(healthy_transport);
+    try h.mcp.add("healthy", healthy_transport);
+    try h.mcp.add("broken", "/no/such/binary-zcode-test-fixture-xyz");
+
+    var buf = std_io.StringBuilder.init(alloc);
+    defer buf.deinit();
+    const Sink = struct {
+        sb: *std_io.StringBuilder,
+        fn writeAll(self: @This(), bytes: []const u8) !void {
+            try self.sb.appendSlice(bytes);
+        }
+    };
+    try runOutput(h.runContext(), .stream_json, "hello", Sink{ .sb = &buf });
+
+    var it = std.mem.splitScalar(u8, buf.items(), '\n');
+    const init_line = it.next().?;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, init_line, .{});
+    defer parsed.deinit();
+    const servers = parsed.value.object.get("mcp_servers").?.array.items;
+    try testing.expectEqual(@as(usize, 2), servers.len);
+
+    var healthy_status: ?[]const u8 = null;
+    var broken_status: ?[]const u8 = null;
+    for (servers) |s| {
+        const name = s.object.get("name").?.string;
+        const status = s.object.get("status").?.string;
+        if (std.mem.eql(u8, name, "healthy")) healthy_status = status;
+        if (std.mem.eql(u8, name, "broken")) broken_status = status;
+    }
+
+    // The core acceptance bar: DISTINCT status values for a healthy vs an
+    // unreachable server -- previously "pending" was the only value any
+    // real invocation could ever produce, for every server, always.
+    try testing.expect(!std.mem.eql(u8, healthy_status.?, broken_status.?));
+    try testing.expectEqualStrings("connected", healthy_status.?);
+    try testing.expectEqualStrings("failed", broken_status.?);
+}
+
+test "LIVE headless-sdk-15: --prompt-suggestions emits a prompt_suggestion line after result" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var buf = std_io.StringBuilder.init(alloc);
+    defer buf.deinit();
+    const Sink = struct {
+        sb: *std_io.StringBuilder,
+        fn writeAll(self: @This(), bytes: []const u8) !void {
+            try self.sb.appendSlice(bytes);
+        }
+    };
+
+    var rc = h.runContext();
+    rc.caps.prompt_suggestions = true;
+
+    try runOutput(rc, .stream_json, "hello", Sink{ .sb = &buf });
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(alloc);
+    var it = std.mem.splitScalar(u8, buf.items(), '\n');
+    while (it.next()) |raw| {
+        if (raw.len == 0) continue;
+        try lines.append(alloc, raw);
+    }
+    // init, ..., result, prompt_suggestion -- the suggestion line is LAST,
+    // strictly after the result line the acceptance test names.
+    try testing.expect(lines.items.len >= 3);
+
+    var second_to_last = try std.json.parseFromSlice(std.json.Value, alloc, lines.items[lines.items.len - 2], .{});
+    defer second_to_last.deinit();
+    try testing.expectEqualStrings("result", second_to_last.value.object.get("type").?.string);
+
+    var last = try std.json.parseFromSlice(std.json.Value, alloc, lines.items[lines.items.len - 1], .{});
+    defer last.deinit();
+    try testing.expectEqualStrings("prompt_suggestion", last.value.object.get("type").?.string);
+    try testing.expect(last.value.object.get("suggestion").?.string.len > 0);
+    try testing.expect(last.value.object.get("uuid") != null);
+    try testing.expect(last.value.object.get("session_id") != null);
+}
+
+test "LIVE headless-sdk-15: without --prompt-suggestions, no prompt_suggestion line is emitted" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var buf = std_io.StringBuilder.init(alloc);
+    defer buf.deinit();
+    const Sink = struct {
+        sb: *std_io.StringBuilder,
+        fn writeAll(self: @This(), bytes: []const u8) !void {
+            try self.sb.appendSlice(bytes);
+        }
+    };
+
+    try runOutput(h.runContext(), .stream_json, "hello", Sink{ .sb = &buf });
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "prompt_suggestion") == null);
+}
+
+test "headless-sdk-15: derivePromptSuggestion reflects the real turn content" {
+    // A failed tool call -> ask to fix it.
+    const failed = [_]ToolEvent{.{ .tool_use_id = @constCast("t1"), .name = @constCast("Bash"), .input_json = @constCast("{}"), .output_text = @constCast("boom"), .denied = false, .is_error = true }};
+    try testing.expectEqualStrings("Can you fix the error from the last command and try again?", derivePromptSuggestion("done", &failed));
+
+    // A successful edit -> ask to verify.
+    const edited = [_]ToolEvent{.{ .tool_use_id = @constCast("t2"), .name = @constCast("Write"), .input_json = @constCast("{}"), .output_text = @constCast("ok"), .denied = false, .is_error = false }};
+    try testing.expectEqualStrings("Can you run the tests to confirm that change works?", derivePromptSuggestion("done", &edited));
+
+    // A non-edit, non-error tool call (e.g. a read) -> generic next-step ask.
+    const read = [_]ToolEvent{.{ .tool_use_id = @constCast("t3"), .name = @constCast("Read"), .input_json = @constCast("{}"), .output_text = @constCast("contents"), .denied = false, .is_error = false }};
+    try testing.expectEqualStrings("What should we do next?", derivePromptSuggestion("done", &read));
+
+    // No tool calls, final text is a question -> affirmative answer.
+    try testing.expectEqualStrings("Yes, please go ahead.", derivePromptSuggestion("Should I proceed?", &.{}));
+
+    // No tool calls, no question -> generic fallback.
+    try testing.expectEqualStrings("What should we do next?", derivePromptSuggestion("All done.", &.{}));
+}
+
 test "LIVE: stream-json input drives a turn and emits a can_use_tool control_request; allow lets the tool run" {
     const alloc = testing.allocator;
     const env = @import("../core/env.zig");
@@ -2369,6 +3035,51 @@ test "headless-sdk-12: --await-initialize accepts a genuine initialize control_r
     try testing.expect(std.mem.indexOf(u8, host.out.items, "\"type\":\"result\"") != null);
 }
 
+test "LIVE headless-sdk-missed-183: initialize.systemPrompt/appendSystemPrompt genuinely mutate the live session (not a silent drop)" {
+    const alloc = testing.allocator;
+    const env = @import("../core/env.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    try env.setOverride("ZCODE_MOCK_RESPONSE", "{\"assistant\":\"ok\",\"tool_calls\":[]}");
+    defer env.clearOverrides();
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+    // Before: the fields an SDK host's initialize is supposed to override
+    // start empty (this fixture's default Config never sets them).
+    try testing.expectEqualStrings("", h.cfg.system_prompt_override);
+    try testing.expectEqualStrings("", h.cfg.append_system_prompt);
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    try host.queue(
+        "{\"type\":\"control_request\",\"request_id\":\"init-1\",\"request\":{\"subtype\":\"initialize\"," ++
+            "\"systemPrompt\":\"You are a terse bot.\",\"appendSystemPrompt\":\"Always answer in one word.\"}}",
+    );
+    try host.queue("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"turn one\"}}");
+
+    const rc = h.runContext();
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(rc, &host, &host, .json);
+    defer session.deinit();
+    try session.run();
+
+    // The control_response for `initialize` succeeded...
+    try testing.expect(std.mem.indexOf(u8, host.out.items, "\"request_id\":\"init-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, host.out.items, "\"subtype\":\"success\"") != null);
+    // ...and, unlike before this fix, the LIVE Config this session's turns
+    // actually read from (prompt_engine.build() / prompt_helpers.zig, both
+    // proven elsewhere to consume these exact fields on every turn) now
+    // carries the host's real values -- not silently dropped.
+    try testing.expectEqualStrings("You are a terse bot.", h.cfg.system_prompt_override);
+    try testing.expectEqualStrings("Always answer in one word.", h.cfg.append_system_prompt);
+    // And the turn that followed still ran to completion.
+    try testing.expect(std.mem.indexOf(u8, host.out.items, "\"type\":\"result\"") != null);
+}
+
 test "LIVE: stream-json control_request set_model mutates the live runtime and replies success" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2448,4 +3159,154 @@ test "LIVE: stream-json control_request mcp_status replies success with an mcpSe
     // No configured MCP servers in this fixture -> an empty array, not an
     // "unsupported subtype" error (the previous behavior).
     try testing.expectEqual(@as(usize, 0), resp.get("response").?.object.get("mcpServers").?.array.items.len);
+}
+
+test "LIVE headless-sdk-11: rewind_files with an unknown user_message_id errors, naming it" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    try host.queue("{\"type\":\"control_request\",\"request_id\":\"r-rw\",\"request\":{\"subtype\":\"rewind_files\",\"user_message_id\":\"no-such-id\"}}");
+
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(h.runContext(), &host, &host, .json);
+    defer session.deinit();
+    try session.run();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trimEnd(u8, host.out.items, "\n"), .{});
+    defer parsed.deinit();
+    const resp = parsed.value.object.get("response").?.object;
+    try testing.expectEqualStrings("error", resp.get("subtype").?.string);
+    try testing.expect(std.mem.indexOf(u8, resp.get("error").?.string, "no-such-id") != null);
+}
+
+test "LIVE headless-sdk-11: rewind_files missing user_message_id errors" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    try host.queue("{\"type\":\"control_request\",\"request_id\":\"r-rw2\",\"request\":{\"subtype\":\"rewind_files\"}}");
+
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(h.runContext(), &host, &host, .json);
+    defer session.deinit();
+    try session.run();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trimEnd(u8, host.out.items, "\n"), .{});
+    defer parsed.deinit();
+    const resp = parsed.value.object.get("response").?.object;
+    try testing.expectEqualStrings("error", resp.get("subtype").?.string);
+    try testing.expect(std.mem.indexOf(u8, resp.get("error").?.string, "user_message_id") != null);
+}
+
+test "LIVE headless-sdk-11: rewind_files dry_run reports without mutating history" {
+    const alloc = testing.allocator;
+    const env = @import("../core/env.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    try env.setOverride("ZCODE_MOCK_RESPONSE", "{\"assistant\":\"ok\",\"tool_calls\":[]}");
+    defer env.clearOverrides();
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    // A real turn, tagged with a client-supplied uuid (the reference's
+    // actual `user_message_id` semantics -- missed-186), then a dry-run
+    // rewind_files naming it.
+    try host.queue("{\"type\":\"user\",\"uuid\":\"client-uuid-dry\",\"message\":{\"role\":\"user\",\"content\":\"turn one\"}}");
+    try host.queue("{\"type\":\"control_request\",\"request_id\":\"r-rw3\",\"request\":{\"subtype\":\"rewind_files\",\"user_message_id\":\"client-uuid-dry\",\"dry_run\":true}}");
+
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(h.runContext(), &host, &host, .json);
+    defer session.deinit();
+    try session.run();
+
+    const history_len_after = session.runtime.?.history.len();
+    try testing.expect(history_len_after > 0);
+
+    // Find the rewind_files control_response specifically (the output also
+    // carries the turn's own assistant/result lines).
+    var it = std.mem.splitScalar(u8, host.out.items, '\n');
+    var found = false;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, "\"request_id\":\"r-rw3\"") == null) continue;
+        found = true;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        const resp = parsed.value.object.get("response").?.object;
+        try testing.expectEqualStrings("success", resp.get("subtype").?.string);
+        try testing.expect(resp.get("response").?.object.get("dry_run").?.bool);
+        try testing.expect(std.mem.indexOf(u8, resp.get("response").?.object.get("message").?.string, "dry run") != null);
+    }
+    try testing.expect(found);
+    // dry_run must never mutate: history is exactly as the turn left it.
+    try testing.expectEqual(history_len_after, session.runtime.?.history.len());
+}
+
+test "LIVE headless-sdk-11: rewind_files with no checkpoint falls back to a real conversation-only truncation" {
+    const alloc = testing.allocator;
+    const env = @import("../core/env.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    try env.setOverride("ZCODE_MOCK_RESPONSE", "{\"assistant\":\"ok\",\"tool_calls\":[]}");
+    defer env.clearOverrides();
+
+    var h = try LiveHarness.init(alloc, root);
+    defer h.deinit();
+
+    var host = ScriptedHost.init(alloc);
+    defer host.deinit();
+    try host.queue("{\"type\":\"user\",\"uuid\":\"client-uuid-real\",\"message\":{\"role\":\"user\",\"content\":\"turn one\"}}");
+    try host.queue("{\"type\":\"control_request\",\"request_id\":\"r-rw4\",\"request\":{\"subtype\":\"rewind_files\",\"user_message_id\":\"client-uuid-real\"}}");
+
+    const Session = StreamSession(*ScriptedHost, *ScriptedHost);
+    var session = Session.init(h.runContext(), &host, &host, .json);
+    defer session.deinit();
+    try session.run();
+
+    // No checkpoint exists in this fixture (nothing ever created one), so
+    // the REAL fallback path ran: the conversation was actually truncated
+    // back to (and including) the user's own turn -- a genuine mutation,
+    // not a canned response. Confirmed by re-checking the live runtime's
+    // history length is now zero (the user turn itself, at index 0, was the
+    // rewind target and got dropped along with everything after it).
+    try testing.expectEqual(@as(usize, 0), session.runtime.?.history.len());
+
+    var it = std.mem.splitScalar(u8, host.out.items, '\n');
+    var found = false;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, "\"request_id\":\"r-rw4\"") == null) continue;
+        found = true;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        const resp = parsed.value.object.get("response").?.object;
+        try testing.expectEqualStrings("success", resp.get("subtype").?.string);
+        try testing.expect(!resp.get("response").?.object.get("dry_run").?.bool);
+        try testing.expect(std.mem.indexOf(u8, resp.get("response").?.object.get("message").?.string, "no checkpoint found") != null);
+    }
+    try testing.expect(found);
 }
