@@ -1638,20 +1638,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
             return options;
         }
         if (positional.items.len < 2) {
-            try std_io.stdoutWriter().writeAll(
-                \\zcode agents - Inspect declared sub-agents.
-                \\
-                \\Subcommands:
-                \\  list          List agent definitions in this workspace.
-                \\  show <name>   Print the agent frontmatter, tools, and system prompt.
-                \\
-                \\Agents are defined under .zcode/agents/*.md with YAML frontmatter.
-                \\
-                \\NOTE: this differs from Claude Code's `agents`, which manages
-                \\background sessions (see `zcode ps`/`zcode attach`/`zcode stop`).
-                \\Run `zcode agents --bg` or `zcode agents ps` for that listing.
-                \\
-            );
+            try std_io.stdoutWriter().writeAll(AGENTS_NO_SUBCOMMAND_HELP);
             options.command = .help;
             return options;
         }
@@ -2725,6 +2712,25 @@ fn reportUsageError(cmd: []const u8, missing: []const u8, usage: []const u8) err
     return error.UsageErrorReported;
 }
 
+/// Printed by `zcode agents` with no subcommand. Extracted to a named
+/// constant (rather than inlined at the call site) so the identity-leak
+/// test below can assert on its content directly, without capturing
+/// stdout.
+const AGENTS_NO_SUBCOMMAND_HELP =
+    \\zcode agents - Inspect declared sub-agents.
+    \\
+    \\Subcommands:
+    \\  list          List agent definitions in this workspace.
+    \\  show <name>   Print the agent frontmatter, tools, and system prompt.
+    \\
+    \\Agents are defined under .zcode/agents/*.md with YAML frontmatter.
+    \\
+    \\NOTE: some other agentic CLIs use `agents` for BACKGROUND
+    \\sessions instead (see `zcode ps`/`zcode attach`/`zcode stop`).
+    \\Run `zcode agents --bg` or `zcode agents ps` for that listing.
+    \\
+;
+
 pub fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         \\zcode - Enterprise coding agent CLI
@@ -2793,7 +2799,7 @@ pub fn printUsage(writer: anytype) !void {
         \\      --approval-mode, --permission-mode <mode>
         \\                                  tiered-auto (default) | manual | strict | acceptEdits | plan |
         \\                                  bypassPermissions | dontAsk | auto (approximated: no cloud classifier)
-        \\      --dangerously-skip-permissions   Alias for -y/--yolo (Claude Code's own spelling)
+        \\      --dangerously-skip-permissions   Alias for -y/--yolo (a spelling also used by other agentic CLIs)
         \\      --allow-dangerously-skip-permissions  Permit (but do not itself enable) bypassing permission checks
         \\      --sandbox <profile>         read-only | workspace-write | no-network | danger-full-access
         \\      --cwd <path>
@@ -2832,7 +2838,7 @@ pub fn printUsage(writer: anytype) !void {
         \\  -j, --json                      Emit a single JSON object on stdout (machine-readable mode)
         \\      --print                     Run one prompt non-interactively and exit (headless).
         \\                                  No short alias: -p stays bound to --provider in zcode,
-        \\                                  a deliberate divergence from Claude Code's -p, --print.
+        \\                                  a deliberate divergence from other agentic CLIs' -p, --print.
         \\      --output-format <fmt>       text | json | stream-json (headless; honored with --print/run/exec)
         \\      --input-format <fmt>        text | stream-json (headless; honored with --print/run/exec)
         \\      --max-turns <n>             Cap tool-call rounds (headless); exceeding emits error_max_turns
@@ -2865,9 +2871,10 @@ pub fn printUsage(writer: anytype) !void {
         \\      --approve-high
         \\  -y, --yolo                      Auto-approve high-risk tool calls (use with care)
         \\  -v, --verbose                   Log extra diagnostic info to stderr.
-        \\                                  Claude Code's -v is --version; zcode keeps -V for --version and
-        \\                                  reserves -v for --verbose, EXCEPT a lone `zcode -v` (no other args)
-        \\                                  still prints the version, matching `claude -v`-shaped scripts.
+        \\                                  Some other agentic CLIs bind -v to --version; zcode keeps -V for
+        \\                                  --version and reserves -v for --verbose, EXCEPT a lone `zcode -v`
+        \\                                  (no other args) still prints the version, for compatibility with
+        \\                                  scripts written against those CLIs' `-v`-prints-version shape.
         \\  -q, --quiet                     Suppress non-essential output (spinner, thinking summary)
         \\      --log-level <level>         debug | info | warn (default) | error
         \\      --log-format <text|json>    Log format on stderr (json is aggregator-friendly)
@@ -3832,6 +3839,25 @@ test "headless-sdk-15: --prompt-suggestions appears in --help" {
     defer buf.deinit();
     try printUsage(buf.writer());
     try testing.expect(std.mem.indexOf(u8, buf.items(), "--prompt-suggestions") != null);
+}
+
+test "identity-leak: --help never claims zcode is Claude Code" {
+    // "Anthropic" itself is not checked here: zcode is a multi-provider CLI
+    // and --help legitimately names Anthropic as an actual API provider
+    // (e.g. "zcode keychain set anthropic <key>", "Anthropic requests" for
+    // --betas), which is a factual provider reference, not an identity
+    // claim. "Claude Code" is the one string that would claim zcode IS the
+    // reference product, so that is what this guards.
+    const allocator = testing.allocator;
+    var buf = std_io.StringBuilder.init(allocator);
+    defer buf.deinit();
+    try printUsage(buf.writer());
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "Claude Code") == null);
+}
+
+test "identity-leak: `zcode agents` (no subcommand) help never names Claude Code or Anthropic" {
+    try testing.expect(std.mem.indexOf(u8, AGENTS_NO_SUBCOMMAND_HELP, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, AGENTS_NO_SUBCOMMAND_HELP, "Anthropic") == null);
 }
 
 test "headless-sdk-missed-185: --enable-auth-status parses and stays out of --help" {
