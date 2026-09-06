@@ -14,6 +14,7 @@
 //! matching the `cmdSessionList` / daemon-status hardening.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const rt = @import("zcode_runtime");
 const clock = @import("core/clock.zig");
 const std_io = @import("core/std_io.zig");
@@ -260,6 +261,24 @@ fn readTail(allocator: std.mem.Allocator, path: []const u8, max: usize) ![]u8 {
 /// to forward into the child's env as `ZCODE_BG_INITIAL_PROMPT` -- null for
 /// every other spawner (the top-level `--bg` CLI flag has no such concept).
 pub fn spawnBackground(allocator: std.mem.Allocator, orig_argv: []const []const u8, cwd: []const u8, writer: anytype, queued_prompt: ?[]const u8) !void {
+    // sessions-storage-09: `zig build test`'s process is the CUSTOM TEST
+    // RUNNER binary, not `main.zig` -- it does not understand a re-invoked
+    // `--resume <id> --provider ... --model ...` argv at all, so actually
+    // exec'ing `std.process.executablePathAlloc`'s result (the test binary
+    // itself) here would spawn a second copy of the test suite rather than
+    // a real background zcode session. Mirrors the `builtin.is_test` guard
+    // on `core/os_notify.zig`'s notify(): return early with the same
+    // message shape a real spawn reports (fake pid 0) so callers -- now
+    // including `/fork`'s handleForkSession -- can be tested end-to-end
+    // without ever actually forking a process.
+    if (builtin.is_test) {
+        try writer.print(
+            "started background session\tpid={d}\n  zcode logs {d}   # view captured output\n  zcode kill {d}   # terminate it\n",
+            .{ 0, 0, 0 },
+        );
+        return;
+    }
+
     // Per-session id for the log filename. argv[0] is the exe path; the child
     // re-discovers its own pid for the registry key, so a timestamp id is
     // enough to keep concurrent --bg launches from colliding on the log file.
@@ -776,4 +795,20 @@ test "register picks up ZCODE_SESSION_NAME from env (the --bg self-register path
 fn fileExists(path: []const u8) bool {
     std.Io.Dir.cwd().access(rt.io, path, .{}) catch return false;
     return true;
+}
+
+test "sessions-storage-09: spawnBackground is a no-op under builtin.is_test but still reports success" {
+    // `zig build test` runs as the custom test-runner binary, not
+    // `main.zig` -- a real spawnBackground would try to re-exec THAT binary
+    // with a `--resume ...` argv it cannot interpret. The `builtin.is_test`
+    // guard (mirroring core/os_notify.zig's notify()) must short-circuit
+    // before any of that -- this exercises every caller of spawnBackground
+    // (including /fork's handleForkSession and /background's
+    // handleBackground) safely inside the test suite.
+    const alloc = testing.allocator;
+    var out = std_io.StringBuilder.init(alloc);
+    defer out.deinit();
+
+    try spawnBackground(alloc, &.{"zcode"}, "/work", out.writer(), "hello");
+    try testing.expect(std.mem.indexOf(u8, out.items(), "started background session") != null);
 }

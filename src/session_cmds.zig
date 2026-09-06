@@ -31,6 +31,7 @@ const agent_runtime = @import("agent_runtime.zig");
 const review_flow = @import("review_flow.zig");
 const remote_daemon = @import("remote_daemon.zig");
 const session_mgmt = @import("session_mgmt.zig");
+const sdk_output = @import("sdk/output.zig");
 const format_mod = @import("core/format.zig");
 const coordinator_mode = @import("core/coordinator_mode.zig");
 
@@ -126,6 +127,84 @@ pub fn cmdSessionList(allocator: std.mem.Allocator, store: *session_store.Store,
     }
 }
 
+/// Resolve `arg` (an exact session id, or a fuzzy id/label term) against
+/// `store`'s session list -- same-project by default, every project's
+/// bucket under `all_projects` -- exactly the way `cmdSessionResume` always
+/// has: exact id first (the historical fast path), then fuzzy by id/label,
+/// then multi-match disambiguation. Prints a targeted error to stderr and
+/// returns `error.SessionNotFound` when nothing resolves uniquely. Shared by
+/// `cmdSessionResume` and its `--print` analogue (`runResumePrint`) so both
+/// apply identical matching rules. Caller owns the returned id.
+pub fn resolveResumeSubject(
+    allocator: std.mem.Allocator,
+    store: *session_store.Store,
+    all_projects: bool,
+    arg: []const u8,
+) ![]u8 {
+    // Exact-id fast path: a valid, existing session file resumes directly
+    // (sessionPath's cross-project scan already finds one that lives in
+    // a different project's bucket, regardless of `all_projects`).
+    if (store.sessionPath(arg)) |p| {
+        defer allocator.free(p);
+        const exists = if (std.Io.Dir.cwd().access(rt.io, p, .{})) |_| true else |_| false;
+        if (exists) return allocator.dupe(u8, arg);
+    } else |_| {}
+
+    // Fuzzy fallback over the session list (id + label): same-project by
+    // default, every project's bucket under --all-projects.
+    const entries = if (all_projects) try store.listAllProjects() else try store.listForActiveProject();
+    defer store.freeSessionEntries(entries);
+
+    const candidates = try allocator.alloc(session_search.Candidate, entries.len);
+    defer allocator.free(candidates);
+    for (entries, 0..) |e, i| {
+        candidates[i] = .{ .id = e.id, .label = e.label orelse "" };
+    }
+
+    const target = try session_search.resolveResumeTarget(allocator, candidates, arg);
+    switch (target) {
+        .exact, .single => |id| return allocator.dupe(u8, id),
+        .multiple => |ids| {
+            defer allocator.free(ids);
+            const stderr = std_io.stderrWriter();
+            try stderr.print("error: session resume: multiple sessions match '{s}':\n", .{arg});
+            for (ids) |id| {
+                var matched_label: []const u8 = "";
+                for (entries) |e| {
+                    if (std.mem.eql(u8, e.id, id)) {
+                        matched_label = e.label orelse "";
+                        break;
+                    }
+                }
+                if (matched_label.len > 0) {
+                    try stderr.print("      {s}  {s}\n", .{ id, matched_label });
+                } else {
+                    try stderr.print("      {s}\n", .{id});
+                }
+            }
+            try stderr.writeAll("  - Re-run with a full session id to pick one.\n");
+            return error.SessionNotFound;
+        },
+        .none => {
+            const stderr = std_io.stderrWriter();
+            const display = try formatDisplaySessionId(allocator, arg);
+            defer allocator.free(display);
+            try stderr.print("error: session resume: no such session '{s}'.\n", .{display});
+            const n = @min(entries.len, 3);
+            if (n > 0) {
+                try stderr.writeAll("  - Most recent sessions:\n");
+                for (entries[0..n]) |e| {
+                    try stderr.print("      {s}\n", .{e.id});
+                }
+                try stderr.writeAll("  - Or run `zcode session list` for the full list.\n");
+            } else {
+                try stderr.writeAll("  - You have no saved sessions yet; run `zcode` to start one.\n");
+            }
+            return error.SessionNotFound;
+        },
+    }
+}
+
 pub fn cmdSessionResume(
     allocator: std.mem.Allocator,
     cwd: []const u8,
@@ -159,77 +238,9 @@ pub fn cmdSessionResume(
     };
 
     // Resolve the argument to a concrete session id: exact id first (the
-    // historical fast path), then fuzzy by id/label. `resolved_owned` holds
-    // the id when it came from fuzzy resolution (it must outlive the call).
-    var resolved_owned: ?[]u8 = null;
-    defer if (resolved_owned) |r| allocator.free(r);
-    const session_id: []const u8 = blk: {
-        // Exact-id fast path: a valid, existing session file resumes directly
-        // (sessionPath's cross-project scan already finds one that lives in
-        // a different project's bucket, regardless of `all_projects`).
-        if (store.sessionPath(arg)) |p| {
-            defer allocator.free(p);
-            const exists = if (std.Io.Dir.cwd().access(rt.io, p, .{})) |_| true else |_| false;
-            if (exists) break :blk arg;
-        } else |_| {}
-
-        // Fuzzy fallback over the session list (id + label): same-project by
-        // default, every project's bucket under --all-projects.
-        const entries = if (all_projects) try store.listAllProjects() else try store.listForActiveProject();
-        defer store.freeSessionEntries(entries);
-
-        const candidates = try allocator.alloc(session_search.Candidate, entries.len);
-        defer allocator.free(candidates);
-        for (entries, 0..) |e, i| {
-            candidates[i] = .{ .id = e.id, .label = e.label orelse "" };
-        }
-
-        const target = try session_search.resolveResumeTarget(allocator, candidates, arg);
-        switch (target) {
-            .exact, .single => |id| {
-                resolved_owned = try allocator.dupe(u8, id);
-                break :blk resolved_owned.?;
-            },
-            .multiple => |ids| {
-                defer allocator.free(ids);
-                const stderr = std_io.stderrWriter();
-                try stderr.print("error: session resume: multiple sessions match '{s}':\n", .{arg});
-                for (ids) |id| {
-                    var matched_label: []const u8 = "";
-                    for (entries) |e| {
-                        if (std.mem.eql(u8, e.id, id)) {
-                            matched_label = e.label orelse "";
-                            break;
-                        }
-                    }
-                    if (matched_label.len > 0) {
-                        try stderr.print("      {s}  {s}\n", .{ id, matched_label });
-                    } else {
-                        try stderr.print("      {s}\n", .{id});
-                    }
-                }
-                try stderr.writeAll("  - Re-run with a full session id to pick one.\n");
-                return error.SessionNotFound;
-            },
-            .none => {
-                const stderr = std_io.stderrWriter();
-                const display = try formatDisplaySessionId(allocator, arg);
-                defer allocator.free(display);
-                try stderr.print("error: session resume: no such session '{s}'.\n", .{display});
-                const n = @min(entries.len, 3);
-                if (n > 0) {
-                    try stderr.writeAll("  - Most recent sessions:\n");
-                    for (entries[0..n]) |e| {
-                        try stderr.print("      {s}\n", .{e.id});
-                    }
-                    try stderr.writeAll("  - Or run `zcode session list` for the full list.\n");
-                } else {
-                    try stderr.writeAll("  - You have no saved sessions yet; run `zcode` to start one.\n");
-                }
-                return error.SessionNotFound;
-            },
-        }
-    };
+    // historical fast path), then fuzzy by id/label.
+    const session_id = try resolveResumeSubject(allocator, store, all_projects, arg);
+    defer allocator.free(session_id);
 
     try writer.print("resumed session {s}\n", .{session_id});
 
@@ -310,6 +321,72 @@ pub fn resolveForkTarget(
         .{ forked.source_session_id, forked.session_id },
     );
     return allocator.dupe(u8, forked.session_id);
+}
+
+/// sessions-storage-12: resolve `--continue`'s implicit target -- the most
+/// recent session in the current project by default (every project's most
+/// recent under `all_projects`) -- returning null when there is no previous
+/// session (mirrors `cmdSessionContinue`'s own "no previous sessions,
+/// starting new session" branch). Caller owns a non-null result.
+pub fn resolveContinueTarget(
+    allocator: std.mem.Allocator,
+    store: *session_store.Store,
+    all_projects: bool,
+) !?[]u8 {
+    const sessions = if (all_projects) try store.listAllProjects() else try store.listForActiveProject();
+    defer store.freeSessionEntries(sessions);
+    if (sessions.len == 0) return null;
+    return @as(?[]u8, try allocator.dupe(u8, sessions[0].id));
+}
+
+/// sessions-storage-12: the `--print` analogue of `resumeSessionInteractive`
+/// -- answers exactly one more prompt against an already-resolved
+/// `session_id` (applying `--fork-session` first, so a fork leaves the
+/// original untouched) without ever opening the interactive REPL, which is
+/// wrong for a `--print` caller that has no attached terminal to read from.
+/// `writer` receives the same diagnostic lines the interactive path prints
+/// (`resumed session ...`, the cross-project warning, the coordinator-mode
+/// reconciliation note, and `--fork-session`'s "forked ... into ..." note)
+/// before the caller renders the returned result. Caller owns the result
+/// (free via `session_mgmt.freeHeadlessResult`).
+pub fn runResumePrint(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    cfg: *const config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    prompt: []const u8,
+    auto_approve_high: bool,
+    strict: bool,
+    yolo_mode: bool,
+    fork_session: bool,
+    writer: anytype,
+) !sdk_output.Result {
+    store.active_cwd = cwd;
+
+    try writer.print("resumed session {s}\n", .{session_id});
+    try warnIfCrossProjectResume(store, session_id, cwd, writer);
+
+    {
+        const stored_mode = store.readMode(session_id) catch null;
+        defer if (stored_mode) |m| allocator.free(m);
+        const stored = stored_mode orelse coordinator_mode.MODE_NORMAL;
+        if (coordinator_mode.matchSessionMode(stored)) |warning| {
+            try writer.print("{s}\n", .{warning});
+        }
+    }
+
+    // sessions-storage-12: `--fork-session` branches into a NEW session id
+    // BEFORE the prompt is answered, so the answer lands on the fork and the
+    // original session's `.jsonl` is never appended to.
+    const effective_session_id = try resolveForkTarget(allocator, store, session_id, fork_session, writer);
+    defer allocator.free(effective_session_id);
+
+    return session_mgmt.runHeadlessResumeResult(allocator, cwd, cfg, policy, audit, store, mcp, browser, effective_session_id, prompt, auto_approve_high, strict, yolo_mode);
 }
 
 pub fn cmdSessionContinue(
