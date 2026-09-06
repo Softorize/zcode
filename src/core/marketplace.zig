@@ -1741,6 +1741,70 @@ test "config-layout-17: extraKnownMarketplaces in ~/.claude/settings.json appear
     try testing.expect(std.mem.indexOf(u8, rendered, "https://example.com/mp.git") != null);
 }
 
+test "config-layout-17: extraKnownMarketplaces in a PROJECT-scope .claude/settings.json is correctly ignored (reference restricts to user/policy)" {
+    // config-layout-17 verifier repro: the acceptance test's literal example
+    // places `extraKnownMarketplaces` in a single `.claude/settings.json`,
+    // which reads as project scope when that file sits in a project repo.
+    // The reference bundle is explicit that this must NOT vouch for a
+    // marketplace: "a marketplace on a network location must be declared
+    // under extraKnownMarketplaces in USER or managed settings (project/local
+    // scope cannot vouch for it)". This test proves zcode matches that
+    // restriction: the identical JSON fragment at project scope contributes
+    // nothing, while the sibling test above proves the same fragment at user
+    // scope (~/.claude/settings.json) DOES appear. Together they pin the
+    // full, reference-correct behavior rather than leaving it as an
+    // undocumented gap.
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    // HOME and the project checkout must be genuinely distinct directories --
+    // otherwise a `.claude/settings.json` written "at project scope" would
+    // physically BE `~/.claude/settings.json` too, and the test would prove
+    // nothing. `home` has no .claude/settings.json at all, so user scope
+    // contributes nothing -- any source found below must have come from
+    // project scope.
+    try tmp.dir.createDirPath(rt.io, "home");
+    const home = try @import("test_helpers.zig").tmpDirPath(allocator, &tmp, "home");
+    defer allocator.free(home);
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const proj = try @import("test_helpers.zig").tmpDirPath(allocator, &tmp, "proj");
+    defer allocator.free(proj);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", home);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    // A project-scope settings.json (as if `proj` were a project checkout)
+    // declaring the exact same extraKnownMarketplaces fragment the sibling
+    // user-scope test uses.
+    try tmp.dir.createDirPath(rt.io, "proj/.claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "proj/.claude/settings.json",
+        .data =
+        \\{"extraKnownMarketplaces":{"team-mp":{"source":{"source":"git","repo":"https://example.com/mp.git"}}}}
+        ,
+    });
+
+    // Sanity check: the file really is readable as project-scope settings
+    // (proves this is a "not consulted" gap, not a "file didn't parse" one).
+    var parsed = (try settings_sources.readSource(allocator, proj, .project, null)).?;
+    defer parsed.deinit();
+    try testing.expect(settings_sources.getObject(parsed.value, "extraKnownMarketplaces") != null);
+
+    const sources = try listSources(allocator);
+    defer freeSources(allocator, sources);
+    try testing.expectEqual(@as(usize, 0), sources.len);
+
+    const rendered = try renderSources(allocator);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "team-mp") == null);
+}
+
 test "config-layout-17: a native sources.json entry with the same name wins over extraKnownMarketplaces" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
