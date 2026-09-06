@@ -47,6 +47,8 @@ pub const repl_footer_mod = @import("repl_footer.zig");
 const figures = @import("../core/figures.zig");
 const thinking_render = @import("../core/thinking_render.zig");
 const memory_mod = @import("../core/memory.zig");
+const status_line_mod = @import("../core/status_line.zig");
+const paths_mod = @import("../core/paths.zig");
 const trust_mod = @import("../core/trust.zig");
 const trust_capabilities_mod = @import("../core/trust_capabilities.zig");
 const feedback_survey_mod = @import("../core/feedback_survey.zig");
@@ -226,6 +228,15 @@ pub const Options = struct {
     prompt_suggestion: []const u8 = "",
     inline_ghost_text: []const u8 = "",
     queued_prompt_notice: []const u8 = "",
+    /// config-layout-16: the last successfully rendered output of a
+    /// user-configured `statusLine.command` (settings.json), refreshed on
+    /// the same cadence as the other footer_* fields below. Empty when no
+    /// `statusLine` object is configured, the command has not produced any
+    /// non-blank output yet, or it failed/timed out. When non-empty,
+    /// `renderDefaultFooterLine` shows this instead of the static "? for
+    /// shortcuts" hint (mirroring the reference: the hint is hidden only
+    /// when a custom statusLine command is configured).
+    status_line_text: []const u8 = "",
     prompt_strip_items: []const repl_footer_mod.StripItem = &.{},
     prompt_strip_selection: ?usize = null,
     footer_rows: []const repl_footer_mod.Row = &.{},
@@ -6527,6 +6538,21 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
     var footer_tmux_state_buf: [48]u8 = undefined;
     var footer_worktree_state_buf: [48]u8 = undefined;
     var footer_state_refresh_at_ms: i64 = 0;
+    // config-layout-16: a `statusLine` object anywhere in the settings.json
+    // cascade (read once at session start -- it does not change mid-session
+    // without a restart, matching how the rest of `options` is seeded from
+    // `cfg`). By the time `run()` reaches here the workspace-trust gate
+    // above has already accepted or exited on any project-scope settings
+    // source, so running the configured command needs no further trust
+    // check of its own (the same assumption other workspace-provided
+    // executable content, like hooks, already relies on post-trust-gate).
+    var status_line_cfg: ?status_line_mod.StatusLineConfig = status_line_mod.readConfig(allocator, options.status_workspace) catch null;
+    defer if (status_line_cfg) |*c| c.deinit(allocator);
+    var status_line_paths: ?paths_mod.PathSet = if (status_line_cfg != null) (paths_mod.resolve(allocator) catch null) else null;
+    defer if (status_line_paths) |*p| p.deinit(allocator);
+    var status_line_text_owned: ?[]u8 = null;
+    defer if (status_line_text_owned) |b| allocator.free(b);
+    var status_line_next_refresh_ms: i64 = 0;
     // repl-ux-05: once-per-session budget for the "Press up to edit queued
     // messages" placeholder hint, ticked at most once per second (piggy-
     // backing the existing footer-state refresh cadence below) and only
@@ -6658,6 +6684,32 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                     // would exhaust the budget in well under a second.
                     if (queued_prompt_backlog.count() > 0 and input_buf.items().len == 0) {
                         queued_up_hint_ticks += 1;
+                    }
+                    if (status_line_cfg) |cfg| {
+                        if (status_line_paths) |paths_set| {
+                            if (now_ms >= status_line_next_refresh_ms) {
+                                const refresh_s: i64 = if (cfg.refresh_interval_s) |r| @max(r, 1) else 1;
+                                status_line_next_refresh_ms = now_ms + refresh_s * 1000;
+                                const rendered = status_line_mod.run(
+                                    allocator,
+                                    cfg,
+                                    options.status_workspace,
+                                    paths_set.zcode_home,
+                                    .{
+                                        .cwd = options.status_workspace,
+                                        .current_dir = options.status_workspace,
+                                        .project_dir = options.status_workspace,
+                                        .model_id = options.status_model,
+                                        .model_display_name = options.status_model,
+                                        .version = options.app_version,
+                                    },
+                                    2000,
+                                ) catch null;
+                                if (status_line_text_owned) |old| allocator.free(old);
+                                status_line_text_owned = rendered;
+                                options.status_line_text = status_line_text_owned orelse "";
+                            }
+                        }
                     }
                     options.footer_tasks_state = fetchCompactFooterState(allocator, handler, "__tasks_footer_state", footer_tasks_state_buf[0..]);
                     options.footer_teams_state = fetchCompactFooterState(allocator, handler, "__teams_footer_state", footer_teams_state_buf[0..]);
