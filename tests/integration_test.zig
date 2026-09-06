@@ -710,6 +710,58 @@ test "mock scripted bare shell prompt dispatches Bash before model" {
     try testing.expect(std.mem.indexOf(u8, try objectString(tool_calls.array.items[0].object, "output"), workspace_dir) != null);
 }
 
+test "headless-sdk-missed-184: --output-format stream-json emits a real thinking content block before the text block" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_dir = try realPathAlloc(testing.allocator, tmp.dir, ".");
+    defer testing.allocator.free(home_dir);
+
+    const result = try runZcodeWithEnv(testing.allocator, &.{
+        "--provider",       "mock",
+        "--model",          "mock-agent",
+        "--print",          "--output-format",
+        "stream-json",      "--verbose",
+        "what is the meaning of life",
+    }, &.{
+        .{ .key = "HOME", .value = home_dir },
+        .{ .key = "ZCODE_MOCK_RESPONSE", .value = "{\"assistant\":\"The answer is 42.\",\"tool_calls\":[]}" },
+        // headless-sdk-missed-184: only the mock provider adapter's OWN
+        // absence of any "inject mock thinking text" concept blocked this
+        // from being a real, CLI-observable run before -- this env var (a
+        // new, tiny addition to src/providers/mock.zig) is exactly that.
+        .{ .key = "ZCODE_MOCK_THINKING", .value = "Let me think about the meaning of life step by step." },
+    });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+
+    try expectExitZero(result);
+
+    // Find the `assistant` line and confirm its content array is
+    // `[{"type":"thinking","thinking":"..."},{"type":"text","text":"..."}]`
+    // -- a real reasoning_text captured behind the final answer, not a
+    // fabrication, and ordered before the text block per the Messages API
+    // content-ordering convention for extended thinking.
+    var it = std.mem.splitScalar(u8, result.stdout, '\n');
+    var found_assistant = false;
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"type\":\"assistant\"") == null) continue;
+        found_assistant = true;
+        var parsed = try parseJsonOutput(testing.allocator, line);
+        defer parsed.deinit();
+        const content = parsed.value.object.get("message").?.object.get("content").?.array.items;
+        try testing.expectEqual(@as(usize, 2), content.len);
+        try testing.expectEqualStrings("thinking", try objectString(content[0].object, "type"));
+        try testing.expectEqualStrings(
+            "Let me think about the meaning of life step by step.",
+            try objectString(content[0].object, "thinking"),
+        );
+        try testing.expectEqualStrings("text", try objectString(content[1].object, "type"));
+        try testing.expectEqualStrings("The answer is 42.", try objectString(content[1].object, "text"));
+    }
+    try testing.expect(found_assistant);
+}
+
 test "prompt inspect summary reports skipped preprocessor and omits packets" {
     const result = try runZcode(testing.allocator, &.{ "prompt", "inspect", "--json", "--summary", "fix", "tests" });
     defer testing.allocator.free(result.stdout);

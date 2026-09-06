@@ -1512,6 +1512,7 @@ pub fn cmdCommandsRun(
 
     const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, rendered, false, auto_approve_high, strict, yolo_mode, initial_agent);
     defer allocator.free(one_shot.body);
+    defer allocator.free(one_shot.session_id);
     try writer.writeAll(one_shot.body);
     if (!std.mem.endsWith(u8, one_shot.body, "\n")) try writer.writeByte('\n');
 }
@@ -1556,6 +1557,7 @@ pub fn cmdSkillsRun(
 
     const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, rendered, false, auto_approve_high, strict, yolo_mode, initial_agent);
     defer allocator.free(one_shot.body);
+    defer allocator.free(one_shot.session_id);
     try writer.writeAll(one_shot.body);
     if (!std.mem.endsWith(u8, one_shot.body, "\n")) try writer.writeByte('\n');
 }

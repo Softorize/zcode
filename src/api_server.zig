@@ -411,6 +411,7 @@ fn handleRequest(
         const json_mode = getParamBool(params, "json") orelse false;
         const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, prompt, json_mode, false, false, false, agent);
         defer allocator.free(one_shot.body);
+        defer allocator.free(one_shot.session_id);
         return encodeSuccessResponse(allocator, id, .{
             .output = one_shot.body,
             .strict_violation = one_shot.strict_violation,

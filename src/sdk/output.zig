@@ -94,6 +94,22 @@ pub fn validateForwardSubagentTextGate(print: bool, format: OutputFormat, forwar
     }
 }
 
+/// headless-sdk-15: `--prompt-suggestions` is only meaningful in stream-json
+/// output (a `prompt_suggestion` line inserted after `result` would break the
+/// single-JSON-object contract of `--output-format json`), matching the
+/// reference's own gate verbatim ("Error: --prompt-suggestions requires
+/// --print and --output-format=stream-json (prompt_suggestion messages are
+/// only surfaced in stream-json output).").
+pub fn validatePromptSuggestionsGate(print: bool, format: OutputFormat, prompt_suggestions: bool) error{PromptSuggestionsRequiresStreamJson}!void {
+    if (prompt_suggestions and !(print and format == .stream_json)) {
+        std_io.stderrWriter().print(
+            "Error: --prompt-suggestions requires --print and --output-format=stream-json.\n",
+            .{},
+        ) catch {};
+        return error.PromptSuggestionsRequiresStreamJson;
+    }
+}
+
 /// The result subtypes the SDK `result` message can carry. `success` is the
 /// happy path; the `error_*` variants map to the headless limit flags
 /// (sdk-headless-14). `subtype` strings match coreSchemas.ts.
@@ -867,12 +883,15 @@ pub fn serializeCommandsChanged(
 /// URL); `error_message` is optional (empty -> the `error` key is omitted).
 /// Caller owns the returned newline-terminated slice.
 ///
-/// Wire-format mostly: `--enable-auth-status` now parses (cli/args.zig,
-/// hidden from --help per the reference's `.hideHelp()`) and is stored on
-/// `CliOptions.enable_auth_status`, but no call site inside `zcode login`/
-/// `zcode mcp auth login` emits stream-json today -- wiring an actual login
-/// flow to call this serializer belongs to whichever package owns those
-/// command handlers, outside this package's ownership.
+/// `--enable-auth-status` parses (cli/args.zig, hidden from --help per the
+/// reference's `.hideHelp()`) and is threaded into `sdk_headless.RunCaps.
+/// enable_auth_status`; `sdk_headless.maybeEmitAuthStatus` is the real call
+/// site, firing once at session start (stream-json output only) with the
+/// session's actual resolved credential source. It reports that resolved
+/// state, not live OAuth device-code progress -- zcode's headless `--print`
+/// path has no interactive auth flow to report progress FROM (`zcode
+/// login`'s flows are a separate, always-interactive subcommand, never
+/// combined with `--print`), so `isAuthenticating` is always `false` here.
 pub fn serializeAuthStatus(
     allocator: std.mem.Allocator,
     is_authenticating: bool,
@@ -1297,6 +1316,17 @@ test "headless-sdk-14: validateForwardSubagentTextGate requires --print and stre
     try testing.expectError(error.ForwardSubagentTextRequiresStreamJson, validateForwardSubagentTextGate(false, .stream_json, true));
     // On, wrong output format -> rejected.
     try testing.expectError(error.ForwardSubagentTextRequiresStreamJson, validateForwardSubagentTextGate(true, .json, true));
+}
+
+test "headless-sdk-15: validatePromptSuggestionsGate requires --print and stream-json" {
+    // Off entirely -> never gated, regardless of the other flags.
+    try validatePromptSuggestionsGate(false, .text, false);
+    // On, with both requirements met -> passes.
+    try validatePromptSuggestionsGate(true, .stream_json, true);
+    // On, missing --print -> rejected.
+    try testing.expectError(error.PromptSuggestionsRequiresStreamJson, validatePromptSuggestionsGate(false, .stream_json, true));
+    // On, wrong output format -> rejected.
+    try testing.expectError(error.PromptSuggestionsRequiresStreamJson, validatePromptSuggestionsGate(true, .json, true));
 }
 
 // ── headless-sdk-05/missed-186: result uuid / user_message_uuid ────────────

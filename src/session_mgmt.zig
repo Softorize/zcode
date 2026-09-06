@@ -462,6 +462,7 @@ pub fn runOneShot(
         return .{
             .body = try allocator.dupe(u8, result.final_text),
             .strict_violation = result.strict_violation,
+            .session_id = try allocator.dupe(u8, runtime.session_id),
         };
     }
 
@@ -493,6 +494,7 @@ pub fn runOneShot(
             json_traces,
         ),
         .strict_violation = result.strict_violation,
+        .session_id = try allocator.dupe(u8, runtime.session_id),
     };
 }
 
