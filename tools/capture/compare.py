@@ -15,8 +15,10 @@ Diffs:
 - Wire JSON: structural (key-reorder tolerant), focused on
   assistant.content text and result.result text.
 - Command I/O: structured diff on command + stdout + exit_code.
-- Frames: not yet diffed (frames.bin is not captured by #562/#563);
-  reported as 'not_captured'.
+- Frames: diffed when both scenarios/<name>/{reference,zcode}/frames.bin
+  exist (r3-mock-02 added the zcode-side `zcode_runner.py --pty` capture
+  and its `reference_runner.py --pty` counterpart; see diff_frames' doc
+  comment for the four `kind` values this can report).
 
 Usage:
     python3 tools/capture/compare.py <scenario_name>
@@ -235,16 +237,57 @@ def strip_ansi(data: bytes) -> str:
 
 
 def diff_frames(scenario_name: str) -> dict:
-    """Diff the captured frames.bin between reference and zcode."""
+    """Diff the captured frames.bin between reference and zcode.
+
+    `kind` distinguishes four states rather than collapsing "nothing to
+    diff yet" into one ambiguous value (r3-mock-02 follow-up -- the
+    original two-state {not_captured, diffed} made a genuine capture
+    failure on both sides read identically to "only one side has ever been
+    captured", which is the normal, expected state for a scenario before
+    its reference-side PTY capture has been run -- see
+    tools/capture/reference_runner.py's `--pty` mode):
+      - "not_captured"          neither side has a frames.bin at all.
+      - "zcode_only_capture"    zcode captured; reference has not been
+                                 captured yet (run reference_runner.py
+                                 <name> --pty). The common state today:
+                                 no scenario in this repo has a committed
+                                 reference/ capture (see scenarios/.gitignore
+                                 -- it's a regenerable, machine-specific
+                                 artifact, not source).
+      - "reference_only_capture" the reverse (run zcode_runner.py <name>
+                                 --pty).
+      - "diffed"                both sides present; see the line-level
+                                 fields below.
+    """
     ref_frames = SCENARIOS_ROOT / scenario_name / "reference" / "frames.bin"
     zcode_frames = SCENARIOS_ROOT / scenario_name / "zcode" / "frames.bin"
+    ref_present = ref_frames.exists()
+    zcode_present = zcode_frames.exists()
 
-    if not ref_frames.exists() or not zcode_frames.exists():
+    if not ref_present and not zcode_present:
         return {
-            "reference_frames_present": ref_frames.exists(),
-            "zcode_frames_present": zcode_frames.exists(),
+            "reference_frames_present": False,
+            "zcode_frames_present": False,
             "kind": "not_captured",
-            "note": "frames.bin missing for one or both sides",
+            "note": "frames.bin missing for both sides -- run zcode_runner.py "
+                    "<name> --pty and reference_runner.py <name> --pty",
+        }
+    if zcode_present and not ref_present:
+        return {
+            "reference_frames_present": False,
+            "zcode_frames_present": True,
+            "kind": "zcode_only_capture",
+            "note": "zcode/frames.bin captured; reference/frames.bin does not "
+                    "exist yet -- run reference_runner.py <name> --pty to "
+                    "capture the real claude binary and get a genuine diff",
+        }
+    if ref_present and not zcode_present:
+        return {
+            "reference_frames_present": True,
+            "zcode_frames_present": False,
+            "kind": "reference_only_capture",
+            "note": "reference/frames.bin captured; zcode/frames.bin does not "
+                    "exist yet -- run zcode_runner.py <name> --pty",
         }
 
     ref = read_frames(ref_frames)
