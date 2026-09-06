@@ -223,6 +223,15 @@ pub const Teammate = struct {
     }
 
     /// Transition back to idle (the turn finished, waiting for work).
+    ///
+    /// hooks-permissions-03: this is the intended `TeammateIdle` hook firing
+    /// point once a live run loop calls it (see `hook_event.zig`'s
+    /// `.teammate_idle` doc comment for why that loop does not exist yet).
+    /// Not wired here directly -- this module is deliberately side-effect-
+    /// free (its own doc comment: "side effects... live in agent_runtime.zig,
+    /// which consumes this struct") -- but the future run loop's call site
+    /// should fire `hooks.runEvent(alloc, .{.event = .teammate_idle, .cwd = ..., .teammate_name = self.name, .team_name = self.team})`
+    /// immediately after calling this.
     pub fn setIdle(self: *Teammate) void {
         self.mutex.lock(rt.io) catch {};
         defer self.mutex.unlock(rt.io);

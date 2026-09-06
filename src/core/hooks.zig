@@ -14,6 +14,7 @@ const session_env = @import("session_env.zig");
 const hook_exec_prompt = @import("hook_exec_prompt.zig");
 const hook_exec_http = @import("hook_exec_http.zig");
 const hook_exec_mcp_tool = @import("hook_exec_mcp_tool.zig");
+const mcp_client = @import("../mcp/client.zig");
 const async_hook_registry = @import("async_hook_registry.zig");
 const hooks_snapshot = @import("hooks_snapshot.zig");
 const session_hooks = @import("session_hooks.zig");
@@ -157,6 +158,17 @@ pub const HookContext = struct {
     error_message: []const u8 = "",
     error_details: []const u8 = "",
     last_assistant_message: []const u8 = "",
+    /// hooks-permissions-06: an opaque handle to the live, already-connected
+    /// MCP client registry (`mcp.Client`), threaded through so an `mcp_tool`
+    /// hook can actually invoke the configured server/tool instead of always
+    /// degrading to "no bridge is connected". Cast back to `*mcp.Client` by
+    /// `mcpToolInvoker` below. Kept `*anyopaque` (rather than importing the
+    /// concrete type into every `HookContext` field list) so the vast
+    /// majority of call sites that never fire an `mcp_tool` hook stay
+    /// unaffected. Null at every call site with no live client (most unit
+    /// tests) -- `processDef` then falls back to the documented non-blocking
+    /// error, exactly as before this field existed.
+    mcp_ctx: ?*anyopaque = null,
 };
 
 /// True for the tool-shaped events: the 3 original events with an on-disk
@@ -742,6 +754,37 @@ fn runConfiguredFromSources(allocator: std.mem.Allocator, ctx: HookContext) !Hoo
     return .{ .ran = ran, .blocked = false, .output = last_output };
 }
 
+/// hooks-permissions-06: `hook_exec_mcp_tool.Invoker` adapter onto the real,
+/// live MCP client registry. `ctx` is `HookContext.mcp_ctx` cast back to its
+/// concrete type -- this is the one place in the hooks package that knows
+/// what that opaque handle actually is. `mcp.Client.invoke` has no per-call
+/// timeout knob today, so `timeout_ms` (the hook's configured/default
+/// timeout, already computed by `computeTimeoutMs`) is accepted but not yet
+/// enforced here; a stuck server tool call blocks for as long as the
+/// client's own transport-level timeout allows, same as a direct model-
+/// facing `mcp_invoke` tool call today.
+fn mcpToolInvoker(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    server: []const u8,
+    tool: []const u8,
+    input_json: []const u8,
+    timeout_ms: u64,
+) anyerror!hook_exec_mcp_tool.InvokeResult {
+    _ = timeout_ms;
+    const client: *mcp_client.Client = @ptrCast(@alignCast(ctx));
+    const output = try client.invoke(server, tool, input_json);
+    // `Client.invoke` already degrades transport/protocol failures to a
+    // descriptive text result (mirroring the model-facing `mcp_invoke` tool)
+    // rather than a distinct Zig error, so there is no separate "is_error"
+    // signal to plumb through here; `allocator` here is expected to be the
+    // same underlying allocator as `client.allocator` in every real
+    // (non-test) construction, so the caller's `allocator.free(result.output)`
+    // frees the same allocation `invoke` made.
+    _ = allocator;
+    return .{ .output = output, .is_error = false };
+}
+
 /// Process a single hook def for the current event. Returns a non-null
 /// `HookRunResult` when this def produced a short-circuiting outcome the caller
 /// must return immediately (a block, a contract signal, or a prompt/http
@@ -857,18 +900,22 @@ fn processDef(
         },
         .mcp_tool => {
             // hooks-permissions-06: invoke an already-configured MCP server's
-            // tool. No live registry hookup is wired at this call site (see
-            // hook_exec_mcp_tool.zig's header note), so this degrades to a
-            // documented non-blocking error rather than silently doing
-            // nothing -- but the type is fully parsed/dispatched, unlike
-            // before where it was silently dropped at parse time.
+            // tool. When `ctx.mcp_ctx` carries a live client (every real,
+            // non-test call site -- see agent_tools.zig/agent_runtime.zig's
+            // HookContext construction), this actually calls the server/tool
+            // via `mcpToolInvoker`. With no live client wired (most unit
+            // tests), it degrades to the documented non-blocking error
+            // instead of silently doing nothing -- but the type is fully
+            // parsed/dispatched either way, unlike before where it was
+            // silently dropped at parse time.
             ran.* = true;
             const fields = [_]hook_exec_mcp_tool.Field{
                 .{ .path = "tool_name", .value = ctx.tool_name },
                 .{ .path = "tool_input", .value = ctx.tool_args },
             };
             const mcp_timeout_ms = computeTimeoutMs(def.hook_type, def.timeout_s);
-            var outcome = hook_exec_mcp_tool.runMcpToolHook(allocator, def, &fields, mcp_timeout_ms, null, null) catch return null;
+            const invoker: ?hook_exec_mcp_tool.Invoker = if (ctx.mcp_ctx != null) mcpToolInvoker else null;
+            var outcome = hook_exec_mcp_tool.runMcpToolHook(allocator, def, &fields, mcp_timeout_ms, invoker, ctx.mcp_ctx) catch return null;
             defer outcome.deinit(allocator);
             if (outcome.blocked) {
                 const reason = outcome.reason orelse "";
@@ -971,7 +1018,30 @@ fn processDef(
     // carrying exec-form `args`, is spawned directly (no shell) so its args
     // are never re-parsed by a shell -- see runCommandWithStdin's doc comment.
     const direct_spawn = def.hook_type == .script or def.args.len > 0;
-    const run_res = runCommandWithStdin(allocator, def.body, def.args, direct_spawn, ctx.cwd, zcode_home, payload, engine_event, cmd_timeout_ms) catch return null;
+    // hooks-permissions-missed-163: an inline `script:` hook (no `file` key)
+    // has no on-disk path to exec -- `def.body` is raw script SOURCE TEXT,
+    // not a path, and would fail at spawn time as an invalid executable path
+    // if handed to `exec` as-is. Materialize it as a fresh, executable temp
+    // file (deleted after the run) and exec THAT instead, exactly like a
+    // `file`-based script hook already does. `command` hooks and file-based
+    // script hooks are unaffected: `command_path` just aliases `def.body`.
+    var inline_script_path: ?[]u8 = null;
+    defer if (inline_script_path) |p| {
+        std.Io.Dir.cwd().deleteFile(rt.io, p) catch {};
+        allocator.free(p);
+    };
+    const command_path: []const u8 = blk: {
+        if (def.hook_type == .script and def.script_inline) {
+            const p = writeInlineScriptTempFile(allocator, zcode_home, def.body) catch |err| {
+                log_hooks.debug("failed to materialize inline script hook: {s}", .{@errorName(err)});
+                return null;
+            };
+            inline_script_path = p;
+            break :blk p;
+        }
+        break :blk def.body;
+    };
+    const run_res = runCommandWithStdin(allocator, command_path, def.args, direct_spawn, ctx.cwd, zcode_home, payload, engine_event, cmd_timeout_ms) catch return null;
     defer allocator.free(run_res.stdout);
     if (run_res.timed_out) {
         // Task 16: a timed-out hook reports a `cancelled` response (reference
@@ -1170,6 +1240,23 @@ fn writeSettingsAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []
 }
 
 const CommandResult = struct { exit_code: u8, stdout: []u8, timed_out: bool = false };
+
+/// hooks-permissions-missed-163: write an inline `script:` hook's raw source
+/// text to a fresh, executable temp file under `home`, so `runCommandWithStdin`
+/// can `exec` it exactly like a `file`-based script hook's already-real path.
+/// Uses the same hex-named-under-`home` convention as the stdin payload temp
+/// file (`.hook-input-*`) so no shell quoting is needed for the path. Caller
+/// deletes the file and frees the returned path (see `processDef`'s
+/// `inline_script_path` defer).
+fn writeInlineScriptTempFile(allocator: std.mem.Allocator, home: []const u8, script_source: []const u8) ![]u8 {
+    const nonce = clock.nowNanos();
+    const path = try std.fmt.allocPrint(allocator, "{s}/.hook-script-{x}", .{ home, nonce });
+    errdefer allocator.free(path);
+    const file = try std.Io.Dir.cwd().createFile(rt.io, path, .{ .truncate = true, .permissions = std.Io.File.Permissions.fromMode(0o700) });
+    defer file.close(rt.io);
+    try file.writeStreamingAll(rt.io, script_source);
+    return path;
+}
 
 /// Run a command hook with `payload` written to a temp file so the hook
 /// receives it on stdin. Uses the one-shot runner (captures stdout, no manual
@@ -2673,4 +2760,283 @@ test "hooks-permissions-02 (corrected): StopFailure carries error/error_details/
     try testing.expectEqualStrings("RateLimited", parsed.value.object.get("error").?.string);
     try testing.expectEqualStrings("Rate limited by the API provider.", parsed.value.object.get("error_details").?.string);
     try testing.expectEqualStrings("Working on it...", parsed.value.object.get("last_assistant_message").?.string);
+}
+
+test "hooks-permissions-06: an mcp_tool hook actually invokes the configured server/tool through a real MCP client" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    // A minimal stdio MCP server (mirrors mcp/client.zig's own python-
+    // transport test): one tool, "policy_check", that echoes the interpolated
+    // `tool` argument back in a stdout-contract "block" decision so this test
+    // can observe a real round trip end to end -- settings.json parse ->
+    // hooks.processDef's `.mcp_tool` branch -> `mcpToolInvoker` ->
+    // `mcp.Client.invoke` -> a REAL subprocess -> its REAL response --
+    // rather than the `hook_exec_mcp_tool.zig` unit tests' `FakeInvoker`.
+    try tmp.dir.createDirPath(rt.io, "mcp");
+    // The stdio transport speaks LSP-style `Content-Length:`-framed JSON, not
+    // newline-delimited JSON -- mirrors mcp/client.zig's own python-transport
+    // test's read_frame/write_frame helpers exactly.
+    try writeFileMakingDirs(tmp.dir, "mcp/mock_server.py",
+        \\import sys, json
+        \\def read_frame():
+        \\    header = b""
+        \\    while b"\r\n\r\n" not in header:
+        \\        c = sys.stdin.buffer.read(1)
+        \\        if not c:
+        \\            return None
+        \\        header += c
+        \\    length = 0
+        \\    for line in header.decode("utf-8", errors="replace").split("\r\n"):
+        \\        if line.lower().startswith("content-length:"):
+        \\            length = int(line.split(":",1)[1].strip())
+        \\            break
+        \\    body = sys.stdin.buffer.read(length)
+        \\    return json.loads(body.decode("utf-8"))
+        \\def write_frame(obj):
+        \\    body = json.dumps(obj).encode("utf-8")
+        \\    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+        \\    sys.stdout.buffer.write(body)
+        \\    sys.stdout.buffer.flush()
+        \\while True:
+        \\    msg = read_frame()
+        \\    if msg is None:
+        \\        break
+        \\    method = msg.get("method", "")
+        \\    if method == "initialize":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0"}}})
+        \\    elif method == "notifications/initialized":
+        \\        pass
+        \\    elif method == "tools/list":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"tools":[{"name":"policy_check","description":"","inputSchema":{"type":"object"}}]}})
+        \\    elif method == "tools/call":
+        \\        args = msg.get("params", {}).get("arguments", {})
+        \\        reason = "blocked because tool=" + str(args.get("tool", ""))
+        \\        payload = json.dumps({"decision":"block","reason":reason})
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"content":[{"type":"text","text":payload}]}})
+    );
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "mcp/servers.json", .data = "[]" });
+    const script = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "mcp/mock_server.py");
+    defer alloc.free(script);
+    const registry = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "mcp/servers.json");
+    defer alloc.free(registry);
+
+    var client = try mcp_client.Client.init(alloc, registry);
+    defer client.deinit();
+    const transport = try std.fmt.allocPrint(alloc, "python3 '{s}'", .{script});
+    defer alloc.free(transport);
+    try client.add("policy", transport);
+
+    const settings_json =
+        \\{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"mcp_tool","server":"policy","tool":"policy_check","input":{"tool":"${tool_name}"}}]}]}}
+    ;
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings_json);
+
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"rm -rf /\"}",
+        .mcp_ctx = @ptrCast(&client),
+    });
+    defer result.deinit(alloc);
+
+    try testing.expect(result.ran);
+    try testing.expect(result.blocked);
+    // "tool=Bash" only appears if the real subprocess actually received the
+    // interpolated `${tool_name}` value and echoed it back -- proving the
+    // wiring is live, not degrading to the "no bridge is connected" message.
+    try testing.expect(std.mem.indexOf(u8, result.output, "tool=Bash") != null);
+}
+
+test "hooks-permissions-06: an mcp_tool hook degrades to a non-blocking error with no live client wired" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const settings_json =
+        \\{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"mcp_tool","server":"policy","tool":"policy_check"}]}]}}
+    ;
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings_json);
+
+    // No `.mcp_ctx` set (the default, matching every call site with no live
+    // client -- most unit tests, or a hook fired before the client binds).
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"ls\"}",
+    });
+    defer result.deinit(alloc);
+
+    try testing.expect(result.ran);
+    try testing.expect(!result.blocked);
+}
+
+test "hooks-permissions-07: a command hook's exec-form args reach argv literally, defeating shell-metacharacter injection" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const captured = try std.fs.path.join(alloc, &.{ root, "argv_capture.txt" });
+    defer alloc.free(captured);
+
+    // `command` is "/bin/sh" itself (always present+executable, so this needs
+    // no chmod dance) and `args` is what the exec form hands it as argv --
+    // this is exactly the reference's exec-form contract: `command` is
+    // resolved as an executable and spawned directly with `args`, never
+    // re-parsed by an intermediate shell. The inner `sh -c` script we
+    // deliberately chose to run then references its OWN positional
+    // parameter (`$1`) rather than interpolating the untrusted value into
+    // script text, so `$(whoami)` is captured byte-for-byte rather than
+    // being evaluated as a command substitution at any layer.
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf '%s' \\\"$1\\\" > '{s}'\",\"argv0-placeholder\",\"$(whoami)\"]}}]}}]}}}}",
+        .{captured},
+    );
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"echo hi\"}",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+    try testing.expect(!result.blocked);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(4096)) catch |err| {
+        std.debug.print("exec-form args hook did not run: {s} ({any})\n", .{ captured, err });
+        return error.ExecFormHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+    // The literal 9-byte string "$(whoami)" -- NOT an expanded username --
+    // proves the argument reached argv unexpanded by any shell, at any layer.
+    try testing.expectEqualStrings("$(whoami)", bytes);
+}
+
+test "hooks-permissions-missed-163: an inline script: hook (no file key) is materialized to a temp file and actually runs" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const captured = try std.fs.path.join(alloc, &.{ root, "inline_script_ran.txt" });
+    defer alloc.free(captured);
+
+    // No "file" key -- this is the inline-content form. Before this fix
+    // `def.body` (this raw source text) was handed directly to `exec` as a
+    // path and would fail with "not a valid path"; the fix writes it to a
+    // fresh executable temp file first.
+    const script_source = try std.fmt.allocPrint(
+        alloc,
+        "#!/bin/sh\necho ran > '{s}'\n",
+        .{captured},
+    );
+    defer alloc.free(script_source);
+    var settings_buf: std.Io.Writer.Allocating = .init(alloc);
+    defer settings_buf.deinit();
+    try settings_buf.writer.writeAll("{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"script\",\"script\":");
+    try std.json.Stringify.encodeJsonString(script_source, .{}, &settings_buf.writer);
+    try settings_buf.writer.writeAll("}]}]}}");
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings_buf.written());
+
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"echo hi\"}",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+    try testing.expect(!result.blocked);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(4096)) catch |err| {
+        std.debug.print("inline script: hook did not run: {s} ({any})\n", .{ captured, err });
+        return error.InlineScriptHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+    try testing.expectEqualStrings("ran\n", bytes);
+}
+
+test "hooks-permissions-missed-163: a file-based script hook still runs a real script path unchanged" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const captured = try std.fs.path.join(alloc, &.{ root, "file_script_ran.txt" });
+    defer alloc.free(captured);
+    const script_body = try std.fmt.allocPrint(alloc, "#!/bin/sh\necho ran > '{s}'\n", .{captured});
+    defer alloc.free(script_body);
+    try writeFileMakingDirs(tmp.dir, "scripts/hook.sh", script_body);
+    const script_path = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "scripts/hook.sh");
+    defer alloc.free(script_path);
+    {
+        const file = try std.Io.Dir.cwd().openFile(rt.io, script_path, .{});
+        defer file.close(rt.io);
+        try file.setPermissions(rt.io, std.Io.File.Permissions.fromMode(0o700));
+    }
+
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"script\",\"file\":\"{s}\"}}]}}]}}}}",
+        .{script_path},
+    );
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"echo hi\"}",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+    try testing.expect(!result.blocked);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(4096)) catch |err| {
+        std.debug.print("file-based script: hook did not run: {s} ({any})\n", .{ captured, err });
+        return error.FileScriptHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+    try testing.expectEqualStrings("ran\n", bytes);
 }

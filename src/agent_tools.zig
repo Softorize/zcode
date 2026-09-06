@@ -791,6 +791,21 @@ pub const ToolExecContext = struct {
     /// (`AgentRuntime.transcript_path`), threaded the same way as
     /// `session_id` above.
     transcript_path: []const u8 = "",
+    /// hooks-permissions-09: the reference `Se` base schema's optional
+    /// `prompt_id` -- a per-user-turn correlator synthesized once at the top
+    /// of the root `AgentRuntime`'s `handlePromptDetailed*` (mirroring how
+    /// `tool_use_id` is synthesized once per tool call) and inherited by any
+    /// sub-agent spawned during that turn (`AgentRuntime.promptId()`). Empty
+    /// at every non-main call site, which `hook_io` treats as "omit".
+    prompt_id: []const u8 = "",
+    /// hooks-permissions-09: the reference `Se` base schema's optional
+    /// `agent_id`. zcode has no distinguishing identity for the single root
+    /// agent, so this stays empty there (an absent `agent_id` is valid per
+    /// the reference schema); a sub-agent spawned via the Agent/Task tool
+    /// gets one synthesized at spawn time (`AgentRuntime.agentId()`), so its
+    /// own tool calls and the parent's SubagentStart/SubagentStop hooks about
+    /// it all carry the same id.
+    agent_id: []const u8 = "",
 };
 
 /// Resolve the approval-mode string the gate evaluates under: a live permission
@@ -1407,6 +1422,9 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
         .tool_args = args,
         .session_id = ctx.session_id,
         .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
         .permission_mode = effectiveApprovalMode(ctx),
         .tool_use_id = tool_use_id,
     });
@@ -1642,6 +1660,9 @@ fn firePermissionRequestHook(ctx: ToolExecContext, tool_name: []const u8, tool_a
         .reason = reason,
         .session_id = ctx.session_id,
         .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
         .permission_mode = effectiveApprovalMode(ctx),
     }) catch return;
     result.deinit(ctx.allocator);
@@ -1664,6 +1685,9 @@ fn firePermissionDeniedHook(ctx: ToolExecContext, tool_name: []const u8, tool_ar
         .reason = reason,
         .session_id = ctx.session_id,
         .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
         .permission_mode = effectiveApprovalMode(ctx),
     }) catch return;
     result.deinit(ctx.allocator);
@@ -1715,6 +1739,9 @@ fn firePostToolUseFailureHook(ctx: ToolExecContext, tool_name: []const u8, tool_
         .tool_success = false,
         .session_id = ctx.session_id,
         .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
         .permission_mode = effectiveApprovalMode(ctx),
         .tool_use_id = tool_use_id,
         .duration_ms = @intCast(@max(@as(i64, 0), duration_ms)),
@@ -1756,6 +1783,9 @@ fn fireFileChangedHook(ctx: ToolExecContext, name: []const u8, args: []const u8)
         .file_change_event = change_event,
         .session_id = ctx.session_id,
         .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
         .permission_mode = effectiveApprovalMode(ctx),
     }) catch return;
     result.deinit(ctx.allocator);
@@ -1816,6 +1846,9 @@ fn runApprovedToolTrace(
             .tool_args = args,
             .session_id = ctx.session_id,
             .transcript_path = ctx.transcript_path,
+            .prompt_id = ctx.prompt_id,
+            .agent_id = ctx.agent_id,
+            .mcp_ctx = @ptrCast(ctx.mcp),
             .permission_mode = effectiveApprovalMode(ctx),
             .tool_use_id = tool_use_id,
         });
@@ -1917,6 +1950,9 @@ fn runApprovedToolTrace(
         .tool_success = executed,
         .session_id = ctx.session_id,
         .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
         .permission_mode = effectiveApprovalMode(ctx),
         // hooks-permissions-09: the same per-call id PreToolUse saw (when run
         // in this function -- see the top-of-function doc comment) and the
@@ -6008,6 +6044,103 @@ test "hooks-permissions-09: a real successful call's PreToolUse and PostToolUse 
     // duration_ms is present (non-negative; the test clock has second
     // granularity so it may legitimately read 0 for a fast call).
     try testing.expect(post_parsed.value.object.get("duration_ms").?.integer >= 0);
+}
+
+test "hooks-permissions-09: PreToolUse and PostToolUse carry agent_id/prompt_id when ToolExecContext sets them" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const pre_captured = try std.fs.path.join(alloc, &.{ root, "pre_ids.json" });
+    defer alloc.free(pre_captured);
+    const post_captured = try std.fs.path.join(alloc, &.{ root, "post_ids.json" });
+    defer alloc.free(post_captured);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"PostToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ pre_captured, post_captured },
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "tiered-auto");
+    cfg.mcp_tool_bridge_enabled = false;
+    alloc.free(cfg.sandbox);
+    cfg.sandbox = try alloc.dupe(u8, "danger-full-access");
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    // hooks-permissions-09: these are what AgentRuntime.buildToolExecContext
+    // now threads through from AgentRuntime.promptId()/agentId() (a
+    // sub-agent's synthesized id, in the production path) -- set directly
+    // here so the test exercises the payload-building side without needing
+    // a full sub-agent spawn.
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = null,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+        .prompt_id = "prompt_deadbeef",
+        .agent_id = "agent_cafef00d",
+    };
+
+    var trace = try executeToolCall(ctx, "Bash", "command=echo hi");
+    defer trace.deinit(alloc);
+    try testing.expect(trace.executed);
+
+    const pre_bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, pre_captured, alloc, .limited(16 * 1024));
+    defer alloc.free(pre_bytes);
+    var pre_parsed = try std.json.parseFromSlice(std.json.Value, alloc, pre_bytes, .{});
+    defer pre_parsed.deinit();
+    try testing.expectEqualStrings("prompt_deadbeef", pre_parsed.value.object.get("prompt_id").?.string);
+    try testing.expectEqualStrings("agent_cafef00d", pre_parsed.value.object.get("agent_id").?.string);
+
+    const post_bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, post_captured, alloc, .limited(16 * 1024));
+    defer alloc.free(post_bytes);
+    var post_parsed = try std.json.parseFromSlice(std.json.Value, alloc, post_bytes, .{});
+    defer post_parsed.deinit();
+    try testing.expectEqualStrings("prompt_deadbeef", post_parsed.value.object.get("prompt_id").?.string);
+    try testing.expectEqualStrings("agent_cafef00d", post_parsed.value.object.get("agent_id").?.string);
 }
 
 test "hooks-permissions-03: FileChanged fires with file_path and event=add after a successful Write" {
