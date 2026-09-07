@@ -4134,9 +4134,10 @@ test "cli-flags-05: --agents with a JSON array (not an object) is rejected" {
 test "cli-flags-06: --mcp-config accepts inline JSON, repeats, and --strict-mcp-config" {
     const allocator = testing.allocator;
     const argv = [_][]const u8{
-        "--mcp-config", "{\"mcpServers\":{\"foo\":{\"command\":\"echo\"}}}",
-        "--mcp-config", "{\"mcpServers\":{\"bar\":{\"command\":\"echo\"}}}",
-        "--strict-mcp-config", "run", "x",
+        "--mcp-config",        "{\"mcpServers\":{\"foo\":{\"command\":\"echo\"}}}",
+        "--mcp-config",        "{\"mcpServers\":{\"bar\":{\"command\":\"echo\"}}}",
+        "--strict-mcp-config", "run",
+        "x",
     };
     var opts = try parse(allocator, argv[0..]);
     defer opts.deinit(allocator);
@@ -4159,9 +4160,8 @@ test "cli-flags-06: --mcp-config rejects a nonexistent path that isn't inline JS
 test "cli-flags-07: repeated --plugin-dir and --plugin-url each accumulate" {
     const allocator = testing.allocator;
     const argv = [_][]const u8{
-        "--plugin-dir", "./a", "--plugin-dir", "./b",
-        "--plugin-url", "https://x/a.zip",
-        "run", "x",
+        "--plugin-dir", "./a",             "--plugin-dir", "./b",
+        "--plugin-url", "https://x/a.zip", "run",          "x",
     };
     var opts = try parse(allocator, argv[0..]);
     defer opts.deinit(allocator);

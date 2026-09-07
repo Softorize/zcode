@@ -395,10 +395,10 @@ fn handleTeamOnboarding(allocator: std.mem.Allocator, runtime: *AgentRuntime) !?
 /// though they might share a first word with something benign. Checked
 /// before the read-only allowlist so nothing here can slip through.
 const MUTATING_PREFIXES = [_][]const u8{
-    "rm",        "mv",          "cp -r",     "git push",  "git commit", "git reset",
-    "git checkout", "git merge", "git rebase", "git clean", "npm install", "npm publish",
-    "yarn add",  "pip install", "curl -x",   "sudo",      "chmod",      "chown",
-    "kill",      "dd",          "docker rm", "docker push", "eval",
+    "rm",           "mv",          "cp -r",      "git push",    "git commit",  "git reset",
+    "git checkout", "git merge",   "git rebase", "git clean",   "npm install", "npm publish",
+    "yarn add",     "pip install", "curl -x",    "sudo",        "chmod",       "chown",
+    "kill",         "dd",          "docker rm",  "docker push", "eval",
 };
 
 /// Bash prefixes (or exact commands) safe to auto-approve. Kept short and
@@ -406,14 +406,14 @@ const MUTATING_PREFIXES = [_][]const u8{
 /// user actually ran this session; being conservative just means more
 /// prompts stay asked, never that something unsafe gets auto-allowed.
 const READ_ONLY_PREFIXES = [_][]const u8{
-    "ls",           "cat",         "pwd",          "echo",        "which",
-    "whoami",       "date",        "head",         "tail",        "wc",
-    "grep",         "find",        "file",         "stat",        "diff",
-    "tree",         "env",         "printenv",     "true",        "false",
-    "uname",        "git status",  "git log",      "git diff",    "git show",
-    "git branch",   "git remote",  "git blame",    "git describe", "git rev-parse",
-    "npm ls",       "npm list",    "npm view",     "npm outdated", "node --version",
-    "node -v",      "python --version", "python3 --version", "zig version", "go version",
+    "ls",              "cat",              "pwd",               "echo",         "which",
+    "whoami",          "date",             "head",              "tail",         "wc",
+    "grep",            "find",             "file",              "stat",         "diff",
+    "tree",            "env",              "printenv",          "true",         "false",
+    "uname",           "git status",       "git log",           "git diff",     "git show",
+    "git branch",      "git remote",       "git blame",         "git describe", "git rev-parse",
+    "npm ls",          "npm list",         "npm view",          "npm outdated", "node --version",
+    "node -v",         "python --version", "python3 --version", "zig version",  "go version",
     "cargo --version",
 };
 

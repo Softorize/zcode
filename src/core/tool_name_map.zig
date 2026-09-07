@@ -11,21 +11,21 @@ const std = @import("std");
 /// Authoritative set of reference-exact model-facing tool names
 /// (claude-code-main TOOL_NAME constants), minus auth/Windows/Ant-only tools.
 pub const reference_names = [_][]const u8{
-    "Agent",              "AskUserQuestion", "Bash",
-    "CronCreate",         "CronDelete",      "CronList",
-    "Edit",               "EnterPlanMode",   "EnterWorktree",
-    "ExitPlanMode",       "ExitWorktree",    "EndConversation",
-    "Glob",               "Grep",            "ListAgents",
-    "ListMcpResourcesTool", "LSP",           "Monitor",
-    "MultiEdit",          "NotebookEdit",    "PushNotification",
-    "Read",               "ReadMcpResourceTool", "ReadMcpResourceDirTool",
-    "ReportFindings",     "ScheduleWakeup",  "SendMessage",
-    "SendUserFile",       "SendUserMessage", "Skill",
-    "Sleep",              "Task",            "TaskCreate",
-    "TaskGet",            "TaskList",        "TaskOutput",
-    "TaskStop",           "TaskUpdate",      "TeamCreate",
-    "TeamDelete",         "TodoWrite",       "ToolSearch",
-    "WebFetch",           "WebSearch",       "Write",
+    "Agent",                "AskUserQuestion",     "Bash",
+    "CronCreate",           "CronDelete",          "CronList",
+    "Edit",                 "EnterPlanMode",       "EnterWorktree",
+    "ExitPlanMode",         "ExitWorktree",        "EndConversation",
+    "Glob",                 "Grep",                "ListAgents",
+    "ListMcpResourcesTool", "LSP",                 "Monitor",
+    "MultiEdit",            "NotebookEdit",        "PushNotification",
+    "Read",                 "ReadMcpResourceTool", "ReadMcpResourceDirTool",
+    "ReportFindings",       "ScheduleWakeup",      "SendMessage",
+    "SendUserFile",         "SendUserMessage",     "Skill",
+    "Sleep",                "Task",                "TaskCreate",
+    "TaskGet",              "TaskList",            "TaskOutput",
+    "TaskStop",             "TaskUpdate",          "TeamCreate",
+    "TeamDelete",           "TodoWrite",           "ToolSearch",
+    "WebFetch",             "WebSearch",           "Write",
 };
 
 const Pair = struct { alias: []const u8, canonical: []const u8 };

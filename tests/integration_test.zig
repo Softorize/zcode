@@ -718,10 +718,10 @@ test "headless-sdk-missed-184: --output-format stream-json emits a real thinking
     defer testing.allocator.free(home_dir);
 
     const result = try runZcodeWithEnv(testing.allocator, &.{
-        "--provider",       "mock",
-        "--model",          "mock-agent",
-        "--print",          "--output-format",
-        "stream-json",      "--verbose",
+        "--provider",                  "mock",
+        "--model",                     "mock-agent",
+        "--print",                     "--output-format",
+        "stream-json",                 "--verbose",
         "what is the meaning of life",
     }, &.{
         .{ .key = "HOME", .value = home_dir },

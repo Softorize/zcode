@@ -753,7 +753,7 @@ test "list() keeps a dead .stopped entry but sweeps a dead .idle one (cli-flags-
     // Two short-lived children we can register then let die, one marked
     // .stopped (kill/stop's contract) and one left .idle (a crash).
     var stopped_child = std.process.spawn(rt.io, .{
-        .argv = &.{ "true" },
+        .argv = &.{"true"},
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -761,7 +761,7 @@ test "list() keeps a dead .stopped entry but sweeps a dead .idle one (cli-flags-
     const stopped_pid: i32 = @intCast(stopped_child.id orelse return error.SkipZigTest);
 
     var idle_child = std.process.spawn(rt.io, .{
-        .argv = &.{ "true" },
+        .argv = &.{"true"},
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,

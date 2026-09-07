@@ -606,24 +606,28 @@ pub fn builtinSchemas() []const types.ToolSchema {
 /// name appears here.
 pub const ALWAYS_LOADED_TOOL_NAMES = [_][]const u8{
     // Zcode-only primaries with no advertised PascalCase counterpart.
-    "git_status",    "git_apply",
+    "git_status",      "git_apply",
     // Claude Code-style aliases
-    "Bash",          "Read",
-    "Write",         "Edit",         "MultiEdit",       "Glob",
-    "Grep",          "GitDiff",      "GitLog",          "GitCommit",
+    "Bash",            "Read",
+    "Write",           "Edit",
+    "MultiEdit",       "Glob",
+    "Grep",            "GitDiff",
+    "GitLog",          "GitCommit",
     // Web (commonly needed, cheap)
-    "WebFetch",      "WebSearch",
+    "WebFetch",        "WebSearch",
     // Mode control + clarification + tracking
-    "EnterPlanMode", "ExitPlanMode", "AskUserQuestion", "TodoWrite",
+    "EnterPlanMode",   "ExitPlanMode",
+    "AskUserQuestion", "TodoWrite",
     // tools-25: the reference's observed 2.1.261 always-loaded set includes
     // Agent, ListAgents, ReportFindings, ScheduleWakeup, and Skill alongside
     // Bash/Edit/Read/Write/AskUserQuestion/ToolSearch (cc_system_prompt_2.1.261.md
     // header) -- the previous list omitted Skill and Agent entirely (deferring
     // both by default), the reverse of the reference's split.
-    "Agent",         "Skill",        "ListAgents",      "ReportFindings",
+    "Agent",           "Skill",
+    "ListAgents",      "ReportFindings",
     "ScheduleWakeup",
     // The deferral gate itself MUST always load
-    "ToolSearch",
+     "ToolSearch",
 };
 
 pub fn isAlwaysLoadedToolName(name: []const u8) bool {

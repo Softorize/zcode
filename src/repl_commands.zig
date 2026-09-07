@@ -10674,8 +10674,7 @@ test "commands-29: /debug <issue> genuinely blocks a mutating tool call, not jus
 
     // Script the mock model to try a mutating tool call first, then give a
     // final answer with no further tool calls once it is rejected.
-    try env_mod.setOverride(
-        "ZCODE_MOCK_RESPONSES",
+    try env_mod.setOverride("ZCODE_MOCK_RESPONSES",
         \\["{\"assistant\":\"I'll just fix it directly.\",\"tool_calls\":[{\"name\":\"Write\",\"args\":{\"path\":\"x.txt\",\"content\":\"patched\"}}]}","{\"assistant\":\"Investigation complete; here is what I found (read-only).\",\"tool_calls\":[]}"]
     );
 

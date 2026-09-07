@@ -1218,9 +1218,9 @@ const testing = std.testing;
 
 test "ControlSubtype round-trips through strings; unknown maps to unsupported" {
     const all = [_]ControlSubtype{
-        .interrupt,   .can_use_tool,            .initialize,     .set_permission_mode,
-        .set_model,   .set_max_thinking_tokens, .hook_callback,  .elicitation,
-        .mcp_status,  .rewind_files,           .mcp_message,
+        .interrupt,  .can_use_tool,            .initialize,    .set_permission_mode,
+        .set_model,  .set_max_thinking_tokens, .hook_callback, .elicitation,
+        .mcp_status, .rewind_files,            .mcp_message,
     };
     for (all) |s| {
         try testing.expectEqual(s, ControlSubtype.fromString(s.toString()));

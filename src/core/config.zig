@@ -1173,9 +1173,9 @@ test "validate accepts valid default config" {
 test "validate accepts every Claude Code reference permission-mode spelling (cli-flags-01)" {
     const allocator = testing.allocator;
     const reference_modes = [_][]const u8{
-        "acceptEdits", "accept-edits", "plan", "bypassPermissions", "bypass", "dontAsk", "dont-ask",
+        "acceptEdits", "accept-edits", "plan",   "bypassPermissions", "bypass", "dontAsk", "dont-ask",
         // zcode's own legacy modes must keep validating too.
-        "tiered-auto", "manual", "strict",
+        "tiered-auto", "manual",       "strict",
     };
     for (reference_modes) |mode| {
         var cfg = try Config.init(allocator);

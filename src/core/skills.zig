@@ -519,10 +519,10 @@ fn discoverNestedSkills(
 /// even without a `.gitignore` covering them, mirroring the equivalent list in
 /// `repl_global_search.zig`'s `shouldSkipWalkPath`.
 const pruned_tree_dirs = [_][]const u8{
-    ".git",          "node_modules", ".zig-cache", "zig-out",
-    ".venv",         "venv",         "__pycache__", "target",
-    "build",         "dist",         ".cache",     ".next",
-    ".nuxt",         ".svelte-kit",  "vendor",     ".hg",
+    ".git",  "node_modules", ".zig-cache",  "zig-out",
+    ".venv", "venv",         "__pycache__", "target",
+    "build", "dist",         ".cache",      ".next",
+    ".nuxt", ".svelte-kit",  "vendor",      ".hg",
     ".svn",
 };
 
