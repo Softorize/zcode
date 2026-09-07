@@ -28,6 +28,12 @@ zcode runner (#563).
   `wire.jsonl` will contain the mock's responses, which is fine for
   format verification but not for behavioral parity claims.
 - Scenarios 9-10 require a real PTY; both runners (reference and zcode)
-  use the same PTY recorder.
+  use the same PTY recorder (`tools/capture/pty_capture.py`'s
+  `run_interactive`), invoked as `<runner>.py <name> --pty` (r3-mock-02).
+  `ux-spinner-basic` is captured on the zcode side; its reference-side
+  capture is a manual, opt-in step (`reference_runner.py ux-spinner-basic
+  --pty`) because it spends one real model turn against the caller's
+  Claude Code account -- not run by `zig build test` or CI.
+  `ux-permission-prompt` (#9) is not yet authored.
 - The corpus is intentionally small. Phase 1+ slices will expand it
   per feature.

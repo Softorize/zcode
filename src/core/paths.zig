@@ -88,6 +88,55 @@ pub fn resolve(allocator: std.mem.Allocator) !PathSet {
     };
 }
 
+/// Resolve `~/.claude`, the reference's user-scope config home -- independent
+/// of zcode's own `~/.zcode` / `$XDG_CONFIG_HOME/zcode` home. Every
+/// config-layout compatibility fallback ("also read the Claude Code
+/// location") shares this single HOME lookup so a machine or repo already
+/// configured for Claude Code works with zcode unchanged (see
+/// docs: the `wp5a-config-layout` package notes).
+pub fn claudeHomeDir(allocator: std.mem.Allocator) ![]u8 {
+    const home = @import("env.zig").getOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => try allocator.dupe(u8, "/tmp"),
+        else => return err,
+    };
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".claude" });
+}
+
+/// Join a relative path onto `~/.claude` (e.g. "settings.json", "commands",
+/// "agents/reviewer.md"). Caller owns the returned slice.
+pub fn claudeHomePathAlloc(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
+    const home = try claudeHomeDir(allocator);
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, rel });
+}
+
+/// config-layout-missed-149: the reference's OS-standard enterprise
+/// managed-settings.json install path -- an admin-owned, unprivileged-user-
+/// unwritable location distinct from zcode's own user-writable
+/// `{zcode_home}/policy/settings.json` (which `settings_sources.zig`'s
+/// `.policy` source already reads, and which a non-admin user can freely
+/// edit -- defeating the point of a managed tier the user themselves cannot
+/// override). Returns null on a platform with no defined reference path
+/// (only macOS/Linux/Windows are, per the reference's own deployment docs).
+///
+/// `ZCODE_MANAGED_SETTINGS_JSON` overrides the OS default for CI/testing,
+/// mirroring `config_parse.resolveManagedConfigPath`'s
+/// `ZCODE_MANAGED_CONFIG` override for the same reason: the real path is a
+/// fixed absolute system location that test fixtures must never touch.
+pub fn managedSettingsJsonPath(allocator: std.mem.Allocator) !?[]u8 {
+    if (@import("env.zig").getenv("ZCODE_MANAGED_SETTINGS_JSON")) |p| {
+        const trimmed = std.mem.trim(u8, p, " \t\r\n");
+        if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+    }
+    return switch (@import("builtin").os.tag) {
+        .macos => try allocator.dupe(u8, "/Library/Application Support/ClaudeCode/managed-settings.json"),
+        .linux => try allocator.dupe(u8, "/etc/claude-code/managed-settings.json"),
+        .windows => try allocator.dupe(u8, "C:\\Program Files\\ClaudeCode\\managed-settings.json"),
+        else => null,
+    };
+}
+
 pub fn workspaceConfigPath(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
     return workspacePathAlloc(allocator, cwd, "config.toml");
 }
@@ -132,6 +181,44 @@ pub fn workspaceDirNameAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]u
     return allocator.dupe(u8, PRIMARY_WORKSPACE_DIR);
 }
 
+/// Cap on a sanitized per-project session-directory slug before a stable
+/// hash suffix is appended (sessions-storage-02), matching Claude Code's own
+/// `MAX_SANITIZED_LENGTH` in `sessionStoragePortable.ts`.
+pub const MAX_SANITIZED_PROJECT_SLUG_LEN: usize = 200;
+
+/// Derive a filesystem-safe per-project directory slug from an absolute
+/// `cwd`, mirroring Claude Code's `sanitizePath`: every byte outside
+/// `[a-zA-Z0-9]` becomes `-`, and a slug longer than
+/// `MAX_SANITIZED_PROJECT_SLUG_LEN` is truncated with a stable FNV-1a hash
+/// suffix (computed over the FULL sanitized string, not just the truncated
+/// prefix) so two long paths sharing a 200-char prefix never collide.
+/// Empty `cwd` maps to `"unknown"` -- sessions-storage-02's
+/// `Store.projectDirForCwd` uses this for sessions with no known origin
+/// rather than silently dropping them. Mirrors (in spirit, not literal
+/// implementation) the simpler per-project key `core/kairos_lock.projectKey`
+/// already uses for the KAIROS lock directory. Caller owns the result.
+pub fn projectSlug(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
+    if (cwd.len == 0) return allocator.dupe(u8, "unknown");
+
+    const sanitized = try allocator.alloc(u8, cwd.len);
+    defer allocator.free(sanitized);
+    for (cwd, 0..) |c, i| {
+        const is_alnum = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
+        sanitized[i] = if (is_alnum) c else '-';
+    }
+
+    if (sanitized.len <= MAX_SANITIZED_PROJECT_SLUG_LEN) {
+        return allocator.dupe(u8, sanitized);
+    }
+
+    var hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for (sanitized) |b| {
+        hash ^= b;
+        hash *%= 0x100000001b3; // FNV-1a prime
+    }
+    return std.fmt.allocPrint(allocator, "{s}-{x}", .{ sanitized[0..MAX_SANITIZED_PROJECT_SLUG_LEN], hash });
+}
+
 pub fn ensureDir(path: []const u8) !void {
     std.Io.Dir.cwd().createDirPath(rt.io, path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -153,4 +240,67 @@ test "workspaceDirNameAlloc returns dir" {
     const name = try workspaceDirNameAlloc(alloc, "/p");
     defer alloc.free(name);
     try testing.expectEqualStrings(PRIMARY_WORKSPACE_DIR, name);
+}
+
+test "claudeHomePathAlloc joins onto HOME/.claude" {
+    const alloc = testing.allocator;
+    const home = try @import("env.zig").getOwned(alloc, "HOME");
+    defer alloc.free(home);
+
+    const settings = try claudeHomePathAlloc(alloc, "settings.json");
+    defer alloc.free(settings);
+
+    const expected = try std.fs.path.join(alloc, &.{ home, ".claude", "settings.json" });
+    defer alloc.free(expected);
+    try testing.expectEqualStrings(expected, settings);
+}
+
+// config-layout-missed-149: OS-standard enterprise managed-settings.json path.
+test "managedSettingsJsonPath resolves a platform default on macOS/Linux/Windows" {
+    const alloc = testing.allocator;
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+
+    const path = try managedSettingsJsonPath(alloc);
+    defer if (path) |p| alloc.free(p);
+
+    switch (@import("builtin").os.tag) {
+        .macos => try testing.expectEqualStrings("/Library/Application Support/ClaudeCode/managed-settings.json", path.?),
+        .linux => try testing.expectEqualStrings("/etc/claude-code/managed-settings.json", path.?),
+        .windows => try testing.expectEqualStrings("C:\\Program Files\\ClaudeCode\\managed-settings.json", path.?),
+        else => try testing.expect(path == null),
+    }
+}
+
+test "managedSettingsJsonPath honors the ZCODE_MANAGED_SETTINGS_JSON test override" {
+    const alloc = testing.allocator;
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("ZCODE_MANAGED_SETTINGS_JSON", "/tmp/fake-managed-settings.json");
+
+    const path = (try managedSettingsJsonPath(alloc)).?;
+    defer alloc.free(path);
+    try testing.expectEqualStrings("/tmp/fake-managed-settings.json", path);
+}
+
+test "projectSlug sanitizes non-alnum bytes and handles empty/long input" {
+    const alloc = testing.allocator;
+
+    const empty = try projectSlug(alloc, "");
+    defer alloc.free(empty);
+    try testing.expectEqualStrings("unknown", empty);
+
+    const simple = try projectSlug(alloc, "/Users/dev/zig-code");
+    defer alloc.free(simple);
+    try testing.expectEqualStrings("-Users-dev-zig-code", simple);
+
+    // Two different long paths sharing the same 200-char prefix must
+    // produce different slugs (via the hash suffix), not collide.
+    const prefix = "/Users/dev/" ++ ("x" ** 200);
+    const a = try projectSlug(alloc, prefix ++ "/project-a");
+    defer alloc.free(a);
+    const b = try projectSlug(alloc, prefix ++ "/project-b");
+    defer alloc.free(b);
+    try testing.expect(!std.mem.eql(u8, a, b));
+    try testing.expect(a.len > MAX_SANITIZED_PROJECT_SLUG_LEN);
 }

@@ -22,6 +22,7 @@ const std = @import("std");
 const rt = @import("zcode_runtime");
 const paths = @import("paths.zig");
 const parse_helpers = @import("parse_helpers.zig");
+const std_io = @import("std_io.zig");
 
 /// Cap on a single settings.json file. 256 KiB matches the cap used for
 /// hook settings.json reads in `core/hooks.zig`. readFileAlloc(.limited(N))
@@ -94,10 +95,15 @@ pub fn sourceOrder() [5]Source {
 /// returned slice. Returns null for the `flag` source when no `--settings`
 /// path was supplied (the source is then empty).
 ///
-/// - user    -> {zcode_home}/settings.json
+/// - user    -> {zcode_home}/settings.json (also `~/.claude/settings.json`,
+///              see `readSource`/`readUserSource`; this returns only the
+///              zcode-native half, for display/provenance purposes)
 /// - project -> {cwd}/.claude/settings.json
 /// - local   -> {cwd}/.claude/settings.local.json
-/// - policy  -> {zcode_home}/policy/settings.json
+/// - policy  -> {zcode_home}/policy/settings.json (also the reference's
+///              OS-standard managed-settings.json when the platform has
+///              one, see `readSource`/`readPolicySource` -- config-layout-
+///              missed-149; this returns only the zcode-native half)
 /// - flag    -> the explicit --settings path (or null when unset)
 pub fn sourcePath(
     allocator: std.mem.Allocator,
@@ -145,9 +151,73 @@ pub fn readSource(
     source: Source,
     flag_path: ?[]const u8,
 ) !?std.json.Parsed(std.json.Value) {
+    // config-layout-01: the user scope reads BOTH `~/.claude/settings.json`
+    // (the reference location) and zcode's own `{zcode_home}/settings.json`,
+    // merged with zcode winning on a shared key. Every other scope is a
+    // single-file read.
+    if (source == .user) return readUserSource(allocator);
+    // config-layout-missed-149: the policy scope additionally reads the
+    // reference's OS-standard managed-settings.json, winning on a shared
+    // key over zcode's own user-writable policy file.
+    if (source == .policy) return readPolicySource(allocator);
+
     const path = (try sourcePath(allocator, cwd, source, flag_path)) orelse return null;
     defer allocator.free(path);
 
+    return readSettingsFile(allocator, path);
+}
+
+/// Shallow-merge two already-parsed settings objects at the top level,
+/// `override`'s keys winning a shared key. Either input may be null (no file
+/// present at that path); the result is null only when both are. When only
+/// one side has a value, it is returned UNCHANGED (no reparse cost) -- the
+/// common case for both call sites below. Consumes (deinits) both inputs
+/// when actually merging; the stringify-then-reparse step is required
+/// because each side's `Value` aliases its own `Parsed`'s backing memory, so
+/// a merged view must be serialized to text before either side is torn
+/// down, then reparsed into an independent, freshly-owned `Parsed`. Mirrors
+/// the same technique `agents.zig`'s `parseAgentMcpServers` uses to avoid a
+/// bespoke deep-clone.
+fn mergeSettingsSources(
+    allocator: std.mem.Allocator,
+    base: ?std.json.Parsed(std.json.Value),
+    override: ?std.json.Parsed(std.json.Value),
+) !?std.json.Parsed(std.json.Value) {
+    var base_v = base;
+    var override_v = override;
+    if (base_v == null and override_v == null) return null;
+    if (base_v == null) return override_v;
+    if (override_v == null) return base_v;
+
+    defer base_v.?.deinit();
+    defer override_v.?.deinit();
+
+    var merged: std.json.ObjectMap = .empty;
+    defer merged.deinit(allocator);
+
+    if (base_v.?.value == .object) {
+        var it = base_v.?.value.object.iterator();
+        while (it.next()) |entry| try merged.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    // `override`'s keys are inserted last so `ObjectMap.put`'s overwrite
+    // semantics let them win a same-key conflict.
+    if (override_v.?.value == .object) {
+        var it = override_v.?.value.object.iterator();
+        while (it.next()) |entry| try merged.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+    }
+
+    var body = std_io.StringBuilder.init(allocator);
+    defer body.deinit();
+    try std.json.Stringify.value(std.json.Value{ .object = merged }, .{}, body.writer());
+
+    return parse_helpers.parseJsonBounded(std.json.Value, allocator, body.items()) catch null;
+}
+
+/// Shared bounded-JSON-file reader used by every disk-backed source. Missing
+/// file, oversize file (StreamTooLong), and parse errors all degrade to null
+/// (a lenient read, mirroring the reference) rather than failing the whole
+/// settings load.
+fn readSettingsFile(allocator: std.mem.Allocator, path: []const u8) !?std.json.Parsed(std.json.Value) {
     const data = std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(MAX_SETTINGS_BYTES)) catch |err| switch (err) {
         error.FileNotFound => return null,
         // 256 KiB cap exceeded: treat as empty / ignore rather than fail.
@@ -165,6 +235,56 @@ pub fn readSource(
     }
 
     return parse_helpers.parseJsonBounded(std.json.Value, allocator, clean) catch return null;
+}
+
+/// config-layout-01: user-scope settings resolution. Claude Code's user
+/// settings live at `~/.claude/settings.json`; zcode's native equivalent is
+/// `{zcode_home}/settings.json` (usually `~/.zcode/settings.json`, or
+/// `$XDG_CONFIG_HOME/zcode/settings.json`). Reading both means a machine
+/// already configured for Claude Code works with zcode unchanged. When only
+/// one file exists, its value is returned unchanged (the common case, and
+/// the fast path -- no merge cost). When both exist, the two objects are
+/// shallow-merged at the top level with the zcode-native file winning a
+/// shared key (repo convention: zcode-specific config wins on conflict).
+fn readUserSource(allocator: std.mem.Allocator) !?std.json.Parsed(std.json.Value) {
+    var resolved = try paths.resolve(allocator);
+    defer resolved.deinit(allocator);
+    const zcode_path = try std.fs.path.join(allocator, &.{ resolved.zcode_home, "settings.json" });
+    defer allocator.free(zcode_path);
+    const claude_path = try paths.claudeHomePathAlloc(allocator, "settings.json");
+    defer allocator.free(claude_path);
+
+    const claude_parsed = try readSettingsFile(allocator, claude_path);
+    const zcode_parsed = try readSettingsFile(allocator, zcode_path);
+
+    // zcode's own file is the `override` side: its keys win a shared key.
+    return mergeSettingsSources(allocator, claude_parsed, zcode_parsed);
+}
+
+/// config-layout-missed-149: policy-scope settings resolution. zcode's own
+/// `.policy` file lives at `{zcode_home}/policy/settings.json` -- a path
+/// under the user's own home directory, which the very user the tier is
+/// meant to govern can freely edit. The reference's actual enterprise
+/// managed-settings.json instead lives at a fixed, admin-owned OS path
+/// (`paths.managedSettingsJsonPath`) that an unprivileged user cannot write.
+/// Both are read and shallow-merged, with the OS-standard file's keys
+/// winning a shared key -- it is the tier that is supposed to be
+/// authoritative. When the platform has no defined reference path (only
+/// macOS/Linux/Windows do), this degrades to reading zcode's own file only.
+fn readPolicySource(allocator: std.mem.Allocator) !?std.json.Parsed(std.json.Value) {
+    var resolved = try paths.resolve(allocator);
+    defer resolved.deinit(allocator);
+    const zcode_path = try std.fs.path.join(allocator, &.{ resolved.zcode_home, "policy", "settings.json" });
+    defer allocator.free(zcode_path);
+
+    const zcode_parsed = try readSettingsFile(allocator, zcode_path);
+
+    const os_path = try paths.managedSettingsJsonPath(allocator);
+    defer if (os_path) |p| allocator.free(p);
+    const os_parsed = if (os_path) |p| try readSettingsFile(allocator, p) else null;
+
+    // The OS-standard file is the `override` side: its keys win a shared key.
+    return mergeSettingsSources(allocator, zcode_parsed, os_parsed);
 }
 
 // ── Lenient accessors ──────────────────────────────────────────────────
@@ -198,6 +318,21 @@ pub fn getBool(value: std.json.Value, key: []const u8) ?bool {
     const entry = obj.get(key) orelse return null;
     return switch (entry) {
         .bool => |b| b,
+        else => null,
+    };
+}
+
+/// Read an integer-valued key from a parsed object. Returns null on missing
+/// key, non-object root, or non-integer value (config-layout-17: e.g.
+/// `cleanupPeriodDays`).
+pub fn getInt(value: std.json.Value, key: []const u8) ?i64 {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const entry = obj.get(key) orelse return null;
+    return switch (entry) {
+        .integer => |n| n,
         else => null,
     };
 }
@@ -411,13 +546,160 @@ test "lenient accessors tolerate wrong types and missing keys" {
     try testing.expectEqualStrings("hi", getString(parsed.value, "s").?);
     try testing.expectEqual(true, getBool(parsed.value, "b").?);
     try testing.expectEqual(@as(usize, 2), getArray(parsed.value, "a").?.len);
+    try testing.expectEqual(@as(i64, 5), getInt(parsed.value, "n").?);
 
     // Wrong type -> null.
     try testing.expect(getString(parsed.value, "b") == null);
     try testing.expect(getBool(parsed.value, "s") == null);
     try testing.expect(getArray(parsed.value, "n") == null);
+    try testing.expect(getInt(parsed.value, "s") == null);
     // Missing key -> null.
     try testing.expect(getString(parsed.value, "missing") == null);
+}
+
+// config-layout-01: user-scope settings.json falls back to
+// `~/.claude/settings.json`, with zcode's own `~/.zcode/settings.json`
+// winning on a shared key. Both tests override HOME (and blank
+// XDG_CONFIG_HOME so no stray real value redirects zcode_home away from
+// HOME) so `paths.resolve()` -- which readUserSource calls internally --
+// resolves against the tmp dir instead of the real machine's HOME.
+const env_mod = @import("env.zig");
+
+test "config-layout-01: user source falls back to ~/.claude/settings.json when ~/.zcode has none" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"permissions\":{\"allow\":[\"Read\"]}}",
+    });
+
+    // No ~/.zcode/settings.json exists at all.
+    var user = (try readSource(alloc, root, .user, null)).?;
+    defer user.deinit();
+    const perms = getObject(user.value, "permissions").?;
+    const allow = getArray(perms, "allow").?;
+    try testing.expectEqual(@as(usize, 1), allow.len);
+    try testing.expectEqualStrings("Read", allow[0].string);
+}
+
+test "config-layout-01: when both ~/.claude and ~/.zcode settings.json define a key, ~/.zcode wins" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"permissions\":{\"allow\":[\"Read\"]},\"theme\":\"claude-theme\"}",
+    });
+    try tmp.dir.createDirPath(rt.io, ".zcode");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/settings.json",
+        .data = "{\"permissions\":{\"allow\":[\"Write\"]}}",
+    });
+
+    var user = (try readSource(alloc, root, .user, null)).?;
+    defer user.deinit();
+
+    // Conflicting key ("permissions"): the zcode-native file wins.
+    const perms = getObject(user.value, "permissions").?;
+    const allow = getArray(perms, "allow").?;
+    try testing.expectEqual(@as(usize, 1), allow.len);
+    try testing.expectEqualStrings("Write", allow[0].string);
+
+    // Key only ~/.claude/settings.json defines survives the merge.
+    try testing.expectEqualStrings("claude-theme", getString(user.value, "theme").?);
+}
+
+// config-layout-missed-149: policy-scope settings.json additionally reads
+// the reference's OS-standard managed-settings.json (via the
+// ZCODE_MANAGED_SETTINGS_JSON test override, since the real path is a fixed
+// system location test fixtures must never touch), winning on a shared key
+// over zcode's own user-writable `{zcode_home}/policy/settings.json`.
+test "config-layout-missed-149: policy source falls back to the OS managed-settings.json when zcode's policy file has none" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    const managed_path = try std.fs.path.join(alloc, &.{ root, "managed-settings.json" });
+    defer alloc.free(managed_path);
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "managed-settings.json",
+        .data = "{\"permissions\":{\"allow\":[\"Read\"]}}",
+    });
+    try env_mod.setOverride("ZCODE_MANAGED_SETTINGS_JSON", managed_path);
+
+    // No `{zcode_home}/policy/settings.json` exists at all.
+    var policy = (try readSource(alloc, root, .policy, null)).?;
+    defer policy.deinit();
+    const perms = getObject(policy.value, "permissions").?;
+    const allow = getArray(perms, "allow").?;
+    try testing.expectEqual(@as(usize, 1), allow.len);
+    try testing.expectEqualStrings("Read", allow[0].string);
+}
+
+test "config-layout-missed-149: when both the OS managed-settings.json and zcode's policy file define a key, the OS file wins" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    const managed_path = try std.fs.path.join(alloc, &.{ root, "managed-settings.json" });
+    defer alloc.free(managed_path);
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "managed-settings.json",
+        .data = "{\"permissions\":{\"allow\":[\"Read\"]}}",
+    });
+    try env_mod.setOverride("ZCODE_MANAGED_SETTINGS_JSON", managed_path);
+
+    try tmp.dir.createDirPath(rt.io, ".zcode/policy");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/policy/settings.json",
+        .data = "{\"permissions\":{\"allow\":[\"Write\"]},\"theme\":\"zcode-theme\"}",
+    });
+
+    var policy = (try readSource(alloc, root, .policy, null)).?;
+    defer policy.deinit();
+
+    // Conflicting key ("permissions"): the OS-standard managed file wins --
+    // it is meant to be authoritative over zcode's own user-writable file.
+    const perms = getObject(policy.value, "permissions").?;
+    const allow = getArray(perms, "allow").?;
+    try testing.expectEqual(@as(usize, 1), allow.len);
+    try testing.expectEqualStrings("Read", allow[0].string);
+
+    // Key only zcode's own policy file defines survives the merge.
+    try testing.expectEqualStrings("zcode-theme", getString(policy.value, "theme").?);
 }
 
 test "mergedScalarBool lets later sources win" {

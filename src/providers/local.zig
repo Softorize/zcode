@@ -147,6 +147,10 @@ fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReque
             const jitter_ms: u64 = @as(u64, @intCast(rng.intRangeAtMost(u16, 0, 500)));
             const delay_ms = base_delay_ms + jitter_ms;
             std.log.warn("local: request failed ({s}), retry {d}/{d} after {d}ms", .{ @errorName(err), retries + 1, self.retry_count, delay_ms });
+            // repl-ux-04: drive the interactive spinner's escalating retry
+            // status line (no-op when no turn reporter is registered, e.g.
+            // headless/background calls).
+            common.notifyRetryStatus(delay_ms, retries + 1);
             clock.sleepNanos(delay_ms * std.time.ns_per_ms);
             retries += 1;
             continue;

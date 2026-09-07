@@ -10,6 +10,11 @@ const reactive_compaction = @import("../core/reactive_compaction.zig");
 const max_tokens_overflow = @import("../core/max_tokens_overflow.zig");
 const cancel_reason_mod = @import("../core/cancel_reason.zig");
 const retry_policy = @import("../core/retry_policy.zig");
+/// cli-flags-14: `-d, --debug api,...` category filtering only has real
+/// effect on `std.log.scoped` call sites -- this file's HTTP retry trace is
+/// the shared client used by every provider, so tagging it `.api` gives the
+/// reference's own `--debug api,hooks` example genuine content to filter on.
+const log_api = std.log.scoped(.api);
 
 pub const CancelReason = cancel_reason_mod.CancelReason;
 
@@ -972,6 +977,72 @@ fn recordTerminalError(m: *metrics_mod.Metrics, err: anyerror) void {
     }
 }
 
+/// repl-ux-04: retry-status sink invoked by the resilient HTTP retry loop
+/// right before each backoff sleep, so a caller's spinner can show the
+/// reference's escalating retry line instead of the default thinking verb
+/// while a request is being retried (cc_strings.txt: `retryStatus`,
+/// `Waiting for API response`, ` will retry in `, ` next try in `,
+/// ` attempt `, ` esc to interrupt`, assembled as `` ` \xB7 next try in
+/// ${qe} \xB7 attempt ${nt.attempt} \xB7 esc to interrupt` ``).
+pub const RetryStatusCallback = struct {
+    ctx: ?*anyopaque = null,
+    on_retry: *const fn (ctx: ?*anyopaque, status: []const u8) void,
+
+    fn notify(self: RetryStatusCallback, status: []const u8) void {
+        self.on_retry(self.ctx, status);
+    }
+};
+
+/// Format the reference's retry-status line verbatim in shape:
+/// "Waiting for API response \xc2\xb7 next try in {d}s \xc2\xb7 attempt {d}
+/// \xc2\xb7 esc to interrupt". `delay_ms` is the backoff delay about to be
+/// slept (rounded up to whole seconds, reference style); `attempt` is
+/// 1-based (the attempt about to be retried, matching `nt.attempt`).
+pub fn formatRetryStatus(buf: []u8, delay_ms: u64, attempt: u32) []const u8 {
+    const next_try_secs = (delay_ms + 999) / 1000;
+    return std.fmt.bufPrint(
+        buf,
+        "Waiting for API response \xc2\xb7 next try in {d}s \xc2\xb7 attempt {d} \xc2\xb7 esc to interrupt",
+        .{ next_try_secs, attempt },
+    ) catch "Waiting for API response \xc2\xb7 esc to interrupt";
+}
+
+/// repl-ux-04: process-wide sink for the retry-status line. Every real
+/// provider adapter (anthropic.zig, openai.zig, azure.zig, gemini.zig,
+/// groq.zig, deepseek.zig, local.zig, openrouter.zig) runs its OWN manual
+/// retry loop around `callHttp`/`callHttpJson` -- none of them route
+/// through `callHttpWithResilienceAndRetryStatus`, so that function's
+/// `retry_status` parameter alone never fires from a real API call, only
+/// from a synthetic unit test. Rather than thread a new parameter through
+/// the `ProviderAdapter` vtable's `send`/`stream`/`streamLive` (touching
+/// every call site, including internal ones -- compaction, preprocessing,
+/// hook prompts, tool-use summaries -- that must NOT drive the visible
+/// turn spinner), each adapter's retry loop instead calls
+/// `notifyRetryStatus` directly, a thin wrapper around this global slot.
+/// `agent_history.callWithAdapterOnce` is the only writer: it installs the
+/// current turn's reporter right before calling the adapter and clears it
+/// immediately after, so only the one foreground interactive turn ever
+/// drives it -- every other (background/internal) adapter call leaves this
+/// null, and `notifyRetryStatus` is then a no-op.
+var global_retry_status: ?RetryStatusCallback = null;
+
+pub fn setGlobalRetryStatusCallback(cb: ?RetryStatusCallback) void {
+    global_retry_status = cb;
+}
+
+pub fn globalRetryStatusCallback() ?RetryStatusCallback {
+    return global_retry_status;
+}
+
+/// Format and forward a retry-status line to the globally-registered sink,
+/// if any. A no-op (not even the `formatRetryStatus` call) when nothing is
+/// registered, so a headless/background retry costs nothing extra.
+pub fn notifyRetryStatus(delay_ms: u64, attempt: u32) void {
+    const cb = global_retry_status orelse return;
+    var buf: [96]u8 = undefined;
+    cb.notify(formatRetryStatus(&buf, delay_ms, attempt));
+}
+
 pub fn callHttpWithResilience(
     allocator: std.mem.Allocator,
     method: HttpMethod,
@@ -981,6 +1052,22 @@ pub fn callHttpWithResilience(
     timeout_ms: u32,
     retry_count: u8,
     cb: ?*circuit_breaker_mod.CircuitBreaker,
+) ![]u8 {
+    return callHttpWithResilienceAndRetryStatus(allocator, method, url, headers, body, timeout_ms, retry_count, cb, null);
+}
+
+/// Same as `callHttpWithResilience`, plus an optional retry-status sink
+/// notified right before each backoff sleep (repl-ux-04).
+pub fn callHttpWithResilienceAndRetryStatus(
+    allocator: std.mem.Allocator,
+    method: HttpMethod,
+    url: []const u8,
+    headers: []const []const u8,
+    body: ?[]const u8,
+    timeout_ms: u32,
+    retry_count: u8,
+    cb: ?*circuit_breaker_mod.CircuitBreaker,
+    retry_status: ?RetryStatusCallback,
 ) ![]u8 {
     const m = metrics_mod.globalMetrics();
     m.increment(metrics_mod.Names.provider_requests_total);
@@ -1030,8 +1117,12 @@ pub fn callHttpWithResilience(
 
             // Exponential backoff before retry.
             const delay_ms = circuit_breaker_mod.backoffDelayMs(attempt, 100, 30_000);
+            if (retry_status) |status_cb| {
+                var status_buf: [96]u8 = undefined;
+                status_cb.notify(formatRetryStatus(&status_buf, delay_ms, attempt + 1));
+            }
             clock.sleepNanos(delay_ms * std.time.ns_per_ms);
-            std.log.debug("http retry {d}/{d} after {d}ms for {s}: {s}", .{
+            log_api.debug("http retry {d}/{d} after {d}ms for {s}: {s}", .{
                 attempt + 1, retry_count, delay_ms, url, @errorName(err),
             });
         }
@@ -1957,6 +2048,63 @@ test "shouldRetryHttpErrorWithHeaders obeys x-should-retry header" {
     const empty: []const HeaderPair = &.{};
     try testing.expect(shouldRetryHttpErrorWithHeaders(error.ConnectionTimeout, empty));
     try testing.expect(!shouldRetryHttpErrorWithHeaders(error.HttpStatusCode, empty));
+}
+
+test "formatRetryStatus matches the reference retry-status vocabulary" {
+    var buf: [96]u8 = undefined;
+    const status = formatRetryStatus(&buf, 2_500, 2);
+    try testing.expect(std.mem.indexOf(u8, status, "Waiting for API response") != null);
+    try testing.expect(std.mem.indexOf(u8, status, "next try in 3s") != null);
+    try testing.expect(std.mem.indexOf(u8, status, "attempt 2") != null);
+    try testing.expect(std.mem.indexOf(u8, status, "esc to interrupt") != null);
+}
+
+test "RetryStatusCallback.notify forwards the formatted status to the sink" {
+    const Sink = struct {
+        var last_status_buf: [96]u8 = undefined;
+        var last_status_len: usize = 0;
+
+        fn onRetry(ctx: ?*anyopaque, status: []const u8) void {
+            _ = ctx;
+            last_status_len = @min(status.len, last_status_buf.len);
+            @memcpy(last_status_buf[0..last_status_len], status[0..last_status_len]);
+        }
+    };
+    const cb = RetryStatusCallback{ .ctx = null, .on_retry = Sink.onRetry };
+    var status_buf: [96]u8 = undefined;
+    cb.notify(formatRetryStatus(&status_buf, 1_000, 1));
+    try testing.expect(std.mem.indexOf(u8, Sink.last_status_buf[0..Sink.last_status_len], "attempt 1") != null);
+}
+
+// repl-ux-04: `notifyRetryStatus` is what each real provider adapter's own
+// manual retry loop calls -- confirm it is a no-op with nothing registered
+// (the common headless/background case) and forwards the formatted line
+// once a sink IS registered (the live interactive-turn case).
+test "notifyRetryStatus is a no-op with no sink and forwards the formatted line once one is registered" {
+    defer setGlobalRetryStatusCallback(null);
+    const Sink = struct {
+        var buf: [128]u8 = undefined;
+        var got: []const u8 = "";
+
+        fn onRetry(ctx: ?*anyopaque, status: []const u8) void {
+            _ = ctx;
+            const n = @min(status.len, buf.len);
+            @memcpy(buf[0..n], status[0..n]);
+            got = buf[0..n];
+        }
+    };
+    Sink.got = "";
+
+    // No sink registered (the default, and every non-interactive/background
+    // adapter call): must not crash and must not call anything.
+    notifyRetryStatus(4_000, 2);
+    try testing.expectEqualStrings("", Sink.got);
+
+    setGlobalRetryStatusCallback(.{ .ctx = null, .on_retry = Sink.onRetry });
+    try testing.expect(globalRetryStatusCallback() != null);
+    notifyRetryStatus(4_000, 3);
+    try testing.expect(std.mem.indexOf(u8, Sink.got, "attempt 3") != null);
+    try testing.expect(std.mem.indexOf(u8, Sink.got, "esc to interrupt") != null);
 }
 
 test "describeProviderError surfaces actionable text for RequestTooLarge" {

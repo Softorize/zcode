@@ -15,6 +15,7 @@ const repl_input = @import("repl_input.zig");
 const repl_quick_open = @import("repl_quick_open.zig");
 const repl_markdown = @import("repl_markdown.zig");
 const repl_spinner_mod = @import("repl_spinner.zig");
+const repl_help = @import("repl_help.zig");
 const fuzzy = @import("../core/parse_helpers.zig");
 
 // ── Overlay UI module ──
@@ -223,11 +224,22 @@ pub const SessionSwitcherItem = struct {
     label: []u8,
     updated_summary: []u8,
     is_current: bool,
+    // sessions-storage-05: already computed and JSON-emitted by
+    // renderSessionsOverlayData (repl_commands.zig) but previously
+    // dropped here -- edualc format.ts:203-231 formatLogMetadata builds
+    // the picker's second line from exactly `age \xc2\xb7 branch \xc2\xb7 N
+    // messages`, so a resume/session-switcher line naming only the id and
+    // age was missing two of its three always-present parts.
+    branch: []u8 = &.{},
+    first_prompt: []u8 = &.{},
+    message_count: usize = 0,
 
     pub fn deinit(self: *SessionSwitcherItem, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.label);
         allocator.free(self.updated_summary);
+        allocator.free(self.branch);
+        allocator.free(self.first_prompt);
     }
 };
 
@@ -381,8 +393,25 @@ pub fn runInlineApprovalPrompt(message: []const u8) !ApprovalChoice {
     const stdout = std_io.stdoutWriter();
     const stdin = std_io.stdinReader();
 
-    try stdout.print("{s}\n", .{message});
-    try stdout.writeAll("Select: 1) Approve  2) Always  3) Deny  4) Cancel [default: 3] > ");
+    var name_buf: [64]u8 = undefined;
+    // repl-ux-03: sized generously (not the old 256) so a full Bash
+    // command/approval body threaded through from agent_tools.zig is not
+    // re-truncated here after already surviving the un-clipped
+    // fullDetailForApproval path.
+    var body_buf: [4096]u8 = undefined;
+    const parts = parseApprovalMessage(message, &name_buf, &body_buf);
+    var dont_ask_label_buf: [200]u8 = undefined;
+    const dont_ask_label = dontAskAgainLabel(&dont_ask_label_buf, parts.tool_name, parts.allow_rule);
+
+    // repl-ux-03: title + body + the reference's literal "Do you want to
+    // proceed?" question, then a numbered Yes / "don't ask again" / No
+    // list -- not the old flat "{name} [{risk}]: {summary}" dump with a
+    // generic 4-way Approve/Always/Deny/Cancel select.
+    try stdout.print("{s}\n\n{s}\n\nDo you want to proceed?\n  1. Yes\n  2. {s}\n  3. No, and tell zcode what to do differently (esc)\nSelect [3]: ", .{
+        dialogTitleForTool(parts.tool_name),
+        parts.body,
+        dont_ask_label,
+    });
 
     var buf: [16]u8 = undefined;
     var len: usize = 0;
@@ -403,11 +432,121 @@ pub fn runInlineApprovalPrompt(message: []const u8) !ApprovalChoice {
     if (trimmed.len == 0) return .deny;
     if (trimmed[0] == '1' or trimmed[0] == 'y' or trimmed[0] == 'Y') return .approve;
     if (trimmed[0] == '2' or trimmed[0] == 'a' or trimmed[0] == 'A') return .approve_always;
-    if (trimmed[0] == '4' or trimmed[0] == 'c' or trimmed[0] == 'C') return .cancel;
     return .deny;
 }
 
 // ── Fullscreen approval overlay ──
+
+/// repl-ux-03: tool-specific dialog title, mirroring the reference's
+/// `title:`${r.isReadOnly(o)?"Read":"Edit"} file`` / "Bash command"
+/// family (cc_strings.txt: "Bash command" x26, "Edit file"/"Create
+/// file"). Falls back to the bare tool name (still tool-specific, never
+/// a generic "approval needed") when the tool isn't one of the common
+/// built-ins, and to "Tool" when the name could not be parsed at all.
+fn dialogTitleForTool(name: []const u8) []const u8 {
+    const bash_names = [_][]const u8{ "Bash", "bash", "shell" };
+    const edit_names = [_][]const u8{ "Edit", "edit", "MultiEdit", "file_edit", "NotebookEdit" };
+    const write_names = [_][]const u8{ "Write", "write", "file_write" };
+    const read_names = [_][]const u8{ "Read", "read", "file_read" };
+    const fetch_names = [_][]const u8{ "WebFetch", "web_fetch" };
+    const search_names = [_][]const u8{ "WebSearch", "web_search" };
+    for (bash_names) |n| if (std.mem.eql(u8, name, n)) return "Bash command";
+    for (edit_names) |n| if (std.mem.eql(u8, name, n)) return "Edit file";
+    for (write_names) |n| if (std.mem.eql(u8, name, n)) return "Create file";
+    for (read_names) |n| if (std.mem.eql(u8, name, n)) return "Read file";
+    for (fetch_names) |n| if (std.mem.eql(u8, name, n)) return "Fetch URL";
+    for (search_names) |n| if (std.mem.eql(u8, name, n)) return "Web search";
+    if (name.len == 0) return "Tool";
+    return name;
+}
+
+/// The dynamic "don't ask again" row label. zcode's actual "always
+/// approve" grant is scoped per tool name for the rest of the session
+/// (`session_approved_tools`, agent_tools.zig) rather than the
+/// reference's finer command-prefix rule, so the label names that real
+/// scope instead of promising a specific prefix rule it cannot yet grant.
+/// repl-ux-03: when `rule` is non-empty (a concrete allow-rule derived by
+/// `agent_tools.buildApprovalDescription`, e.g. "Bash(npm run)" or
+/// "WebFetch(domain:example.com)"), name it directly -- "Yes, and don't
+/// ask again for: <rule>" -- mirroring the reference's Haiku-suggested
+/// prefix row. Falls back to the generic tool-scoped label (zcode's real
+/// grant scope, `session_approved_tools`) only when no concrete rule
+/// could be derived for this call.
+fn dontAskAgainLabel(out: []u8, tool_name: []const u8, rule: []const u8) []const u8 {
+    if (rule.len > 0) {
+        return std.fmt.bufPrint(out, "Yes, and don't ask again for: {s}", .{rule}) catch "Yes, and don't ask again for this tool this session";
+    }
+    if (tool_name.len == 0) return "Yes, and don't ask again for this tool this session";
+    return std.fmt.bufPrint(out, "Yes, and don't ask again for {s} this session", .{tool_name}) catch "Yes, and don't ask again for this tool this session";
+}
+
+const ApprovalMessageParts = struct {
+    tool_name: []const u8 = "",
+    body: []const u8 = "",
+    /// repl-ux-03: a concrete allow-rule (e.g. "Bash(npm run)"), sliced
+    /// directly out of the original `message` -- not copied -- when a
+    /// "Suggested allow-rules: <rule>" line is present. Empty when none
+    /// was derivable for this call.
+    allow_rule: []const u8 = "",
+};
+
+/// Parse the "{name} [{RISK}]: {summary}" line `agent_tools.
+/// buildApprovalDescription` produces. Every call site wraps that line
+/// with extra context (a permission-rule or hook reason before it, an
+/// advisory note or "Suggested allow-rules:" after it) -- every other
+/// non-empty line is folded into the body with " \xc2\xb7 " so context
+/// already computed upstream is shown rather than silently dropped, the
+/// way the old single raw-message render effectively squashed embedded
+/// newlines together with no separator at all.
+fn parseApprovalMessage(message: []const u8, name_buf: []u8, body_buf: []u8) ApprovalMessageParts {
+    var tool_name: []const u8 = "";
+    var allow_rule: []const u8 = "";
+    var body_pos: usize = 0;
+    var first = true;
+    var lines = std.mem.splitScalar(u8, message, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        var this_line = line;
+        if (tool_name.len == 0) {
+            inline for (.{ "LOW", "MEDIUM", "HIGH", "BLOCKED" }) |risk| {
+                const marker = " [" ++ risk ++ "]: ";
+                if (tool_name.len == 0) {
+                    if (std.mem.indexOf(u8, line, marker)) |idx| {
+                        const candidate = line[0..idx];
+                        if (candidate.len > 0 and candidate.len <= name_buf.len and std.mem.indexOfScalar(u8, candidate, ' ') == null) {
+                            @memcpy(name_buf[0..candidate.len], candidate);
+                            tool_name = name_buf[0..candidate.len];
+                            this_line = line[idx + marker.len ..];
+                        }
+                    }
+                }
+            }
+        }
+        if (allow_rule.len == 0) {
+            const rule_marker = "Suggested allow-rules: ";
+            if (std.mem.startsWith(u8, this_line, rule_marker)) {
+                const rule_text = std.mem.trim(u8, this_line[rule_marker.len..], " \t");
+                if (rule_text.len > 0) allow_rule = rule_text;
+            }
+        }
+        if (!first and body_pos < body_buf.len) {
+            const sep = " \xc2\xb7 ";
+            const take_sep = @min(sep.len, body_buf.len - body_pos);
+            @memcpy(body_buf[body_pos..][0..take_sep], sep[0..take_sep]);
+            body_pos += take_sep;
+        }
+        const take = @min(this_line.len, body_buf.len - body_pos);
+        @memcpy(body_buf[body_pos..][0..take], this_line[0..take]);
+        body_pos += take;
+        first = false;
+    }
+    return .{ .tool_name = tool_name, .body = body_buf[0..body_pos], .allow_rule = allow_rule };
+}
+
+fn stepUpRow(row: usize) usize {
+    return if (row > 1) row - 1 else 1;
+}
 
 /// Pure permission-mode cycle helper, factored out so the overlay state machine
 /// is testable without driving the terminal. Applies getNext `n` times starting
@@ -439,14 +578,18 @@ pub fn runApprovalOverlayLoopWithMode(
     bypass_available: bool,
 ) !ApprovalChoice {
     const fd = std.Io.File.stdin().handle;
-    var selected: usize = 2; // default to Deny for safety (0=Approve, 1=Always, 2=Deny, 3=Cancel).
+    // repl-ux-03: the reference vertical Yes / "don't ask again" / No list
+    // has 3 rows (0=Yes, 1=Yes-and-don't-ask-again, 2=No), replacing the
+    // old 4-way Approve/Always/Deny/Cancel button bar. Default to "No" for
+    // safety, same invariant as the old default-to-Deny selection.
+    var selected: usize = 2;
 
     while (true) {
         renderApprovalOverlay(message, selected, bottom_margin_rows, if (mode) |m| m.* else null);
         const nav = readApprovalNavEvent(fd) catch return .cancel;
         switch (nav) {
-            .left => selected = if (selected == 0) 3 else selected - 1,
-            .right => selected = (selected + 1) % 4,
+            .left => selected = if (selected == 0) 2 else selected - 1,
+            .right => selected = (selected + 1) % 3,
             .cycle_mode => {
                 // Cycle the permission mode in place; keep the selected button so
                 // the Deny safety default is not disturbed. No-op when the caller
@@ -458,8 +601,7 @@ pub fn runApprovalOverlayLoopWithMode(
                 return switch (selected) {
                     0 => .approve,
                     1 => .approve_always,
-                    2 => .deny,
-                    else => .cancel,
+                    else => .deny,
                 };
             },
             .approve => {
@@ -483,48 +625,91 @@ pub fn runApprovalOverlayLoopWithMode(
     }
 }
 
+/// repl-ux-03: the reference's titled dialog -- a tool-specific title
+/// ("Bash command" / "Edit file"), the full body, the literal question
+/// "Do you want to proceed?", then a numbered vertical Yes / "don't ask
+/// again" / No list -- replacing the old single "Permission <summary>"
+/// line above a horizontal Approve/Always/Deny/Cancel button bar.
 fn renderApprovalOverlay(message: []const u8, selected: usize, bottom_margin_rows: usize, mode: ?permission_decision.Mode) void {
     const rows = terminalRows();
     const cols = terminalCols();
     const margin = boundedBottomMarginRows(rows, bottom_margin_rows);
     const status_row = if (rows > margin) rows - margin else 1;
     const border_row = if (status_row > 3) status_row - 3 else 1;
-    const options_row = if (border_row > 1) border_row - 1 else 1;
-    const question_row = if (options_row > 1) options_row - 1 else 1;
+    const opt3_row = stepUpRow(border_row);
+    const opt2_row = stepUpRow(opt3_row);
+    const opt1_row = stepUpRow(opt2_row);
+    const question_row = stepUpRow(opt1_row);
+    const body_row = stepUpRow(question_row);
+    const title_row = stepUpRow(body_row);
 
-    var safe_msg_buf: [240]u8 = undefined;
-    const safe_msg = sanitizeText(std.mem.trim(u8, message, " \t\r\n"), safe_msg_buf[0..]);
+    var name_buf: [64]u8 = undefined;
+    // repl-ux-03: sized generously (not the old 256) -- the single-row
+    // body is still ultimately clipped to the real terminal width below
+    // (`draw_cols`, a genuine display constraint), but it must not be
+    // re-truncated here, well before that, back down to the old
+    // ~60/80-char summary length.
+    var body_buf: [2048]u8 = undefined;
+    const parts = parseApprovalMessage(message, &name_buf, &body_buf);
 
-    // Brand-accent rail (mint) + dim label + bright message. The user's
-    // eye lands on the brand rail, reads the label quietly as metadata,
-    // then locks on the actual risk description which is the decision
-    // the user must make. "Permission" reads more human than the old
-    // "approval needed" and matches Claude Code's own phrasing.
-    //
-    // When a live permission mode is supplied (P3, PRD #534), its short label
-    // is shown as a dim trailing chip so the user sees Shift+Tab cycle the mode.
-    var question_buf: [360]u8 = undefined;
-    const question_full = if (mode) |m| std.fmt.bufPrint(
-        &question_buf,
-        "\x1b[38;2;95;212;160m\xe2\x94\x83\x1b[0m \x1b[2mPermission\x1b[0m  \x1b[1m{s}\x1b[0m  \x1b[2m[{s}]\x1b[0m",
-        .{ safe_msg, permission_mode_cycle.shortLabel(m) },
-    ) catch "Permission" else std.fmt.bufPrint(
-        &question_buf,
-        "\x1b[38;2;95;212;160m\xe2\x94\x83\x1b[0m \x1b[2mPermission\x1b[0m  \x1b[1m{s}\x1b[0m",
-        .{safe_msg},
-    ) catch "Permission";
     const draw_cols = if (cols > 1) cols - 1 else cols;
-    const question = question_full[0..@min(question_full.len, draw_cols)];
 
-    var options_buf: [240]u8 = undefined;
-    const options_full = buildApprovalOptionsLine(&options_buf, selected);
-    const options_line = options_full[0..@min(options_full.len, draw_cols)];
+    // Brand-accent rail (mint) + bold title. When a live permission mode
+    // is supplied (P3, PRD #534), its short label is shown as a dim
+    // trailing chip so the user sees Shift+Tab cycle the mode.
+    var title_buf: [200]u8 = undefined;
+    const title_full = if (mode) |m| std.fmt.bufPrint(
+        &title_buf,
+        "\x1b[38;2;95;212;160m\xe2\x94\x83\x1b[0m \x1b[1m{s}\x1b[0m  \x1b[2m[{s}]\x1b[0m",
+        .{ dialogTitleForTool(parts.tool_name), permission_mode_cycle.shortLabel(m) },
+    ) catch "Tool" else std.fmt.bufPrint(
+        &title_buf,
+        "\x1b[38;2;95;212;160m\xe2\x94\x83\x1b[0m \x1b[1m{s}\x1b[0m",
+        .{dialogTitleForTool(parts.tool_name)},
+    ) catch "Tool";
+    const title_line = title_full[0..@min(title_full.len, draw_cols)];
 
-    var seq: [1024]u8 = undefined;
+    var safe_body_buf: [600]u8 = undefined;
+    const safe_body = sanitizeText(parts.body, safe_body_buf[0..]);
+    var body_full_buf: [620]u8 = undefined;
+    const body_full = std.fmt.bufPrint(&body_full_buf, "  {s}", .{safe_body}) catch safe_body;
+    const body_line = body_full[0..@min(body_full.len, draw_cols)];
+
+    const question_full = "  Do you want to proceed?";
+    const question_line = question_full[0..@min(question_full.len, draw_cols)];
+
+    var dont_ask_label_buf: [200]u8 = undefined;
+    const dont_ask_label = dontAskAgainLabel(&dont_ask_label_buf, parts.tool_name, parts.allow_rule);
+
+    var opt1_buf: [64]u8 = undefined;
+    var opt2_buf: [220]u8 = undefined;
+    var opt3_buf: [96]u8 = undefined;
+    const opt1_full = buildApprovalOptionLine(&opt1_buf, 0, selected, "Yes");
+    const opt2_full = buildApprovalOptionLine(&opt2_buf, 1, selected, dont_ask_label);
+    const opt3_full = buildApprovalOptionLine(&opt3_buf, 2, selected, "No, and tell zcode what to do differently (esc)");
+    const opt1_line = opt1_full[0..@min(opt1_full.len, draw_cols)];
+    const opt2_line = opt2_full[0..@min(opt2_full.len, draw_cols)];
+    const opt3_line = opt3_full[0..@min(opt3_full.len, draw_cols)];
+
+    var seq: [4096]u8 = undefined;
     const frame = std.fmt.bufPrint(
         &seq,
-        "\x1b7\x1b[{d};1H\x1b[2K{s}\x1b[{d};1H\x1b[2K{s}\x1b8",
-        .{ question_row, question, options_row, options_line },
+        "\x1b7" ++
+            "\x1b[{d};1H\x1b[2K{s}" ++
+            "\x1b[{d};1H\x1b[2K{s}" ++
+            "\x1b[{d};1H\x1b[2K{s}" ++
+            "\x1b[{d};1H\x1b[2K{s}" ++
+            "\x1b[{d};1H\x1b[2K{s}" ++
+            "\x1b[{d};1H\x1b[2K{s}" ++
+            "\x1b8",
+        .{
+            title_row,    title_line,
+            body_row,     body_line,
+            question_row, question_line,
+            opt1_row,     opt1_line,
+            opt2_row,     opt2_line,
+            opt3_row,     opt3_line,
+        },
     ) catch return;
     _ = std.c.write(std.Io.File.stdout().handle, (frame).ptr, (frame).len);
 }
@@ -534,63 +719,39 @@ pub fn clearApprovalOverlay(bottom_margin_rows: usize) void {
     const margin = boundedBottomMarginRows(rows, bottom_margin_rows);
     const status_row = if (rows > margin) rows - margin else 1;
     const border_row = if (status_row > 3) status_row - 3 else 1;
-    const options_row = if (border_row > 1) border_row - 1 else 1;
-    const question_row = if (options_row > 1) options_row - 1 else 1;
+    const opt3_row = stepUpRow(border_row);
+    const opt2_row = stepUpRow(opt3_row);
+    const opt1_row = stepUpRow(opt2_row);
+    const question_row = stepUpRow(opt1_row);
+    const body_row = stepUpRow(question_row);
+    const title_row = stepUpRow(body_row);
 
-    var seq: [256]u8 = undefined;
+    var seq: [512]u8 = undefined;
     const clear = std.fmt.bufPrint(
         &seq,
-        "\x1b7\x1b[{d};1H\x1b[2K\x1b[{d};1H\x1b[2K\x1b8",
-        .{ question_row, options_row },
+        "\x1b7" ++
+            "\x1b[{d};1H\x1b[2K" ++
+            "\x1b[{d};1H\x1b[2K" ++
+            "\x1b[{d};1H\x1b[2K" ++
+            "\x1b[{d};1H\x1b[2K" ++
+            "\x1b[{d};1H\x1b[2K" ++
+            "\x1b[{d};1H\x1b[2K" ++
+            "\x1b8",
+        .{ title_row, body_row, question_row, opt1_row, opt2_row, opt3_row },
     ) catch return;
     _ = std.c.write(std.Io.File.stdout().handle, (clear).ptr, (clear).len);
 }
 
-pub fn buildApprovalOptionsLine(out: []u8, selected: usize) []const u8 {
-    // Refactoring-UI hierarchy: the four choices are NOT equally
-    // prominent. Approve is the primary action (brand mint, filled
-    // when selected). Deny is a warning action (soft red, filled when
-    // selected). Always / Cancel are tertiary (dim, outlined only
-    // when selected). Selected buttons use inverse-video fill so the
-    // current choice reads as a solid block at a glance -- no need to
-    // hunt for a triangle marker. Unselected buttons are dim plain
-    // text and stay out of the way.
-    //
-    // Grouping: "Approve  Always" sit tight as the "accept" pair,
-    // then a wider gap before "Deny  Cancel" as the "reject" pair.
-    // Keyboard hint is tertiary (dim) metadata.
-    const accent_mint = "\x1b[48;2;95;212;160m\x1b[38;2;11;18;22m\x1b[1m";
-    const accent_red = "\x1b[48;2;217;95;114m\x1b[38;2;11;18;22m\x1b[1m";
-    const outline = "\x1b[38;2;200;210;220m\x1b[1m";
-    const dim_btn = "\x1b[2m";
-    const reset = "\x1b[0m";
-
-    const approve = if (selected == 0)
-        accent_mint ++ " Approve " ++ reset
-    else
-        dim_btn ++ " Approve " ++ reset;
-    const always = if (selected == 1)
-        outline ++ " Always " ++ reset
-    else
-        dim_btn ++ " Always " ++ reset;
-    const deny = if (selected == 2)
-        accent_red ++ " Deny " ++ reset
-    else
-        dim_btn ++ " Deny " ++ reset;
-    const cancel = if (selected == 3)
-        outline ++ " Cancel " ++ reset
-    else
-        dim_btn ++ " Cancel " ++ reset;
-
-    const rail = "\x1b[38;2;95;212;160m\xe2\x94\x83\x1b[0m";
-    // Keyboard hint groups: "←→ Enter" for nav + "Y/A/N Esc" for
-    // direct keys. The soft arrows and slash separators read better
-    // than a bare whitespace-delimited token list.
-    return std.fmt.bufPrint(
-        out,
-        "{s} {s} {s}   {s} {s}   \x1b[2m\xe2\x86\x90\xe2\x86\x92 Enter  \xc2\xb7  Y/A/N/Esc\x1b[0m",
-        .{ rail, approve, always, deny, cancel },
-    ) catch "approval";
+/// One row of the numbered Yes / "don't ask again" / No list. The
+/// selected row is bold and bright; the others are dim -- an
+/// inverse-video fill would clip a long "don't ask again" label at
+/// narrow widths, where a plain weight/brightness change does not.
+fn buildApprovalOptionLine(out: []u8, index: usize, selected: usize, label: []const u8) []const u8 {
+    const num = index + 1;
+    if (index == selected) {
+        return std.fmt.bufPrint(out, "\x1b[1m  {d}. {s}\x1b[0m", .{ num, label }) catch label;
+    }
+    return std.fmt.bufPrint(out, "\x1b[2m  {d}. {s}\x1b[0m", .{ num, label }) catch label;
 }
 
 pub fn readApprovalNavEvent(fd: std.posix.fd_t) !ApprovalNavEvent {
@@ -1571,11 +1732,23 @@ pub fn parseSessionSwitcherData(allocator: std.mem.Allocator, payload: []const u
         const current_val = item_val.object.get("is_current") orelse continue;
         if (id_val != .string or label_val != .string or updated_val != .string or current_val != .bool) continue;
 
+        // sessions-storage-05: branch/first_prompt/message_count are already
+        // emitted by renderSessionsOverlayData (repl_commands.zig) -- read
+        // them too instead of silently dropping fields the payload already
+        // carries. All three are optional/best-effort so an older or
+        // partial payload still parses.
+        const branch_val = item_val.object.get("branch");
+        const first_prompt_val = item_val.object.get("first_prompt");
+        const message_count_val = item_val.object.get("message_count");
+
         try items.append(.{
             .id = try allocator.dupe(u8, id_val.string),
             .label = try allocator.dupe(u8, label_val.string),
             .updated_summary = try allocator.dupe(u8, updated_val.string),
             .is_current = current_val.bool,
+            .branch = if (branch_val != null and branch_val.? == .string) try allocator.dupe(u8, branch_val.?.string) else &.{},
+            .first_prompt = if (first_prompt_val != null and first_prompt_val.? == .string) try allocator.dupe(u8, first_prompt_val.?.string) else &.{},
+            .message_count = if (message_count_val != null and message_count_val.? == .integer and message_count_val.?.integer >= 0) @intCast(message_count_val.?.integer) else 0,
         });
         if (current_val.bool) initial_selection = idx;
     }
@@ -3069,6 +3242,178 @@ fn clearStylePickerOverlay(item_count: usize, bottom_margin_rows: usize) void {
     _ = std.c.write(std.Io.File.stdout().handle, (seq[0..pos]).ptr, (seq[0..pos]).len);
 }
 
+// ── /help dialog (r4-help-01) ──────────────────────────────────────────────
+// Reference: HelpV2.tsx -- a dialog titled "<product> v<version>" with tabs
+// general | commands | custom-commands (tab/shift+tab or arrows to switch,
+// up/down to scroll, esc to close). zcode's `/help` used to spill ~100
+// flat rows into the scrolling transcript instead.
+
+/// The three tabs of the /help overlay, in reference left-to-right order.
+/// `next`/`prev` wrap around so tab/shift+tab can cycle indefinitely.
+pub const HelpOverlayTab = enum {
+    general,
+    commands,
+    custom,
+
+    pub fn label(self: HelpOverlayTab) []const u8 {
+        return switch (self) {
+            .general => "general",
+            .commands => "commands",
+            .custom => "custom-commands",
+        };
+    }
+
+    pub fn next(self: HelpOverlayTab) HelpOverlayTab {
+        return switch (self) {
+            .general => .commands,
+            .commands => .custom,
+            .custom => .general,
+        };
+    }
+
+    pub fn prev(self: HelpOverlayTab) HelpOverlayTab {
+        return switch (self) {
+            .general => .custom,
+            .commands => .general,
+            .custom => .commands,
+        };
+    }
+};
+
+/// Pre-built content for all three tabs. The caller (repl.zig's `/help`
+/// handler) builds `command_lines`/`custom_lines` once from an arena
+/// before the loop starts -- disk I/O and command-catalog assembly
+/// happen once per `/help` invocation, not once per keystroke/redraw.
+pub const HelpOverlayData = struct {
+    app_name: []const u8,
+    app_version: []const u8,
+    general_lines: []const repl_help.HelpOverlayLine,
+    command_lines: []const repl_help.HelpOverlayLine,
+    custom_lines: []const repl_help.HelpOverlayLine,
+};
+
+fn helpOverlayLinesForTab(data: HelpOverlayData, tab: HelpOverlayTab) []const repl_help.HelpOverlayLine {
+    return switch (tab) {
+        .general => data.general_lines,
+        .commands => data.command_lines,
+        .custom => data.custom_lines,
+    };
+}
+
+/// Chrome rows consumed around the scrollable body: top border, title,
+/// tab bar, divider, footer, bottom border (6 total, none reserved as a
+/// blank margin -- the dialog fills essentially the whole terminal).
+fn helpOverlayBodyRows(rows: usize) usize {
+    return if (rows > 7) rows - 6 else 1;
+}
+
+fn helpOverlayTabBarText(buf: []u8, active: HelpOverlayTab) []const u8 {
+    var pos: usize = 0;
+    const tabs = [_]HelpOverlayTab{ .general, .commands, .custom };
+    for (tabs, 0..) |tab, i| {
+        if (i > 0) appendLiteral(buf, &pos, "   ");
+        if (tab == active) {
+            appendLiteral(buf, &pos, "[");
+            appendLiteral(buf, &pos, tab.label());
+            appendLiteral(buf, &pos, "]");
+        } else {
+            appendLiteral(buf, &pos, tab.label());
+        }
+    }
+    return buf[0..pos];
+}
+
+pub fn runHelpOverlayLoop(data: HelpOverlayData, bindings: ?*const keybindings.RuntimeKeybindings) !void {
+    const fd = std.Io.File.stdin().handle;
+    var active: HelpOverlayTab = .general;
+    var scroll: usize = 0;
+    const contexts = [_]keybindings.BindingContext{.Select};
+
+    while (true) {
+        const rows = terminalRows();
+        const cols = terminalCols();
+        const body_rows = helpOverlayBodyRows(rows);
+        const lines = helpOverlayLinesForTab(data, active);
+        const max_scroll = if (lines.len > body_rows) lines.len - body_rows else 0;
+        if (scroll > max_scroll) scroll = max_scroll;
+
+        renderHelpOverlay(data, active, scroll, rows, cols);
+
+        var chord_buf: [24]u8 = undefined;
+        const key = readPickerKey(fd, &chord_buf) catch {
+            _ = std.c.write(std.Io.File.stdout().handle, "\x1b[2J\x1b[H", 8);
+            return;
+        };
+        const ev = resolvePickerBinding(bindings, &contexts, key.chord, key.event);
+
+        switch (ev) {
+            .up => scroll = if (scroll > 0) scroll - 1 else 0,
+            .down => scroll = if (scroll < max_scroll) scroll + 1 else max_scroll,
+            .tab => {
+                active = active.next();
+                scroll = 0;
+            },
+            .shift_tab => {
+                active = active.prev();
+                scroll = 0;
+            },
+            .cancel, .select => {
+                _ = std.c.write(std.Io.File.stdout().handle, "\x1b[2J\x1b[H", 8);
+                return;
+            },
+            .toggle, .backspace, .char, .next, .none => {},
+        }
+    }
+}
+
+fn renderHelpOverlay(data: HelpOverlayData, active: HelpOverlayTab, scroll: usize, rows: usize, cols: usize) void {
+    const body_rows = helpOverlayBodyRows(rows);
+    const lines = helpOverlayLinesForTab(data, active);
+
+    var box_w: usize = if (cols < 40) 40 else if (cols > 100) 100 else cols;
+    if (box_w > cols) box_w = cols;
+    const inner = if (box_w > 2) box_w - 2 else 1;
+
+    var seq: [32768]u8 = undefined;
+    var pos: usize = 0;
+    appendLiteral(&seq, &pos, "\x1b[2J\x1b[H");
+
+    appendSimpleOverlayBorder(&seq, &pos, 1, inner);
+
+    var title_buf: [160]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, " {s} v{s}", .{ data.app_name, data.app_version }) catch data.app_name;
+    appendSimpleOverlayLine(&seq, &pos, 2, inner, title);
+
+    var tab_bar_buf: [96]u8 = undefined;
+    var tab_line_buf: [112]u8 = undefined;
+    const tab_bar = helpOverlayTabBarText(&tab_bar_buf, active);
+    const tab_line = std.fmt.bufPrint(&tab_line_buf, " {s}", .{tab_bar}) catch tab_bar;
+    appendSimpleOverlayLine(&seq, &pos, 3, inner, tab_line);
+
+    appendSimpleOverlayDivider(&seq, &pos, 4, inner);
+
+    var row: usize = 0;
+    while (row < body_rows) : (row += 1) {
+        const idx = scroll + row;
+        const text = if (idx < lines.len) lines[idx].text else "";
+        var row_buf: [512]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&row_buf, " {s}", .{text}) catch text;
+        appendSimpleOverlayLine(&seq, &pos, 5 + row, inner, rendered);
+    }
+
+    const footer_row = 5 + body_rows;
+    appendSimpleOverlayLine(
+        &seq,
+        &pos,
+        footer_row,
+        inner,
+        " tab / shift+tab switch tabs  \xe2\x80\xa2  \xe2\x86\x91/\xe2\x86\x93 scroll  \xe2\x80\xa2  esc to cancel",
+    );
+    appendSimpleOverlayBottomBorder(&seq, &pos, footer_row + 1, inner);
+
+    _ = std.c.write(std.Io.File.stdout().handle, (seq[0..pos]).ptr, (seq[0..pos]).len);
+}
+
 // ── Command palette --------------------------------------------------------
 
 fn commandPaletteOverlayRows(item_count: usize) usize {
@@ -3546,6 +3891,33 @@ pub fn runSessionSwitcherOverlayLoop(
     }
 }
 
+/// sessions-storage-05: the picker's second line -- id, age, branch (when
+/// known), and message count -- mirroring the reference's always-present
+/// "age \xc2\xb7 branch \xc2\xb7 N messages" triple (edualc format.ts:203-231
+/// formatLogMetadata: `[age, ...gitBranch?[gitBranch]:[], sizeOrCount,
+/// ...].join(' \xc2\xb7 ')`). Branch is omitted for a session that predates
+/// that sidecar file; message count is always shown (0 for an empty
+/// session is itself meaningful, not "unknown").
+fn buildSessionSwitcherLineTwo(buf: []u8, item: SessionSwitcherItem) []const u8 {
+    var pos: usize = 0;
+    appendLiteral(buf, &pos, "   ");
+    appendLiteral(buf, &pos, item.id);
+    appendLiteral(buf, &pos, "  \xe2\x80\xa2  ");
+    appendLiteral(buf, &pos, item.updated_summary);
+    if (item.branch.len > 0) {
+        appendLiteral(buf, &pos, "  \xe2\x80\xa2  ");
+        appendLiteral(buf, &pos, item.branch);
+    }
+    var count_buf: [32]u8 = undefined;
+    const count_text = std.fmt.bufPrint(&count_buf, "{d} message{s}", .{
+        item.message_count,
+        if (item.message_count == 1) @as([]const u8, "") else "s",
+    }) catch "";
+    appendLiteral(buf, &pos, "  \xe2\x80\xa2  ");
+    appendLiteral(buf, &pos, count_text);
+    return buf[0..pos];
+}
+
 fn renderSessionSwitcherOverlay(
     data: SessionSwitcherData,
     filtered: []const usize,
@@ -3612,11 +3984,7 @@ fn renderSessionSwitcherOverlay(
             appendSimpleOverlayLine(&seq, &pos, top_row + 4 + (row * 2), inner, line_one);
 
             var line_two_buf: [512]u8 = undefined;
-            const line_two = std.fmt.bufPrint(
-                &line_two_buf,
-                "   {s}  •  {s}",
-                .{ item.id, item.updated_summary },
-            ) catch item.id;
+            const line_two = buildSessionSwitcherLineTwo(&line_two_buf, item);
             appendSimpleOverlayLine(&seq, &pos, top_row + 5 + (row * 2), inner, line_two);
         }
     }
@@ -6431,6 +6799,42 @@ pub fn parsePlanAction(text: []const u8) ?PlanAction {
 
 const testing = std.testing;
 
+// ── r4-help-01: /help overlay tab model ──
+
+test "HelpOverlayTab.next cycles general -> commands -> custom -> general" {
+    try testing.expectEqual(HelpOverlayTab.commands, HelpOverlayTab.general.next());
+    try testing.expectEqual(HelpOverlayTab.custom, HelpOverlayTab.commands.next());
+    try testing.expectEqual(HelpOverlayTab.general, HelpOverlayTab.custom.next());
+}
+
+test "HelpOverlayTab.prev is the exact inverse of next" {
+    const tabs = [_]HelpOverlayTab{ .general, .commands, .custom };
+    for (tabs) |tab| {
+        try testing.expectEqual(tab, tab.next().prev());
+        try testing.expectEqual(tab, tab.prev().next());
+    }
+}
+
+test "HelpOverlayTab.label matches the reference's tab names" {
+    try testing.expectEqualStrings("general", HelpOverlayTab.general.label());
+    try testing.expectEqualStrings("commands", HelpOverlayTab.commands.label());
+    try testing.expectEqualStrings("custom-commands", HelpOverlayTab.custom.label());
+}
+
+test "helpOverlayBodyRows leaves room for the 6 chrome rows" {
+    try testing.expectEqual(@as(usize, 30), helpOverlayBodyRows(36));
+    try testing.expectEqual(@as(usize, 1), helpOverlayBodyRows(4));
+}
+
+test "helpOverlayTabBarText brackets only the active tab" {
+    var buf: [96]u8 = undefined;
+    const text = helpOverlayTabBarText(&buf, .commands);
+    try testing.expect(std.mem.indexOf(u8, text, "[commands]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "general") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[general]") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "custom-commands") != null);
+}
+
 test "applyModeCycles equals getNext applied N times" {
     // P3 (PRD #534): N Shift+Tab presses inside the approval overlay must land
     // on the same mode as getNext composed N times.
@@ -6455,26 +6859,79 @@ test "applyModeCycles equals getNext applied N times" {
     try testing.expectEqual(expected, applyModeCycles(.acceptEdits, 7, false));
 }
 
-test "buildApprovalOptionsLine highlights selected choice" {
-    var out: [512]u8 = undefined;
-    // selected index 1 = "Always" (inverse-video outline background)
-    const line = buildApprovalOptionsLine(&out, 1);
-    try testing.expect(std.mem.indexOf(u8, line, "Deny") != null);
-    // Always label is present and rendered with the outline accent
-    // escape (C8D2DC). Approve (idx 0) is unselected so it should
-    // carry the dim escape (\x1b[2m) rather than the mint fill.
-    try testing.expect(std.mem.indexOf(u8, line, "Always") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "\x1b[38;2;200;210;220m") != null);
+test "buildApprovalOptionLine numbers each row and bolds only the selected one" {
+    var out: [128]u8 = undefined;
+    const selected_line = buildApprovalOptionLine(&out, 1, 1, "Yes, and don't ask again for Bash this session");
+    try testing.expect(std.mem.indexOf(u8, selected_line, "2. Yes, and don't ask again for Bash this session") != null);
+    try testing.expect(std.mem.indexOf(u8, selected_line, "\x1b[1m") != null);
+
+    var out2: [128]u8 = undefined;
+    const unselected_line = buildApprovalOptionLine(&out2, 0, 1, "Yes");
+    try testing.expect(std.mem.indexOf(u8, unselected_line, "1. Yes") != null);
+    try testing.expect(std.mem.indexOf(u8, unselected_line, "\x1b[2m") != null);
 }
 
-test "buildApprovalOptionsLine marks approve as primary when selected" {
-    var out: [512]u8 = undefined;
-    const line = buildApprovalOptionsLine(&out, 0);
-    // Approve at index 0 should carry the brand-accent mint background.
-    try testing.expect(std.mem.indexOf(u8, line, "Approve") != null);
-    try testing.expect(std.mem.indexOf(u8, line, "\x1b[48;2;95;212;160m") != null);
-    // Deny at index 2 is unselected, so no red fill should be present.
-    try testing.expect(std.mem.indexOf(u8, line, "\x1b[48;2;217;95;114m") == null);
+test "dialogTitleForTool maps common tools to reference-style titles" {
+    try testing.expectEqualStrings("Bash command", dialogTitleForTool("Bash"));
+    try testing.expectEqualStrings("Edit file", dialogTitleForTool("Edit"));
+    try testing.expectEqualStrings("Edit file", dialogTitleForTool("MultiEdit"));
+    try testing.expectEqualStrings("Create file", dialogTitleForTool("Write"));
+    try testing.expectEqualStrings("Read file", dialogTitleForTool("Read"));
+    try testing.expectEqualStrings("Grep", dialogTitleForTool("Grep"));
+    try testing.expectEqualStrings("Tool", dialogTitleForTool(""));
+}
+
+test "parseApprovalMessage extracts the tool name and flattens extra context lines" {
+    var name_buf: [64]u8 = undefined;
+    var body_buf: [256]u8 = undefined;
+    const parts = parseApprovalMessage("Bash [MEDIUM]: run tests via npm test", &name_buf, &body_buf);
+    try testing.expectEqualStrings("Bash", parts.tool_name);
+    try testing.expectEqualStrings("run tests via npm test", parts.body);
+
+    var name_buf2: [64]u8 = undefined;
+    var body_buf2: [256]u8 = undefined;
+    const parts2 = parseApprovalMessage(
+        "permission rule asks before running tool: matched deny-adjacent rule\nBash [HIGH]: rm -rf /tmp/scratch\nSuggested allow-rules: Bash(rm:*)",
+        &name_buf2,
+        &body_buf2,
+    );
+    try testing.expectEqualStrings("Bash", parts2.tool_name);
+    try testing.expect(std.mem.indexOf(u8, parts2.body, "matched deny-adjacent rule") != null);
+    try testing.expect(std.mem.indexOf(u8, parts2.body, "rm -rf /tmp/scratch") != null);
+    try testing.expect(std.mem.indexOf(u8, parts2.body, "Suggested allow-rules") != null);
+    // repl-ux-03: the concrete allow-rule is also lifted out into its own
+    // field so the "don't ask again" option can name it directly.
+    try testing.expectEqualStrings("Bash(rm:*)", parts2.allow_rule);
+}
+
+// repl-ux-03: the approval body must carry the FULL command through
+// end-to-end parsing -- not just up to the old 256-byte body_buf cap.
+test "parseApprovalMessage does not re-truncate a long body back down to ~256 bytes" {
+    const long_command = "a" ** 400;
+    var msg_buf: [512]u8 = undefined;
+    const message = std.fmt.bufPrint(&msg_buf, "Bash [MEDIUM]: {s}", .{long_command}) catch unreachable;
+
+    var name_buf: [64]u8 = undefined;
+    var body_buf: [2048]u8 = undefined;
+    const parts = parseApprovalMessage(message, &name_buf, &body_buf);
+    try testing.expectEqualStrings(long_command, parts.body);
+}
+
+// repl-ux-03: when a concrete allow-rule was derived upstream, the "don't
+// ask again" label names it directly ("for: <rule>") instead of the
+// generic tool-scoped wording.
+test "dontAskAgainLabel prefers a concrete rule over the generic tool-scoped label" {
+    var buf: [200]u8 = undefined;
+    try testing.expectEqualStrings(
+        "Yes, and don't ask again for: Bash(npm run)",
+        dontAskAgainLabel(&buf, "Bash", "Bash(npm run)"),
+    );
+
+    var buf2: [200]u8 = undefined;
+    try testing.expectEqualStrings(
+        "Yes, and don't ask again for Bash this session",
+        dontAskAgainLabel(&buf2, "Bash", ""),
+    );
 }
 
 test "plan review overlay functions exist" {
@@ -6592,6 +7049,67 @@ test "parseSessionSwitcherData parses items and clamps initial selection" {
     try testing.expectEqualStrings("just now", parsed.items[0].updated_summary);
     try testing.expect(parsed.items[0].is_current);
     try testing.expectEqual(@as(usize, 1), parsed.initial_selection);
+}
+
+test "parseSessionSwitcherData reads branch, first_prompt, and message_count when present" {
+    const payload =
+        \\{
+        \\  "initial_selection": 0,
+        \\  "items": [
+        \\    {
+        \\      "id": "session-a",
+        \\      "label": "fix parser",
+        \\      "updated_summary": "1h ago",
+        \\      "is_current": false,
+        \\      "branch": "feature/x",
+        \\      "first_prompt": "fix the tokenizer",
+        \\      "message_count": 4
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try parseSessionSwitcherData(testing.allocator, payload);
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 1), parsed.items.len);
+    try testing.expectEqualStrings("feature/x", parsed.items[0].branch);
+    try testing.expectEqualStrings("fix the tokenizer", parsed.items[0].first_prompt);
+    try testing.expectEqual(@as(usize, 4), parsed.items[0].message_count);
+}
+
+test "buildSessionSwitcherLineTwo includes branch and message count, matching the reference's age/branch/count triple" {
+    const item = SessionSwitcherItem{
+        .id = @constCast("session-a"),
+        .label = @constCast("fix parser"),
+        .updated_summary = @constCast("1h ago"),
+        .is_current = false,
+        .branch = @constCast("feature/x"),
+        .first_prompt = &.{},
+        .message_count = 4,
+    };
+    var buf: [512]u8 = undefined;
+    const line_two = buildSessionSwitcherLineTwo(&buf, item);
+    try testing.expect(std.mem.indexOf(u8, line_two, "session-a") != null);
+    try testing.expect(std.mem.indexOf(u8, line_two, "1h ago") != null);
+    try testing.expect(std.mem.indexOf(u8, line_two, "feature/x") != null);
+    try testing.expect(std.mem.indexOf(u8, line_two, "4 messages") != null);
+}
+
+test "buildSessionSwitcherLineTwo omits the branch segment when a session predates that sidecar" {
+    const item = SessionSwitcherItem{
+        .id = @constCast("session-b"),
+        .label = @constCast("older session"),
+        .updated_summary = @constCast("2d ago"),
+        .is_current = false,
+        .message_count = 1,
+    };
+    var buf: [512]u8 = undefined;
+    const line_two = buildSessionSwitcherLineTwo(&buf, item);
+    try testing.expect(std.mem.indexOf(u8, line_two, "1 message") != null);
+    try testing.expect(std.mem.indexOf(u8, line_two, "1 messages") == null);
+    // No branch known: no extra bare "•  •" double-separator artifact.
+    try testing.expect(std.mem.indexOf(u8, line_two, "\xe2\x80\xa2  \xe2\x80\xa2") == null);
 }
 
 test "bestSessionFuzzyScore ranks parser sessions ahead of unrelated ones" {

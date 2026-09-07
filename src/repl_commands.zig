@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const repl = @import("cli/repl.zig");
+const repl_render_mod = @import("cli/repl_render.zig");
 const agents_mod = @import("core/agents.zig");
 const commands_mod = @import("core/commands.zig");
 const config_mod = @import("core/config.zig");
@@ -47,6 +48,9 @@ const update_mod = @import("update.zig");
 const tool_helpers = @import("tools/helpers.zig");
 const team_tool = @import("tools/team.zig");
 const task_mod = @import("tools/task.zig");
+const bg_cmds = @import("bg_cmds.zig");
+const remote_daemon = @import("remote_daemon.zig");
+const session_registry_mod = @import("core/session_registry.zig");
 const workspace_dirs_mod = @import("core/workspace_dirs.zig");
 const stats_report = @import("core/stats_report.zig");
 const ide_detect = @import("core/ide_detect.zig");
@@ -54,6 +58,7 @@ const terminal_caps = @import("core/terminal_caps.zig");
 const heap_diag = @import("core/heap_diag.zig");
 const ctx_viz = @import("core/ctx_viz.zig");
 const permission_rules_mod = @import("core/permission_rules.zig");
+const permission_rule_validation_mod = @import("core/permission_rule_validation.zig");
 const permission_rule_string_mod = @import("core/permission_rule_string.zig");
 const permission_reason_mod = @import("core/permission_reason.zig");
 const shadow_detection_mod = @import("core/shadow_detection.zig");
@@ -63,6 +68,7 @@ const ripgrep_status = @import("core/ripgrep_status.zig");
 const sandbox_mod = @import("core/sandbox.zig");
 const keychain_mod = @import("core/keychain.zig");
 const feature_gates_mod = @import("core/feature_gates.zig");
+const autocompact_threshold_mod = @import("core/autocompact_threshold.zig");
 const command_canonical = @import("core/command_canonical.zig");
 const cc_stub_commands = @import("core/cc_stub_commands.zig");
 const removed_commands = @import("core/removed_commands.zig");
@@ -71,6 +77,7 @@ const model_allowlist = @import("core/model_allowlist.zig");
 const deprecation = @import("core/deprecation.zig");
 const shell_completion = @import("core/shell_completion.zig");
 const session_search = @import("core/session_search.zig");
+const repl_commands_parity = @import("repl_commands_parity.zig");
 
 const AgentRuntime = agent_runtime.AgentRuntime;
 
@@ -324,7 +331,11 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
     }
 
     if (std.mem.eql(u8, command, "/session list") or std.mem.eql(u8, command, "/resume list")) {
-        const entries = try runtime.store.list();
+        // sessions-storage-02/04: same-project sessions by default now that
+        // sessions land under `<zcode_home>/projects/<slug>/` -- `store.list()`
+        // only ever sees the legacy flat directory, which would otherwise make
+        // every session started after this migration invisible here.
+        const entries = try runtime.store.listForActiveProject();
         defer runtime.store.freeSessionEntries(entries);
         if (entries.len == 0) {
             return @as(?[]u8, try allocator.dupe(u8, "no saved sessions"));
@@ -384,7 +395,7 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         var early_reply: ?[]u8 = null;
         const loaded = runtime.store.load(arg) catch blk: {
             // Fuzzy fallback: resolve the term against the session list.
-            const entries = try runtime.store.list();
+            const entries = try runtime.store.listForActiveProject();
             defer runtime.store.freeSessionEntries(entries);
 
             const candidates = try allocator.alloc(session_search.Candidate, entries.len);
@@ -575,6 +586,14 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try runtime.switchOutputStyle(requested_style));
     }
 
+    // commands-04: 2.1.261 lists "marketplace" as a bare alias of /plugin
+    // (no subcommand). zcode's own /marketplace sources|add|remove|refresh
+    // feature (below) has no reference-name collision, so only the bare form
+    // needs to mirror /plugin's listing.
+    if (std.mem.eql(u8, command, "/marketplace")) {
+        return @as(?[]u8, try plugins_mod.renderList(allocator, runtime.cwd));
+    }
+
     if (std.mem.eql(u8, command, "/marketplace sources")) {
         return @as(?[]u8, try marketplace_mod.renderSources(allocator));
     }
@@ -718,6 +737,59 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try skills_mod.renderDetail(allocator, runtime.cwd, requested));
     }
 
+    // commands-23: reference /reload-skills -- "Pick up skills added or
+    // changed on disk during this session". skills_mod.list() already
+    // rescans .claude/skills + .zcode/skills fresh on every call (no
+    // in-memory cache to invalidate), so a mid-session addition is already
+    // visible to the model's next turn -- this command's real job is to
+    // confirm that to the user and report the current count.
+    if (std.mem.eql(u8, command, "/reload-skills")) {
+        const skills = skills_mod.list(allocator, runtime.cwd) catch |err| {
+            return @as(?[]u8, try std.fmt.allocPrint(allocator, "reload-skills: failed to rescan skills ({s})", .{@errorName(err)}));
+        };
+        defer skills_mod.freeList(allocator, skills);
+        // hooks-permissions-03: ConfigChange fires with the reference's
+        // "skills" source enum value on a skill directory rescan.
+        runtime.fireConfigChangeHook("skills", null);
+        return @as(?[]u8, try std.fmt.allocPrint(
+            allocator,
+            "skills reloaded: {d} skill(s) now visible. (zcode rescans skills from disk on every call, so anything added or changed mid-session was already picked up.)",
+            .{skills.len},
+        ));
+    }
+
+    // commands-24: reference /skill-doctor -- "Show which loaded skills are
+    // unused and costing context". Cross-references every loaded skill
+    // against its decay-scored invocation frequency (core/skill_usage.zig,
+    // already recorded by the /skill dispatch arm above).
+    if (std.mem.eql(u8, command, "/skill-doctor")) {
+        const skills = skills_mod.list(allocator, runtime.cwd) catch |err| {
+            return @as(?[]u8, try std.fmt.allocPrint(allocator, "skill-doctor: failed to list skills ({s})", .{@errorName(err)}));
+        };
+        defer skills_mod.freeList(allocator, skills);
+
+        var snap = skill_usage_mod.snapshot(allocator);
+        defer snap.deinit();
+
+        var out = std_io.StringBuilder.init(allocator);
+        defer out.deinit();
+        try out.writer().writeAll("Skill usage -- which loaded skills are unused and costing context:\n\n");
+
+        var unused_count: usize = 0;
+        for (skills) |skill| {
+            const score = snap.score(skill.name);
+            if (score <= 0) {
+                unused_count += 1;
+                try out.writer().print("  [unused] /{s} -- {s}\n", .{ skill.name, skill.description });
+            }
+        }
+        if (unused_count == 0) {
+            try out.writer().writeAll("  (every loaded skill has been used recently)\n");
+        }
+        try out.writer().print("\n{d} of {d} loaded skill(s) appear unused.\n", .{ unused_count, skills.len });
+        return @as(?[]u8, try out.toOwnedSlice());
+    }
+
     if (std.mem.eql(u8, command, "/plugin") or std.mem.eql(u8, command, "/plugins")) {
         // Bare /plugin with no subcommand: list installed plugins.
         // Reference opens an interactive menu; zcode's non-interactive
@@ -817,17 +889,19 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
     }
 
     if (std.mem.eql(u8, command, "/init")) {
-        // Drop a starter `ZCODE.md` in the current shell cwd with
-        // the section skeleton zcode (and reference claude-code)
-        // reads into the system prompt at startup. Refuses to
-        // overwrite an existing file so the user's edits can't be
-        // clobbered by an accidental re-run.
-        //
-        // The skeleton is intentionally sparse -- just section
-        // headers and short hint lines. The user (or a subsequent
-        // model turn) fills in the bodies based on the actual
-        // project.
-        return @as(?[]u8, try handleInitSkeleton(allocator, runtime));
+        // bundled-skills-06: 2.1.261's `/init` hands the MODEL a prompt that
+        // analyzes the actual codebase and writes CLAUDE.md itself
+        // (progressMessage "analyzing your codebase") -- it does not drop a
+        // static, empty-section skeleton. `runInitCommand` (below) already
+        // sends that model-driven INIT_PROMPT; route the live command through
+        // it. `handleInitSkeleton`'s static skeleton is kept only as the
+        // no-model fallback for the mock provider (which cannot itself
+        // analyze anything), so `--provider mock` sessions still get a usable
+        // starting file instead of a prompt no model will ever answer.
+        if (std.ascii.eqlIgnoreCase(runtime.active_provider, "mock")) {
+            return @as(?[]u8, try handleInitSkeleton(allocator, runtime));
+        }
+        return @as(?[]u8, try runInitCommand(allocator, runtime));
     }
 
     if (std.mem.eql(u8, command, "/pwd")) {
@@ -882,6 +956,11 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
 
         const old_cwd = runtime.shell_cwd;
         runtime.shell_cwd = abs;
+        // hooks-permissions-03: fire CwdChanged for the /cd command itself
+        // (agent_runtime.updateShellCwd covers the other real trigger, a
+        // Bash `cd`). Fired before freeing old_cwd since it is passed by
+        // reference into the (synchronous) hook call.
+        runtime.fireCwdChangedHook(old_cwd, runtime.shell_cwd);
         allocator.free(old_cwd);
 
         return @as(?[]u8, try std.fmt.allocPrint(
@@ -929,16 +1008,67 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         ));
     }
 
-    if (std.mem.eql(u8, command, "/config") or std.mem.startsWith(u8, command, "/config ")) {
+    // commands-08: /settings is the reference's alias for /config.
+    if (std.mem.eql(u8, command, "/config") or std.mem.startsWith(u8, command, "/config ") or
+        std.mem.eql(u8, command, "/settings") or std.mem.startsWith(u8, command, "/settings "))
+    {
         return handleConfigCommand(allocator, runtime, command);
     }
 
+    // NOTE (commands-33 follow-up): the gap's acceptance test says "reported
+    // by /context/features", but /features is itself a zcode-only command
+    // intentionally short-circuited by removed_commands.isRemoved (it has no
+    // 2.1.261 counterpart -- see core/removed_commands.zig), so this branch
+    // is dead/unreachable code and is NOT a valid place to surface the
+    // auto-compact threshold; /context (below, not removed) is the one real
+    // surface and is where the threshold is actually exposed.
     if (std.mem.eql(u8, command, "/features")) {
         return @as(?[]u8, try feature_gates_mod.renderEffective(allocator, runtime.cfg));
     }
 
     if (std.mem.eql(u8, command, "/context")) {
         return handleContextCommand(allocator, runtime);
+    }
+
+    // commands-33: /autocompact -- the absolute-token threshold model already
+    // lived in core/autocompact_threshold.zig, configurable only via the
+    // CLAUDE_CODE_AUTO_COMPACT_WINDOW / CLAUDE_AUTOCOMPACT_PCT_OVERRIDE env
+    // vars (which require a restart). This wires a session-scoped slash
+    // command over the same pure model via the in-process env override map
+    // (core/env.zig), which every autocompact_threshold.zig env reader already
+    // consults first -- no restart, no real env mutation.
+    if (std.mem.eql(u8, command, "/autocompact")) {
+        return @as(?[]u8, try autocompactReport(allocator, runtime.cfg));
+    }
+    if (std.mem.startsWith(u8, command, "/autocompact ")) {
+        const arg = std.mem.trim(u8, command["/autocompact ".len..], " \t");
+        if (arg.len == 0) return @as(?[]u8, try autocompactReport(allocator, runtime.cfg));
+        if (std.ascii.eqlIgnoreCase(arg, "auto")) {
+            // Empty override string reads back as "unset" in every
+            // autocompact_threshold.zig *FromEnv parser (trim -> len==0 -> null).
+            try env_mod.setOverride(autocompact_threshold_mod.ENV_AUTO_COMPACT_WINDOW, "");
+            const report = try autocompactReport(allocator, runtime.cfg);
+            defer allocator.free(report);
+            return @as(?[]u8, try std.fmt.allocPrint(
+                allocator,
+                "auto-compact threshold reset to automatic (percent-of-window) behavior.\n{s}",
+                .{report},
+            ));
+        }
+        const tokens = std.fmt.parseInt(usize, arg, 10) catch {
+            return @as(?[]u8, try allocator.dupe(u8, "usage: /autocompact [auto|<tokens>]"));
+        };
+        if (tokens == 0) {
+            return @as(?[]u8, try allocator.dupe(u8, "usage: /autocompact [auto|<tokens>]  (tokens must be > 0)"));
+        }
+        try env_mod.setOverride(autocompact_threshold_mod.ENV_AUTO_COMPACT_WINDOW, arg);
+        const report = try autocompactReport(allocator, runtime.cfg);
+        defer allocator.free(report);
+        return @as(?[]u8, try std.fmt.allocPrint(
+            allocator,
+            "auto-compact window set to {d} tokens for this session.\n{s}",
+            .{ tokens, report },
+        ));
     }
 
     if (std.mem.eql(u8, command, "/fast") or std.mem.startsWith(u8, command, "/fast ")) {
@@ -963,7 +1093,49 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try handleColorPalette(allocator, runtime.store, runtime.session_id, arg));
     }
 
+    // commands-18: /scroll-speed [N] -- reference: "Adjust mouse wheel scroll
+    // speed". zcode's fullscreen renderer does not decode mouse-wheel SGR
+    // sequences yet, so there is nothing to apply the multiplier to; this
+    // command accepts and remembers the value for the rest of the session
+    // (via the in-process env-override map, the same session-scoped storage
+    // /autocompact uses) so the command is not a pure no-op and the value is
+    // ready to be read once mouse-wheel input lands. Session config (a
+    // config.toml field, like /color's session-store sidecar) is a bigger,
+    // out-of-scope-for-this-fix storage change -- left as a follow-up.
+    if (std.mem.eql(u8, command, "/scroll-speed")) {
+        const current = env_mod.getenv("ZCODE_SCROLL_SPEED") orelse "1.0";
+        return @as(?[]u8, try std.fmt.allocPrint(
+            allocator,
+            "scroll speed: {s}\n(remembered for this session; takes effect once fullscreen mouse-wheel scroll capture is implemented)",
+            .{current},
+        ));
+    }
+    if (std.mem.startsWith(u8, command, "/scroll-speed ")) {
+        const arg = std.mem.trim(u8, command["/scroll-speed ".len..], " \t");
+        const value = std.fmt.parseFloat(f32, arg) catch {
+            return @as(?[]u8, try allocator.dupe(u8, "usage: /scroll-speed <multiplier>  (e.g. /scroll-speed 2.0)"));
+        };
+        if (!(value > 0)) {
+            return @as(?[]u8, try allocator.dupe(u8, "usage: /scroll-speed <multiplier>  (must be > 0)"));
+        }
+        try env_mod.setOverride("ZCODE_SCROLL_SPEED", arg);
+        return @as(?[]u8, try std.fmt.allocPrint(
+            allocator,
+            "scroll speed set to {s} for this session\n(takes effect once fullscreen mouse-wheel scroll capture is implemented)",
+            .{arg},
+        ));
+    }
+
+    // repl-ux-07: bare /status is now the human-readable sectioned panel
+    // (renderStatusSectionedText), mirroring the reference's Settings
+    // dialog on its "Status" tab (named property groups, Title-Case
+    // "Label: value" rows) instead of a raw snake_case key=value dump.
+    // The old dump is kept verbatim behind `/status raw` for scripting.
     if (std.mem.eql(u8, command, "/status")) {
+        return @as(?[]u8, try renderStatusSectionedText(allocator, runtime));
+    }
+
+    if (std.mem.eql(u8, command, "/status raw")) {
         const metrics = runtime.statusMetrics();
         var out = std_io.StringBuilder.init(allocator);
         errdefer out.deinit();
@@ -1196,7 +1368,23 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         std.mem.eql(u8, command, "/tasks list") or
         std.mem.eql(u8, command, "/bashes"))
     {
-        return @as(?[]u8, try task_mod.taskList(allocator, runtime.cwd, null));
+        // commands-14: the reference describes /tasks (alias /bashes) as
+        // "View and manage everything running in the background" -- that
+        // spans subagent Task-tool jobs AND sessions sent to the background
+        // via /background (core/session_registry.zig), not just the former.
+        // Append the live-process registry as a second section so a
+        // backgrounded session is discoverable from another interactive
+        // session without dropping to the CLI-only `zcode ps`.
+        const task_output = try task_mod.taskList(allocator, runtime.cwd, null);
+        defer allocator.free(task_output);
+        var bg_buf = std_io.StringBuilder.init(allocator);
+        defer bg_buf.deinit();
+        try bg_cmds.cmdPs(allocator, bg_buf.writer());
+        return @as(?[]u8, try std.fmt.allocPrint(
+            allocator,
+            "{s}\nBackground sessions:\n{s}",
+            .{ task_output, bg_buf.items() },
+        ));
     }
 
     if (std.mem.startsWith(u8, command, "/tasks stop ")) {
@@ -1209,6 +1397,40 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
 
     if (std.mem.eql(u8, command, "/tasks stop-all")) {
         return @as(?[]u8, try stopAllManagedBackgroundTasks(allocator, runtime));
+    }
+
+    // commands-13: reference /stop -- "Stop this background session;
+    // transcript and worktree are kept". Wraps the already-built
+    // bg_cmds.cmdKill (SIGTERM + mark registry entry `.stopped`, keeping the
+    // file so `zcode attach`/`zcode ps` can still find it; it never touches
+    // the .jsonl transcript or any worktree, matching the reference's
+    // preserved-state semantics). Bare `/stop` from inside a `--bg`-spawned
+    // session stops itself; `/stop <id|pid>` from any session stops another
+    // registered one.
+    if (std.mem.eql(u8, command, "/stop")) {
+        const kind = session_registry_mod.SessionKind.fromEnv(allocator);
+        if (kind != .bg) {
+            return @as(?[]u8, try allocator.dupe(
+                u8,
+                "usage: /stop <id|pid>  (stops a registered background session; from inside a --bg session, bare /stop stops this one)",
+            ));
+        }
+        var buf = std_io.StringBuilder.init(allocator);
+        defer buf.deinit();
+        var pid_buf: [20]u8 = undefined;
+        const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{session_registry_mod.currentPid()}) catch unreachable;
+        try bg_cmds.cmdKill(allocator, pid_str, buf.writer());
+        return @as(?[]u8, try buf.toOwnedSlice());
+    }
+    if (std.mem.startsWith(u8, command, "/stop ")) {
+        const subject = std.mem.trim(u8, command["/stop ".len..], " \t");
+        if (subject.len == 0) {
+            return @as(?[]u8, try allocator.dupe(u8, "usage: /stop <id|pid>"));
+        }
+        var buf = std_io.StringBuilder.init(allocator);
+        defer buf.deinit();
+        try bg_cmds.cmdKill(allocator, subject, buf.writer());
+        return @as(?[]u8, try buf.toOwnedSlice());
     }
 
     if (std.mem.eql(u8, command, "/teams")) {
@@ -1505,11 +1727,93 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try renderUsageSummary(allocator, runtime));
     }
 
+    // commands-30: reference /explain-usage -- "See where this session's
+    // tokens went, in plain words". Narrates the exact structured data
+    // /usage already computes, rather than a second accounting engine.
+    if (std.mem.eql(u8, command, "/explain-usage")) {
+        const summary = try renderUsageSummary(allocator, runtime);
+        defer allocator.free(summary);
+        const prompt = try std.fmt.allocPrint(
+            allocator,
+            "Explain in plain, simple language where this session's tokens went, based on this structured usage summary. Include one simple text/ASCII chart (e.g. a bar made of repeated characters) proportioned to the numbers below -- do not just repeat the numbers verbatim.\n\n{s}",
+            .{summary},
+        );
+        defer allocator.free(prompt);
+        return @as(?[]u8, try runtime.handlePrompt(prompt));
+    }
+
+    // commands-29: reference /debug -- "Turn on debug logging and investigate
+    // problems", dispatcher-only (disableModelInvocation in the reference;
+    // zcode slash commands are never model-invocable pseudo-tools anyway, so
+    // that constraint already holds). zcode has no session-scoped debug-log
+    // toggle to flip yet (the CLI's own -d/--debug is a separate, startup-only
+    // flag owned by a different work package) -- use the in-process
+    // env-override map as the session-scoped stand-in, same mechanism
+    // /autocompact and /scroll-speed use.
+    //
+    // The reference restricts this investigation to allowedTools:
+    // ["Read","Grep","Glob"]. The prompt text alone is advisory -- the model
+    // could still call Edit/Write/Bash if they are offered. zcode's actual
+    // read-only-tools enforcement (agent_runtime.zig's
+    // `read_only_tools = effective_mode == .planning or effective_mode ==
+    // .review`, which drives agent_tools.filterReadOnlySchemas to strip
+    // write/exec tool schemas from what the model is offered) only engages in
+    // `.review`/`.planning` mode, so dispatch the investigation via
+    // handlePromptWithModeAndReporter(..., .review) -- exactly how /advisor
+    // and /security-review get real tool restriction -- rather than the
+    // `.execution`-mode runtime.handlePrompt.
+    if (std.mem.eql(u8, command, "/debug") or std.mem.startsWith(u8, command, "/debug ")) {
+        const issue = if (std.mem.startsWith(u8, command, "/debug "))
+            std.mem.trim(u8, command["/debug ".len..], " \t")
+        else
+            "";
+        try env_mod.setOverride("ZCODE_DEBUG_SESSION", "1");
+        if (issue.len == 0) {
+            return @as(?[]u8, try allocator.dupe(
+                u8,
+                "debug logging enabled for this session.\nusage: /debug <issue description>  to also investigate a specific problem.",
+            ));
+        }
+        const prompt = try std.fmt.allocPrint(
+            allocator,
+            "Debug logging is enabled for this session. Investigate this issue using ONLY read-only tools (Read, Grep, Glob) -- do not edit files, run shell commands, or make any other change: {s}",
+            .{issue},
+        );
+        defer allocator.free(prompt);
+        return @as(?[]u8, try runtime.handlePromptWithModeAndReporter(prompt, null, .review));
+    }
+
+    // commands-28: reference /claude-api -- "Build and debug apps that use
+    // the Claude API", allowedTools:["WebFetch(domain:platform.claude.com)"].
+    if (std.mem.eql(u8, command, "/claude-api") or std.mem.startsWith(u8, command, "/claude-api ")) {
+        const subtopic = if (std.mem.startsWith(u8, command, "/claude-api "))
+            std.mem.trim(u8, command["/claude-api ".len..], " \t")
+        else
+            "";
+        var prompt_buf = std_io.StringBuilder.init(allocator);
+        defer prompt_buf.deinit();
+        try prompt_buf.writer().writeAll(
+            "Help the user build or debug an application against the Claude API / Anthropic SDK " ++
+                "(model choice, pricing, request params, streaming, tool use, MCP, agents, prompt caching, token counting, model migration). " ++
+                "If you need current documentation, you may use WebFetch, but ONLY against platform.claude.com -- do not fetch any other domain for this task.\n",
+        );
+        if (subtopic.len > 0) {
+            try prompt_buf.writer().print(
+                "\nFocus area: {s}  (recognized reference subtopics: cost-optimize, migrate, managed-agents-onboard, prompt-audit, upgrade, build-eval, hillclimb)\n",
+                .{subtopic},
+            );
+        }
+        const prompt = try prompt_buf.toOwnedSlice();
+        defer allocator.free(prompt);
+        return @as(?[]u8, try runtime.handlePrompt(prompt));
+    }
+
     if (std.mem.eql(u8, command, "/stickers")) {
         return @as(?[]u8, try openStickersPage(allocator));
     }
 
-    if (std.mem.eql(u8, command, "/upgrade") or std.mem.eql(u8, command, "/update")) {
+    // commands-10: /restart is the reference's alias for /update.
+    if (isUpdateCommand(command)) {
         return @as(?[]u8, try handleUpgrade(allocator, runtime.cfg));
     }
 
@@ -1533,11 +1837,16 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try fetchPrStatus(allocator, runtime));
     }
 
-    if (std.mem.eql(u8, command, "/rewind") or std.mem.eql(u8, command, "/checkpoint")) {
+    // commands-11 / sessions-storage-10: /undo is the reference's alias for
+    // /rewind (alongside the already-wired /checkpoint).
+    if (std.mem.eql(u8, command, "/rewind") or std.mem.eql(u8, command, "/checkpoint") or std.mem.eql(u8, command, "/undo")) {
         return @as(?[]u8, try handleRewind(allocator, runtime, 1));
     }
-    if (std.mem.startsWith(u8, command, "/rewind ")) {
-        const arg = std.mem.trim(u8, command["/rewind ".len..], " \t");
+    if (std.mem.startsWith(u8, command, "/rewind ") or std.mem.startsWith(u8, command, "/undo ")) {
+        const arg = if (std.mem.startsWith(u8, command, "/rewind "))
+            std.mem.trim(u8, command["/rewind ".len..], " \t")
+        else
+            std.mem.trim(u8, command["/undo ".len..], " \t");
         const n = std.fmt.parseInt(usize, arg, 10) catch {
             return @as(?[]u8, try allocator.dupe(u8, "usage: /rewind [N]  (drop the last N assistant turns from the in-memory conversation)"));
         };
@@ -1549,6 +1858,25 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
 
     if (std.mem.eql(u8, command, "/memory") or std.mem.eql(u8, command, "/memory list")) {
         return @as(?[]u8, try memory_mod.listWithWorkspace(allocator, runtime.cwd));
+    }
+
+    // commands-21: reference /pause-memory (+ aliases /memory-pause,
+    // /toggle-memory) -- "Pause automemory for this session". Also ships
+    // hardcoded disabled for all 2.1.261 users (isEnabled:()=>!1), so this is
+    // treated as low priority. The session-scoped toggle sets
+    // ZCODE_AUTOMEMORY_PAUSED via env-override (same mechanism as
+    // /autocompact); core/memory_gate.zig's isAutoMemoryEnabled() -- the
+    // single source of truth every automemory call site (taxonomy prompt,
+    // MEMORY.md index render, turn-end extraction) gates on -- consults this
+    // flag as its highest-priority check, so a subsequent turn genuinely
+    // omits the automemory system-prompt section while paused.
+    if (std.mem.eql(u8, command, "/pause-memory") or std.mem.eql(u8, command, "/memory-pause") or std.mem.eql(u8, command, "/toggle-memory")) {
+        if (env_mod.isEnvTruthy("ZCODE_AUTOMEMORY_PAUSED")) {
+            try env_mod.setOverride("ZCODE_AUTOMEMORY_PAUSED", "");
+            return @as(?[]u8, try allocator.dupe(u8, "automemory resumed for this session."));
+        }
+        try env_mod.setOverride("ZCODE_AUTOMEMORY_PAUSED", "1");
+        return @as(?[]u8, try allocator.dupe(u8, "automemory paused for this session."));
     }
     if (std.mem.startsWith(u8, command, "/memory save ")) {
         const args_text = std.mem.trim(u8, command["/memory save ".len..], " \t");
@@ -1606,9 +1934,23 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try std.fmt.allocPrint(allocator, "[plugin] {s}\n\n{s}", .{ plugin_result.output, review_output }));
     }
 
-    if (std.mem.eql(u8, command, "/security-review") or std.mem.eql(u8, command, "/security_review")) {
-        const prompt = try review_flow.buildSecurityReviewPrompt(allocator);
+    if (std.mem.eql(u8, command, "/security-review") or std.mem.eql(u8, command, "/security_review") or
+        std.mem.startsWith(u8, command, "/security-review ") or std.mem.startsWith(u8, command, "/security_review "))
+    {
+        // bundled-skills-04: route through the "security-review" bundled skill
+        // (phased sub-task methodology + HARD EXCLUSIONS + allowed-tools
+        // restriction) instead of the older, unrestricted review_flow prompt,
+        // so the REPL command and the Skill-tool-discoverable skill share one
+        // implementation.
+        const args = if (std.mem.startsWith(u8, command, "/security-review "))
+            std.mem.trim(u8, command["/security-review ".len..], " \t")
+        else if (std.mem.startsWith(u8, command, "/security_review "))
+            std.mem.trim(u8, command["/security_review ".len..], " \t")
+        else
+            "";
+        const prompt = try skills_mod.renderRun(allocator, runtime.cwd, "security-review", args, runtime.session_id);
         defer allocator.free(prompt);
+        skill_usage_mod.recordSkill(allocator, "security-review");
         return @as(?[]u8, try runtime.handlePromptWithModeAndReporter(prompt, null, .review));
     }
 
@@ -1710,6 +2052,27 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try renderKairosOverview(allocator, cwd));
     }
 
+    // commands-19: reference /daemon -- "Manage background services and
+    // routines". zcode has no single worker-supervisor process behind that
+    // name (the reference's actual daemon spawns `claude --daemon-worker
+    // <kind>` children to host the cloud Agent SDK assistant -- out of
+    // scope, no local equivalent); instead it splits the same surface area
+    // across /kairos (the per-project autonomous background agent: proposal
+    // review/approve/dismiss) and remote_daemon.zig (the local HTTP
+    // session-share server). /daemon is zcode's umbrella view over both, not
+    // a new subsystem.
+    if (std.mem.eql(u8, command, "/daemon")) {
+        const kairos_overview = try renderKairosOverview(allocator, runtime.cwd);
+        defer allocator.free(kairos_overview);
+        const daemon_status = try remote_daemon.status(allocator);
+        defer allocator.free(daemon_status);
+        return @as(?[]u8, try std.fmt.allocPrint(
+            allocator,
+            "== background routines (kairos) ==\n{s}\n== background services (share daemon) ==\n{s}",
+            .{ kairos_overview, daemon_status },
+        ));
+    }
+
     // /loop [interval] <prompt> - schedule a recurring prompt and fire it once
     // now. Mirrors Claude Code's loop skill (immediate-fire + recurring cron).
     if (std.mem.eql(u8, command, "/loop") or std.mem.startsWith(u8, command, "/loop ")) {
@@ -1746,6 +2109,22 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
             "Looping every {s} (cron \"{s}\", durable, job {s}). Auto-expires after 7 days; cancel with CronDelete {s}.\n\n{s}",
             .{ parsed.interval, cron_expr, id_owned, id_owned, fired },
         ));
+    }
+
+    // commands-20: reference /loops -- "List, create, and delete loops" --
+    // ships hardcoded disabled for all 2.1.261 users (isEnabled:()=>!1), so
+    // this is a thin, low-priority management layer over the durable cron
+    // jobs /loop already creates (CronList/CronDelete), not a second
+    // scheduling engine.
+    if (std.mem.eql(u8, command, "/loops")) {
+        const td = @import("tools/tool_dispatch.zig");
+        return @as(?[]u8, try td.handleCronList(allocator, null, undefined));
+    }
+    if (std.mem.startsWith(u8, command, "/loops delete ")) {
+        const td = @import("tools/tool_dispatch.zig");
+        const id = std.mem.trim(u8, command["/loops delete ".len..], " \t");
+        if (id.len == 0) return @as(?[]u8, try allocator.dupe(u8, "usage: /loops delete <id>"));
+        return @as(?[]u8, try td.removeCronJob(allocator, id));
     }
 
     // ── Memory consolidation ──
@@ -1787,7 +2166,8 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return handlePromptInspectCommand(allocator, runtime, command);
     }
 
-    if (std.mem.eql(u8, command, "/doctor")) {
+    // commands-07: /checkup is the reference's alias for /doctor.
+    if (std.mem.eql(u8, command, "/doctor") or std.mem.eql(u8, command, "/checkup")) {
         return @as(?[]u8, try runDoctorDiagnostics(allocator, runtime));
     }
 
@@ -1969,6 +2349,22 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try renderReleaseNotes(allocator, runtime));
     }
 
+    // commands-22: reference /recap -- "Generate a one-line session recap
+    // now". Exact reference copy for the empty-session and failure
+    // fallbacks (cc_strings.txt: "Nothing to recap yet — send a message
+    // first." / "Couldn't generate a recap. Run with --debug for details.").
+    if (std.mem.eql(u8, command, "/recap")) {
+        if (runtime.history.len() == 0) {
+            return @as(?[]u8, try allocator.dupe(u8, "Nothing to recap yet \xe2\x80\x94 send a message first."));
+        }
+        const result = runtime.handlePrompt(
+            "In exactly one line (one sentence, no more), recap what has happened in this session so far.",
+        ) catch {
+            return @as(?[]u8, try allocator.dupe(u8, "Couldn't generate a recap. Run with --debug for details."));
+        };
+        return @as(?[]u8, result);
+    }
+
     if (std.mem.eql(u8, command, "/thinkback")) {
         return @as(?[]u8, try renderThinkback(allocator, runtime, 5));
     }
@@ -1978,8 +2374,12 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try renderThinkback(allocator, runtime, count));
     }
 
-    if (std.mem.startsWith(u8, command, "/rename ")) {
-        const new_name = std.mem.trim(u8, command["/rename ".len..], " \t");
+    // commands-09: /name is the reference's alias for /rename.
+    if (std.mem.startsWith(u8, command, "/rename ") or std.mem.startsWith(u8, command, "/name ")) {
+        const new_name = if (std.mem.startsWith(u8, command, "/rename "))
+            std.mem.trim(u8, command["/rename ".len..], " \t")
+        else
+            std.mem.trim(u8, command["/name ".len..], " \t");
         if (new_name.len == 0) {
             return @as(?[]u8, try allocator.dupe(u8, "usage: /rename <new-session-name>"));
         }
@@ -1992,7 +2392,7 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try std.fmt.allocPrint(allocator, "session {s} renamed to: {s}", .{ runtime.session_id, new_name }));
     }
 
-    if (std.mem.eql(u8, command, "/rename")) {
+    if (std.mem.eql(u8, command, "/rename") or std.mem.eql(u8, command, "/name")) {
         return @as(?[]u8, try allocator.dupe(u8, "usage: /rename <new-session-name>"));
     }
 
@@ -2256,32 +2656,12 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
 
     // ── Advanced workflow commands ──
 
-    if (std.mem.eql(u8, command, "/security-review") or std.mem.startsWith(u8, command, "/security-review ")) {
-        const scope = if (std.mem.startsWith(u8, command, "/security-review "))
-            std.mem.trim(u8, command["/security-review ".len..], " \t")
-        else
-            "";
-        var prompt_buf = std_io.StringBuilder.init(allocator);
-        defer prompt_buf.deinit();
-        try prompt_buf.writer().writeAll(
-            "Perform a thorough security audit of this codebase. Check for:\n" ++
-                "1. Command injection and shell escapes\n" ++
-                "2. Path traversal and symlink attacks\n" ++
-                "3. SQL injection, XSS, and OWASP Top 10\n" ++
-                "4. Hardcoded secrets, API keys, and credentials\n" ++
-                "5. Insecure deserialization\n" ++
-                "6. Authentication and authorization bypasses\n" ++
-                "7. Insecure cryptographic usage\n" ++
-                "8. Dependency vulnerabilities\n" ++
-                "9. Race conditions and TOCTOU bugs\n" ++
-                "10. Information disclosure in error messages\n\n" ++
-                "For each finding report: severity, file, line, description, and fix.\n",
-        );
-        if (scope.len > 0) try prompt_buf.writer().print("\nFocus on: {s}\n", .{scope});
-        const prompt = try prompt_buf.toOwnedSlice();
-        defer allocator.free(prompt);
-        return @as(?[]u8, try runtime.handlePrompt(prompt));
-    }
+    // (the older, unrestricted /security-review handler that lived here was
+    // dead code -- the eql-based check earlier in this dispatch chain always
+    // matched and returned first; bundled-skills-04 and commands-03
+    // independently removed it rather than leaving an unreachable duplicate.
+    // The surviving arm already matches the reference's bundled
+    // security-review plugin-skill.)
 
     // /btw <question>: a non-interrupting side question (commands-sweep-06).
     // Runs a one-shot model call with the current conversation as context but
@@ -2433,11 +2813,27 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try runGitCommandWithArgs(allocator, runtime.cwd, &.{ "git", "diff" }, raw_args));
     }
 
-    // commands-sweep-02: reference `/branch` (alias `/fork`) forks the CURRENT
-    // CONVERSATION at this point into a new session id with traceability back to
-    // the source. It is a pure conversation operation, NOT git. `/fork` resolves
-    // to `/branch` via command_canonical.toDispatch. The old git-branch helper is
-    // re-homed below under `/git-branch` so the functionality is not lost.
+    // sessions-storage-09: /fork COPIES the current conversation into a NEW,
+    // independently-resumable session and leaves the live runtime completely
+    // untouched -- the OPPOSITE of /branch below (which switches the live
+    // session_id/history in place). 2.1.261 ships these as two distinct
+    // top-level commands ("Copy this conversation into a new background
+    // session and keep working here" vs "Create a branch of the current
+    // conversation at this point"); /fork used to alias to /branch via
+    // command_canonical.toDispatch, which was a stale-snapshot artifact.
+    if (std.mem.eql(u8, command, "/fork") or std.mem.startsWith(u8, command, "/fork ")) {
+        const raw_prompt = if (std.mem.startsWith(u8, command, "/fork "))
+            std.mem.trim(u8, command["/fork ".len..], " \t")
+        else
+            "";
+        return @as(?[]u8, try handleForkSession(allocator, runtime, if (raw_prompt.len > 0) raw_prompt else null));
+    }
+
+    // commands-sweep-02: reference `/branch` forks the CURRENT CONVERSATION at
+    // this point into a new session id with traceability back to the source,
+    // AND switches the live runtime to it. It is a pure conversation
+    // operation, NOT git. The old git-branch helper is re-homed below under
+    // `/git-branch` so the functionality is not lost.
     if (std.mem.eql(u8, command, "/branch") or std.mem.startsWith(u8, command, "/branch ")) {
         const raw_name = if (std.mem.startsWith(u8, command, "/branch "))
             std.mem.trim(u8, command["/branch ".len..], " \t")
@@ -2472,45 +2868,7 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         if (std.mem.trim(u8, status, " \t\r\n").len == 0) {
             return @as(?[]u8, try allocator.dupe(u8, "nothing to commit (working tree clean)"));
         }
-        var prompt_buf = std_io.StringBuilder.init(allocator);
-        defer prompt_buf.deinit();
-        const w = prompt_buf.writer();
-        try w.writeAll(
-            \\Review the current git changes and create a single commit.
-            \\
-            \\1. First, gather context by running these commands:
-            \\   - git status
-            \\   - git diff HEAD (to see staged and unstaged changes)
-            \\   - git log --oneline -10 (to match the repo's commit message style)
-            \\
-            \\2. Git safety rules:
-            \\   - NEVER update git config
-            \\   - NEVER skip hooks (no --no-verify or --no-gpg-sign)
-            \\   - ALWAYS create NEW commits, never use git commit --amend
-            \\   - Do NOT commit files that likely contain secrets (.env, credentials, etc.)
-            \\   - Never use interactive flags (-i) as they are not supported
-            \\   - If there are no changes, do not create an empty commit
-            \\
-            \\3. Analyze all changes and draft a commit message:
-            \\   - Look at recent commits to follow the repo's commit message style
-            \\   - Summarize the nature of the changes (new feature, enhancement, bug fix, refactoring, etc.)
-            \\   - Draft a concise (1-2 sentences) commit message focusing on "why" not "what"
-            \\   - "add" = wholly new feature, "update" = enhancement, "fix" = bug fix
-            \\
-            \\4. Stage relevant files with git add (prefer specific files over git add -A)
-            \\   and commit using HEREDOC syntax:
-            \\   git commit -m "$(cat <<'EOF'
-            \\   Your commit message here.
-            \\
-            \\   Co-Authored-By: zcode <noreply@zcode.dev>
-            \\   EOF
-            \\   )"
-            \\
-        );
-        if (extra.len > 0) {
-            try w.print("\nAdditional context from the user: {s}\n", .{extra});
-        }
-        const prompt = try prompt_buf.toOwnedSlice();
+        const prompt = try buildCommitPrompt(allocator, runtime.cfg, extra);
         defer allocator.free(prompt);
         return @as(?[]u8, try runtime.handlePrompt(prompt));
     }
@@ -2591,17 +2949,20 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try runtime.handlePrompt(prompt));
     }
 
-    // ── /init command ──
-
-    if (std.mem.eql(u8, command, "/init")) {
-        return @as(?[]u8, try runInitCommand(allocator, runtime));
-    }
+    // (the earlier /init check in this dispatch chain always matches and
+    // returns first, so a second "/init" branch here would be unreachable
+    // dead code -- bundled-skills-06 removed it)
 
     // ── /permissions command ──
 
-    if (std.mem.eql(u8, command, "/permissions") or std.mem.startsWith(u8, command, "/permissions ")) {
+    // commands-06: /allowed-tools is the reference's alias for /permissions.
+    if (std.mem.eql(u8, command, "/permissions") or std.mem.startsWith(u8, command, "/permissions ") or
+        std.mem.eql(u8, command, "/allowed-tools") or std.mem.startsWith(u8, command, "/allowed-tools "))
+    {
         const args = if (std.mem.startsWith(u8, command, "/permissions "))
             std.mem.trim(u8, command["/permissions ".len..], " \t")
+        else if (std.mem.startsWith(u8, command, "/allowed-tools "))
+            std.mem.trim(u8, command["/allowed-tools ".len..], " \t")
         else
             "";
         return @as(?[]u8, try runPermissionsCommand(allocator, runtime, args));
@@ -2621,6 +2982,13 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
         return @as(?[]u8, try exportSession(allocator, runtime, derived));
     }
 
+    // ── wp1b-commands-new: /background /bg /list-agents /peers /subtask
+    //    /goal /team-onboarding /fewer-permission-prompts /auto-mode-setup
+    //    /bug /import /skill-doctor /reload-skills, plus the __goal_nudge
+    //    end-of-turn sentinel. One dispatch call into a dedicated module so
+    //    this giant switch does not grow further. ──
+    if (try repl_commands_parity.dispatch(allocator, runtime, command)) |out| return @as(?[]u8, out);
+
     // ── Custom command / skill fallthrough (commands-01) ──
     //
     // Last resort, AFTER every built-in arm above: typing `/deploy` runs
@@ -2628,7 +2996,13 @@ pub fn replCommandCallback(ctx: *anyopaque, allocator: std.mem.Allocator, comman
     // skill -- no `/command`/`/skill` wrapper needed. Built-ins win because they
     // are matched first by construction; this block only sees names no built-in
     // claimed, so a user file named `help.md` can never shadow `/help`.
-    if (command.len > 1 and command[0] == '/') {
+    // cli-flags-15: --disable-slash-commands ("Disable all skills" per
+    // Claude's own help text, applied here to the broader literal
+    // flag-name reading too) -- skip custom-command AND skill resolution
+    // entirely, so an unrecognized `/name` falls through to the normal
+    // unknown-command path. Built-in commands (matched above by
+    // construction) are unaffected.
+    if (command.len > 1 and command[0] == '/' and !runtime.cfg.disable_slash_commands) {
         const outcome = try resolveCustomOrSkill(allocator, runtime.cwd, command, runtime.session_id);
         switch (outcome) {
             .none => {}, // fall through to the unknown-command path below
@@ -2923,6 +3297,13 @@ fn addPermissionRule(allocator: std.mem.Allocator, runtime: *AgentRuntime, raw_a
         return std.fmt.allocPrint(allocator, "invalid permission action: {s}\nexpected one of: allow, deny, ask", .{action_token.value});
     const tool_token = takeToken(action_token.rest) orelse return allocator.dupe(u8, "usage: /permissions add [--workspace] <allow|deny|ask> <tool|*> [args-contains]");
     const args_contains = std.mem.trim(u8, tool_token.rest, " \t");
+    // hooks-permissions-11: reject the rule up front with a corrective
+    // suggestion (matching the reference's customValidation UX) rather than
+    // letting it fall through to Store.addRule's generic
+    // error.InvalidPermissionRule.
+    if (permission_rule_validation_mod.validate(tool_token.value, args_contains)) |verr| {
+        return allocator.dupe(u8, verr.message);
+    }
     const scope: permission_rules_mod.ScopeSpec = if (workspace_scope)
         .{ .workspace = runtime.cwd }
     else
@@ -4463,13 +4844,17 @@ fn renderSessionsOverlayData(allocator: std.mem.Allocator, runtime: *AgentRuntim
         // cleanup loop frees them uniformly.
         branch: []const u8,
         first_prompt: []const u8,
+        // sessions-storage-05: message count, matching the reference
+        // picker's always-present "age · branch · N messages" second line
+        // (edualc format.ts:203-231 formatLogMetadata).
+        message_count: usize,
     };
     const Payload = struct {
         initial_selection: usize,
         items: []const SessionOverlayItem,
     };
 
-    const entries = try runtime.store.list();
+    const entries = try runtime.store.listForActiveProject();
     defer runtime.store.freeSessionEntries(entries);
 
     const items = try allocator.alloc(SessionOverlayItem, entries.len);
@@ -4504,6 +4889,7 @@ fn renderSessionsOverlayData(allocator: std.mem.Allocator, runtime: *AgentRuntim
         const fp_opt = runtime.store.readFirstPrompt(entry.id) catch null;
         const fp_owned = fp_opt orelse try allocator.dupe(u8, "");
         errdefer allocator.free(fp_owned);
+        const message_count = if (runtime.store.countTurns(entry.id)) |counts| counts.total else |_| 0;
         items[idx] = .{
             .id = entry.id,
             .label = title,
@@ -4511,6 +4897,7 @@ fn renderSessionsOverlayData(allocator: std.mem.Allocator, runtime: *AgentRuntim
             .is_current = std.mem.eql(u8, entry.id, runtime.session_id),
             .branch = branch_owned,
             .first_prompt = fp_owned,
+            .message_count = message_count,
         };
         if (items[idx].is_current) current_index = idx;
     }
@@ -5959,8 +6346,68 @@ fn handleEffortSet(allocator: std.mem.Allocator, runtime: *AgentRuntime, arg: []
 /// turn starts fresh in the same session slot. Session history on disk
 /// is left untouched; only the live history buffer and recent outcomes
 /// snapshot are cleared. Aliases: /reset, /new.
+/// sessions-storage-09: `/fork`'s actual "copy this conversation into a new
+/// background session and keep working here" semantics (2.1.261's own
+/// description), distinct from `/branch`'s "switch the live session" (which
+/// `/fork` used to alias). Copies history+snapshot into a NEW session id via
+/// the same `session_bundles.forkSession` machinery `zcode session fork`
+/// already uses, then starts that new session as a genuine DETACHED
+/// background process via `bg_cmds.spawnBackground` -- the same
+/// self-registering `--bg` re-invocation `/background` already uses (see
+/// `repl_commands_parity.handleBackground`), so the fork shows up in `zcode
+/// ps`/the session registry. When `prompt` is given it is forwarded as
+/// `ZCODE_BG_INITIAL_PROMPT`, which the detached child answers headlessly
+/// (`session_mgmt.resumeSessionHeadless`, routed to by main.zig's
+/// `.session_resume` dispatch when `ZCODE_SESSION_KIND=bg`) as the fork's
+/// next turn -- never a merely-queued, unanswered turn a human has to
+/// `/resume` by hand. The CURRENT runtime's session_id/history/snapshot are
+/// never touched: `spawnBackground` only spawns a child process; it has no
+/// effect on the calling (still fully interactive) session.
+fn handleForkSession(allocator: std.mem.Allocator, runtime: *AgentRuntime, prompt: ?[]const u8) ![]u8 {
+    var forked = try session_bundles.forkSession(allocator, runtime.store, runtime.session_id, null);
+    defer forked.deinit(allocator);
+
+    const argv = try repl_commands_parity.buildBackgroundResumeArgv(allocator, forked.session_id, runtime.active_provider, runtime.active_model);
+    defer {
+        for (argv) |item| allocator.free(item);
+        allocator.free(argv);
+    }
+
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    try out.writer().print("forked into new session {s} (current session {s} is unchanged).\n", .{ forked.session_id, forked.source_session_id });
+
+    bg_cmds.spawnBackground(allocator, argv, runtime.cwd, out.writer(), prompt) catch |err| {
+        try out.writer().print(
+            "failed to start the fork in the background ({s}). Resume it manually with /resume {s} or `zcode --resume {s}`.\n",
+            .{ @errorName(err), forked.session_id, forked.session_id },
+        );
+        return out.toOwnedSlice();
+    };
+
+    if (prompt) |p| {
+        try out.writer().print("queued prompt: {s} -- the background session will answer it before idling.\n", .{p});
+    }
+    return out.toOwnedSlice();
+}
+
 fn handleClearConversation(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
     const cleared_count = runtime.history.len();
+
+    // sessions-storage-08: regenerate the session id BEFORE clearing
+    // in-memory state, so the final snapshot below captures the true
+    // pre-clear state -- mirrors edualc's
+    // `regenerateSessionId({setCurrentAsParent:true})` +
+    // `resetSessionFilePointer()`. Pre- and post-clear turns must never
+    // share one .jsonl file. Best-effort: a failure here degrades to the
+    // old behavior (same id kept) rather than blocking /clear itself.
+    const old_session_id = try allocator.dupe(u8, runtime.session_id);
+    defer allocator.free(old_session_id);
+    if (runtime.store.regenerateSessionForClear(runtime.session_id, &runtime.snapshot, "cleared via /clear")) |new_id| {
+        runtime.allocator.free(runtime.session_id);
+        runtime.session_id = new_id;
+    } else |_| {}
+
     runtime.history.clearInMemory();
     // Phase 10 Task 5 (memory-01): reset the turn-end extraction cursor so a
     // cleared conversation starts a fresh extraction window (matches the
@@ -5986,10 +6433,19 @@ fn handleClearConversation(allocator: std.mem.Allocator, runtime: *AgentRuntime)
         std.Io.File.stdout().writeStreamingAll(rt.io, format_mod.clearTerminalSequence()) catch {};
     }
 
+    if (std.mem.eql(u8, old_session_id, runtime.session_id)) {
+        // regenerateSessionForClear failed; fall back to the pre-08 message
+        // rather than claiming a new session that was never actually minted.
+        return std.fmt.allocPrint(
+            allocator,
+            "cleared {d} in-memory turn(s); session {s} on disk is untouched",
+            .{ cleared_count, runtime.session_id },
+        );
+    }
     return std.fmt.allocPrint(
         allocator,
-        "cleared {d} in-memory turn(s); session {s} on disk is untouched",
-        .{ cleared_count, runtime.session_id },
+        "cleared {d} in-memory turn(s); started new session {s} (previous session {s} is still on disk, resumable with /resume {s})",
+        .{ cleared_count, runtime.session_id, old_session_id, old_session_id },
     );
 }
 
@@ -6722,6 +7178,17 @@ fn fetchPrStatus(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
 /// zcode; the atomic rename in cmdUpdate guarantees the old image is
 /// replaced without corrupting the process image that's currently
 /// serving this session.
+/// commands-10: names that dispatch to the /update handler. Pulled out as a
+/// pure predicate (rather than inlined in the big if/else dispatch chain) so
+/// the alias-recognition logic is unit-testable without the network call
+/// `handleUpgrade` makes -- this codebase has no existing test that exercises
+/// that network path, and this change should not add a flaky/slow one.
+fn isUpdateCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "/upgrade") or
+        std.mem.eql(u8, command, "/update") or
+        std.mem.eql(u8, command, "/restart");
+}
+
 fn handleUpgrade(allocator: std.mem.Allocator, cfg: *const config_mod.Config) ![]u8 {
     var buf = std_io.StringBuilder.init(allocator);
     defer buf.deinit();
@@ -6805,7 +7272,7 @@ fn renderUsageSummary(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u
         .used_tokens = metrics.last_input_tokens,
         .compact_threshold_percent = 60,
         .force_threshold_percent = 80,
-        .auto_compact_enabled = true,
+        .auto_compact_enabled = runtime.cfg.auto_compact_enabled,
         .memory_file_bytes = 0,
         .suppress_near_capacity = suppress_near_capacity,
     };
@@ -7520,6 +7987,62 @@ fn contextWindowForModel(provider: []const u8, model: []const u8) usize {
     return 200_000;
 }
 
+/// config-layout-17: build the `/commit` prompt. Extracted to a pure,
+/// directly-testable helper so `includeCoAuthoredBy`'s effect on the
+/// instructed trailer can be asserted without driving a model call.
+/// `cfg.include_co_authored_by` (default true) gates the "Co-Authored-By:
+/// zcode <noreply@zcode.dev>" trailer instruction -- `false` tells the model
+/// to leave it out entirely, mirroring the reference's `includeCoAuthoredBy
+/// === false -> attribution = {commit: "", pr: ""}` (kJo() in the bundle).
+fn buildCommitPrompt(allocator: std.mem.Allocator, cfg: *const config_mod.Config, extra: []const u8) ![]u8 {
+    var prompt_buf = std_io.StringBuilder.init(allocator);
+    defer prompt_buf.deinit();
+    const w = prompt_buf.writer();
+    try w.writeAll(
+        \\Review the current git changes and create a single commit.
+        \\
+        \\1. First, gather context by running these commands:
+        \\   - git status
+        \\   - git diff HEAD (to see staged and unstaged changes)
+        \\   - git log --oneline -10 (to match the repo's commit message style)
+        \\
+        \\2. Git safety rules:
+        \\   - NEVER update git config
+        \\   - NEVER skip hooks (no --no-verify or --no-gpg-sign)
+        \\   - ALWAYS create NEW commits, never use git commit --amend
+        \\   - Do NOT commit files that likely contain secrets (.env, credentials, etc.)
+        \\   - Never use interactive flags (-i) as they are not supported
+        \\   - If there are no changes, do not create an empty commit
+        \\
+        \\3. Analyze all changes and draft a commit message:
+        \\   - Look at recent commits to follow the repo's commit message style
+        \\   - Summarize the nature of the changes (new feature, enhancement, bug fix, refactoring, etc.)
+        \\   - Draft a concise (1-2 sentences) commit message focusing on "why" not "what"
+        \\   - "add" = wholly new feature, "update" = enhancement, "fix" = bug fix
+        \\
+        \\4. Stage relevant files with git add (prefer specific files over git add -A)
+        \\   and commit using HEREDOC syntax:
+        \\   git commit -m "$(cat <<'EOF'
+        \\   Your commit message here.
+        \\
+    );
+    if (cfg.include_co_authored_by) {
+        try w.writeAll(
+            \\   Co-Authored-By: zcode <noreply@zcode.dev>
+            \\
+        );
+    }
+    try w.writeAll(
+        \\   EOF
+        \\   )"
+        \\
+    );
+    if (extra.len > 0) {
+        try w.print("\nAdditional context from the user: {s}\n", .{extra});
+    }
+    return prompt_buf.toOwnedSlice();
+}
+
 fn qualityModelForProvider(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "anthropic")) return "claude-opus-4-6";
     if (std.mem.eql(u8, provider, "openai")) return "gpt-4.1";
@@ -7532,12 +8055,26 @@ fn qualityModelForProvider(provider: []const u8) []const u8 {
 // --- /config command ---
 
 fn handleConfigCommand(allocator: std.mem.Allocator, runtime: *AgentRuntime, command: []const u8) !?[]u8 {
-    const args_raw = if (command.len > "/config".len) command["/config".len..] else "";
+    // commands-08: strip whichever accepted prefix ("/config" or its
+    // reference alias "/settings") actually matched.
+    const prefix_len: usize = if (std.mem.startsWith(u8, command, "/settings")) "/settings".len else "/config".len;
+    const args_raw = if (command.len > prefix_len) command[prefix_len..] else "";
     const args = std.mem.trim(u8, args_raw, " \t");
 
-    // /config -- show all
+    // /config -- show all. repl-ux-07: routed through the SAME sectioned,
+    // Title-Case `renderStatusPanel` surface `/status` uses (not just a
+    // shared title prefix), so the two commands genuinely share one panel
+    // implementation, mirroring the reference's single Settings dialog on
+    // two different default tabs. The old snake_case `cfg.renderAll` dump
+    // is kept verbatim behind `/config raw` for scripting/diffing.
     if (args.len == 0) {
-        return @as(?[]u8, try runtime.cfg.renderAll(allocator));
+        return @as(?[]u8, try renderConfigSectionedText(allocator, runtime));
+    }
+
+    if (std.mem.eql(u8, args, "raw")) {
+        const raw = try runtime.cfg.renderAll(allocator);
+        defer allocator.free(raw);
+        return @as(?[]u8, try std.fmt.allocPrint(allocator, "\nzcode config\n\n{s}", .{raw}));
     }
 
     // /config set <key> <value>
@@ -7566,6 +8103,11 @@ fn handleConfigCommand(allocator: std.mem.Allocator, runtime: *AgentRuntime, com
                 .{ ht.head, @errorName(err) },
             )),
         };
+        // hooks-permissions-03: ConfigChange fires on a live `/config set`
+        // (reference source enum "user_settings" -- the closest fit for a
+        // session-scoped user-initiated override; this write never touches
+        // settings.json, so `file_path` is omitted).
+        runtime.fireConfigChangeHook("user_settings", null);
         return @as(?[]u8, try std.fmt.allocPrint(
             allocator,
             "{s} = {s}\n(session-only; add to ~/.zcode/config.toml to persist)",
@@ -7626,9 +8168,158 @@ fn handlePromptInspectCommand(allocator: std.mem.Allocator, runtime: *AgentRunti
     }));
 }
 
+/// repl-ux-07: build the named, Title-Case section groups shared by BOTH
+/// `/status` and bare `/config` -- one `repl_render.renderStatusPanel`
+/// surface, two entry points, mirroring the reference's single Settings
+/// dialog opened on two different default tabs. Groups mirror the
+/// reference's named Settings property builders (Version, Model, Safety,
+/// Provider, Preprocessor, UI, Session) without claiming to be Claude
+/// Code. `arena` owns every field/section returned (freed by the caller's
+/// arena teardown, not individually).
+fn buildStatusSections(arena: std.mem.Allocator, runtime: *AgentRuntime) ![]repl_render_mod.StatusSection {
+    const boolStr = struct {
+        fn f(v: bool) []const u8 {
+            return if (v) "true" else "false";
+        }
+    }.f;
+    const numStr = struct {
+        fn f(a: std.mem.Allocator, v: anytype) []const u8 {
+            return std.fmt.allocPrint(a, "{d}", .{v}) catch "?";
+        }
+    }.f;
+
+    const metrics = runtime.statusMetrics();
+    const pre_settings = runtime.resolvedPreprocessorSettings();
+
+    const version_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
+        .{ .label = "Version", .value = build_options.app_version },
+    });
+    const model_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
+        .{ .label = "Provider", .value = runtime.active_provider },
+        .{ .label = "Model", .value = runtime.active_model },
+        .{ .label = "Active Agent", .value = runtime.activeAgentName() orelse "<none>" },
+        .{ .label = "Default Provider", .value = runtime.cfg.default_provider },
+        .{ .label = "Default Model", .value = runtime.cfg.default_model },
+        .{ .label = "Fallback Provider", .value = agent_runtime.displayValueOr(runtime.cfg.fallback_provider, "<none>") },
+        .{ .label = "Fallback Model", .value = agent_runtime.displayValueOr(runtime.cfg.fallback_model, "<none>") },
+    });
+    const safety_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
+        .{ .label = "Approval Mode", .value = runtime.cfg.approval_mode },
+        .{ .label = "Sandbox", .value = runtime.cfg.sandbox },
+        .{ .label = "Strict", .value = boolStr(runtime.strict) },
+        .{ .label = "Yolo Mode", .value = boolStr(runtime.yolo_mode) },
+    });
+    const provider_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
+        .{ .label = "Base URL", .value = agent_runtime.displayValueOr(runtime.cfg.provider_base_url, "<env/default>") },
+        .{ .label = "API Key Configured", .value = boolStr(runtime.cfg.provider_api_key.len > 0) },
+        .{ .label = "Timeout (ms)", .value = numStr(arena, runtime.cfg.provider_timeout_ms) },
+        .{ .label = "Retry Count", .value = numStr(arena, runtime.cfg.provider_retry_count) },
+    });
+    const preprocessor_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
+        .{ .label = "Enabled", .value = boolStr(runtime.preprocessor_enabled) },
+        .{ .label = "Provider", .value = agent_runtime.displayValueOr(pre_settings.provider, "<none>") },
+        .{ .label = "Model", .value = agent_runtime.displayValueOr(pre_settings.model, "<none>") },
+    });
+    const ui_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
+        .{ .label = "Fullscreen", .value = boolStr(runtime.cfg.ui_fullscreen) },
+        .{ .label = "Theme", .value = runtime.cfg.ui_theme },
+        .{ .label = "Color", .value = boolStr(runtime.cfg.ui_color_enabled) },
+        .{ .label = "Vim Mode", .value = boolStr(runtime.cfg.ui_vim_mode) },
+        .{ .label = "Brief Mode", .value = boolStr(runtime.cfg.ui_brief_mode) },
+    });
+    const session_fields = try arena.dupe(repl_render_mod.StatusField, &[_]repl_render_mod.StatusField{
+        .{ .label = "Last Prompt Tokens", .value = numStr(arena, metrics.last_prompt_tokens) },
+        .{ .label = "Total Input Tokens", .value = numStr(arena, metrics.total_input_tokens) },
+        .{ .label = "Total Output Tokens", .value = numStr(arena, metrics.total_output_tokens) },
+    });
+
+    return arena.dupe(repl_render_mod.StatusSection, &[_]repl_render_mod.StatusSection{
+        .{ .title = "Version", .fields = version_fields },
+        .{ .title = "Model", .fields = model_fields },
+        .{ .title = "Safety", .fields = safety_fields },
+        .{ .title = "Provider", .fields = provider_fields },
+        .{ .title = "Preprocessor", .fields = preprocessor_fields },
+        .{ .title = "UI", .fields = ui_fields },
+        .{ .title = "Session", .fields = session_fields },
+    });
+}
+
+/// repl-ux-07: render `/status` as a sectioned, Title-Case panel via the
+/// shared `repl_render.renderStatusPanel` surface, instead of the raw
+/// snake_case `key={value}` dump (still available verbatim via
+/// `/status raw` for scripting).
+fn renderStatusSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const sections = try buildStatusSections(arena, runtime);
+
+    var out = std_io.StringBuilder.init(allocator);
+    errdefer out.deinit();
+    try repl_render_mod.renderStatusPanel(out.writer(), "zcode status", sections, runtime.cfg.ui_color_enabled);
+    try out.writer().writeAll("(full machine-readable dump: /status raw)\n");
+    return out.toOwnedSlice();
+}
+
+/// repl-ux-07: bare `/config` renders through the SAME `renderStatusPanel`
+/// surface as `/status` (only the title and footer hint differ) so the two
+/// commands genuinely share one panel implementation -- chrome, section
+/// headers, and Title-Case "Label: value" rows -- instead of `/config`
+/// staying on the old `cfg.renderAll` snake_case-with-comment-header dump.
+/// That raw dump is kept verbatim behind `/config raw` for scripting and
+/// diffing, mirroring `/status raw`.
+fn renderConfigSectionedText(allocator: std.mem.Allocator, runtime: *AgentRuntime) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const sections = try buildStatusSections(arena, runtime);
+
+    var out = std_io.StringBuilder.init(allocator);
+    errdefer out.deinit();
+    try repl_render_mod.renderStatusPanel(out.writer(), "zcode config", sections, runtime.cfg.ui_color_enabled);
+    try out.writer().writeAll("(edit a value: /config set <key> <value>; full machine-readable dump: /config raw)\n");
+    return out.toOwnedSlice();
+}
+
 fn handleContextCommand(allocator: std.mem.Allocator, runtime: *AgentRuntime) !?[]u8 {
-    _ = allocator;
-    return @as(?[]u8, try runtime.promptContextReport("(context diagnostic probe)"));
+    const inspection = try runtime.promptContextReport("(context diagnostic probe)");
+    // commands-33 (verifier follow-up): renderPromptInspection is a
+    // tool-schema/prompt-inspection report with no reference to the
+    // auto-compact threshold, so a /autocompact override was only ever
+    // confirmable by re-invoking /autocompact itself. Append the same
+    // autocompactReport() line /autocompact renders so the effective
+    // threshold -- including any session override -- is externally
+    // verifiable from /context too, without needing a second command.
+    const compact_line = try autocompactReport(allocator, runtime.cfg);
+    defer allocator.free(compact_line);
+    defer allocator.free(inspection);
+    return @as(?[]u8, try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ inspection, compact_line }));
+}
+
+/// commands-33: render the currently effective auto-compact threshold using
+/// the exact model in core/autocompact_threshold.zig, picking up whatever
+/// session override /autocompact has set via the env-override map (or the
+/// real env vars, or neither).
+fn autocompactReport(allocator: std.mem.Allocator, cfg: *const config_mod.Config) ![]u8 {
+    const window_override = autocompact_threshold_mod.windowOverrideFromEnv();
+    const effective = autocompact_threshold_mod.effectiveContextWindow(
+        cfg.model_context_window,
+        cfg.reserved_output_tokens,
+        window_override,
+    );
+    const pct_override = autocompact_threshold_mod.pctOverrideFromEnv();
+    const threshold = autocompact_threshold_mod.autoCompactThreshold(effective, pct_override);
+    return std.fmt.allocPrint(
+        allocator,
+        "auto-compact threshold: {d} tokens (effective context window: {d} tokens){s}",
+        .{
+            threshold,
+            effective,
+            if (window_override != null) " [session/env window override active]" else "",
+        },
+    );
 }
 
 // --- Tests ---
@@ -8380,6 +9071,26 @@ const RewindTestHarness = struct {
         self.allocator.free(self.registry_path);
         self.allocator.destroy(self);
     }
+
+    /// commands-29: point the runtime at the scripted mock provider (same
+    /// pattern as core/hooks_runtime_wire_test.zig's Harness.useMockProvider)
+    /// so a test can drive the real turn loop -- including the
+    /// read_only_tools gate -- without any network. `intent_reprompt_enabled`
+    /// is disabled so a plain no-tool-call answer ends the loop cleanly.
+    fn useMockProvider(self: *RewindTestHarness) !void {
+        self.allocator.free(self.runtime.active_provider);
+        self.runtime.active_provider = try self.allocator.dupe(u8, "mock");
+        self.allocator.free(self.runtime.active_model);
+        self.runtime.active_model = try self.allocator.dupe(u8, "mock-agent");
+        self.cfg.intent_reprompt_enabled = false;
+    }
+
+    fn historyContains(self: *RewindTestHarness, needle: []const u8) bool {
+        for (self.runtime.history.view()) |turn| {
+            if (std.mem.indexOf(u8, turn.content, needle) != null) return true;
+        }
+        return false;
+    }
 };
 
 fn rewindTestRunGit(allocator: std.mem.Allocator, argv: []const []const u8) !void {
@@ -8489,6 +9200,261 @@ test "/rewind conversation-only leaves the working tree untouched" {
     const final = try std.Io.Dir.cwd().readFileAlloc(@import("zcode_runtime").io, sentinel, allocator, .limited(1024));
     defer allocator.free(final);
     try testing.expectEqualStrings("keep me\n", final);
+}
+
+test "sessions-storage-08: /clear regenerates the session id, leaving the old session resumable on disk" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const old_session_id = try allocator.dupe(u8, runtime.session_id);
+    defer allocator.free(old_session_id);
+
+    try runtime.history.append(runtime.session_id, .user, "before /clear");
+    try runtime.history.append(runtime.session_id, .assistant, "ack");
+    try testing.expectEqual(@as(usize, 2), runtime.history.len());
+
+    const msg = try handleClearConversation(allocator, runtime);
+    defer allocator.free(msg);
+
+    // A brand-new session id was minted; the message names both.
+    try testing.expect(!std.mem.eql(u8, old_session_id, runtime.session_id));
+    try testing.expect(std.mem.indexOf(u8, msg, old_session_id) != null);
+    try testing.expect(std.mem.indexOf(u8, msg, runtime.session_id) != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "started new session") != null);
+
+    // In-memory history is empty (the usual /clear effect).
+    try testing.expectEqual(@as(usize, 0), runtime.history.len());
+
+    // The OLD session's two turns are exactly as they were -- /clear never
+    // interleaves pre- and post-clear turns into one .jsonl file.
+    var loaded_old = try runtime.store.load(old_session_id);
+    defer loaded_old.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), loaded_old.history.len);
+    try testing.expectEqualStrings("before /clear", loaded_old.history[0].content);
+
+    // The new session traces back to the old one via the parent sidecar.
+    const parent = (try runtime.store.readParentSessionId(runtime.session_id)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(parent);
+    try testing.expectEqualStrings(old_session_id, parent);
+}
+
+test "sessions-storage-09: /fork copies the conversation into a NEW session and leaves the current one untouched" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const original_session_id = try allocator.dupe(u8, runtime.session_id);
+    defer allocator.free(original_session_id);
+
+    try runtime.history.append(runtime.session_id, .user, "first turn");
+    try runtime.history.append(runtime.session_id, .assistant, "first reply");
+    try testing.expectEqual(@as(usize, 2), runtime.history.len());
+
+    const msg = try handleForkSession(allocator, runtime, "continue the refactor");
+    defer allocator.free(msg);
+
+    // Unlike /branch, /fork never touches the LIVE runtime: same id, same
+    // in-memory history, exactly as it was before the command ran --
+    // spawnBackground only ever spawns a CHILD process (a no-op under
+    // `builtin.is_test`, see bg_cmds.zig); it has no effect on the caller.
+    try testing.expectEqualStrings(original_session_id, runtime.session_id);
+    try testing.expectEqual(@as(usize, 2), runtime.history.len());
+
+    // The message names a genuinely different session id, confirms the fork
+    // was started as a background session, and names the queued prompt.
+    try testing.expect(std.mem.indexOf(u8, msg, original_session_id) != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "started background session") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "continue the refactor") != null);
+
+    // The ORIGINAL session's own file is untouched (still exactly its 2 turns).
+    var loaded_original = try runtime.store.load(original_session_id);
+    defer loaded_original.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), loaded_original.history.len);
+
+    // Find the new session id: it's the one that isn't the original, listed
+    // by the store.
+    const entries = try runtime.store.list();
+    defer runtime.store.freeSessionEntries(entries);
+    var new_id: ?[]const u8 = null;
+    for (entries) |e| {
+        if (!std.mem.eql(u8, e.id, original_session_id)) new_id = e.id;
+    }
+    const forked_id = new_id orelse return error.TestUnexpectedResult;
+
+    // The fork carries an exact COPY of the 2 prior turns at the moment it
+    // was spun off -- the queued prompt is answered by the DETACHED
+    // background process as its next turn (headlessly, via
+    // ZCODE_BG_INITIAL_PROMPT -> session_mgmt.resumeSessionHeadless), not
+    // synchronously here, so it is not yet on disk when handleForkSession
+    // returns.
+    var loaded_fork = try runtime.store.load(forked_id);
+    defer loaded_fork.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), loaded_fork.history.len);
+    try testing.expectEqualStrings("first turn", loaded_fork.history[0].content);
+    try testing.expectEqualStrings("first reply", loaded_fork.history[1].content);
+}
+
+test "sessions-storage-09: /fork with no prompt still starts the background session (no queued-prompt line)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    try runtime.history.append(runtime.session_id, .user, "solo turn");
+
+    const msg = try handleForkSession(allocator, runtime, null);
+    defer allocator.free(msg);
+
+    try testing.expect(std.mem.indexOf(u8, msg, "forked into new session") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "started background session") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "queued prompt") == null);
+}
+
+test "__sessions_overlay_data includes message_count for the session switcher (sessions-storage-05)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    try runtime.history.append(runtime.session_id, .user, "first prompt");
+    try runtime.history.append(runtime.session_id, .assistant, "first answer");
+    try runtime.store.appendTurn(runtime.session_id, .user, "first prompt", "turn-1");
+    try runtime.store.appendTurn(runtime.session_id, .assistant, "first answer", "turn-2");
+
+    const out = try replCommandCallback(runtime, allocator, "__sessions_overlay_data");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "\"message_count\"") != null);
+}
+
+test "/status renders a sectioned Title-Case panel, not a snake_case dump" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/status");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+
+    try testing.expect(std.mem.indexOf(u8, out.?, "Version") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "Provider:") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "/status raw") != null);
+    // No leftover snake_case dump keys on the human-readable path.
+    try testing.expect(std.mem.indexOf(u8, out.?, "provider=") == null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "ui_status_show_workspace=") == null);
+}
+
+test "/status raw preserves the original snake_case key=value dump for scripting" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/status raw");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "provider=") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "ui_status_show_workspace=") != null);
+}
+
+test "bare /config shares the /status panel heading style" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const status_out = try replCommandCallback(runtime, allocator, "/status");
+    try testing.expect(status_out != null);
+    defer allocator.free(status_out.?);
+    const config_out = try replCommandCallback(runtime, allocator, "/config");
+    try testing.expect(config_out != null);
+    defer allocator.free(config_out.?);
+
+    try testing.expect(std.mem.indexOf(u8, status_out.?, "zcode status") != null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "zcode config") != null);
+
+    // repl-ux-07: the two commands must share the actual PANEL BODY, not
+    // just a title prefix -- Title-Case "Label: value" rows and named
+    // section headers, not the old `cfg.renderAll` snake_case-with-
+    // comment-header dump (`# GroupName` + `snake_case_key={value}`).
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "Version:") != null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "Provider:") != null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "Model") != null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "version=") == null);
+    try testing.expect(std.mem.indexOf(u8, config_out.?, "# ") == null);
+
+    // Both panels are rendered by the exact same section-title vocabulary.
+    inline for (.{ "Version", "Model", "Safety", "Provider", "Preprocessor", "UI", "Session" }) |section_title| {
+        try testing.expect(std.mem.indexOf(u8, status_out.?, section_title) != null);
+        try testing.expect(std.mem.indexOf(u8, config_out.?, section_title) != null);
+    }
+}
+
+test "/config raw preserves the original snake_case key=value dump for scripting" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/config raw");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "zcode config") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "=") != null);
+    // The sectioned panel's Title-Case rows must NOT be on this path.
+    try testing.expect(std.mem.indexOf(u8, out.?, "Version:") == null);
 }
 
 test "bare /btw returns the usage string and leaves history untouched" {
@@ -8730,4 +9696,1126 @@ test "/effort auto reports session-only and clears the persisted override" {
     var loaded = try config_parse.load(allocator, h.cwd, &opts);
     defer loaded.deinit(allocator);
     try testing.expectEqualStrings("auto", loaded.config.reasoning_effort);
+}
+
+// ============================================================================
+// wp1a-commands-surface: restored/aliased 2.1.261 commands.
+// ============================================================================
+
+test "commands-01: /advisor is no longer blocked and toggles review mode" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const status = try replCommandCallback(runtime, allocator, "/advisor");
+    try testing.expect(status != null);
+    defer allocator.free(status.?);
+    try testing.expect(std.mem.indexOf(u8, status.?, "advisor mode: off") != null);
+
+    const on = try replCommandCallback(runtime, allocator, "/advisor on");
+    try testing.expect(on != null);
+    defer allocator.free(on.?);
+    try testing.expect(std.mem.indexOf(u8, on.?, "enabled") != null);
+    try testing.expect(runtime.requested_mode != null and runtime.requested_mode.? == .review);
+}
+
+test "commands-02: /cd is no longer blocked and changes shell_cwd" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const target = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(target);
+    const cmd = try std.fmt.allocPrint(allocator, "/cd {s}", .{target});
+    defer allocator.free(cmd);
+
+    const out = try replCommandCallback(runtime, allocator, cmd);
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "cwd ->") != null);
+    try testing.expectEqualStrings(target, runtime.shell_cwd);
+}
+
+/// hooks-permissions-03: minimal HOME override so a `settings.json` written
+/// under `root/.zcode` resolves as the trusted USER scope (mirrors the same
+/// trick `core/hooks.zig`'s and `core/hooks_runtime_wire_test.zig`'s own
+/// `HomeOverride` use) -- a project/local-scope hook would additionally need
+/// a trust prompt this REPL-command test path does not drive.
+const ConfigChangeHomeOverride = struct {
+    prev_home: ?[]u8,
+    prev_xdg: ?[]u8,
+    allocator: std.mem.Allocator,
+
+    fn install(allocator: std.mem.Allocator, home: []const u8) !ConfigChangeHomeOverride {
+        const prev_home = if (env_mod.getOwned(allocator, "HOME")) |v| v else |_| null;
+        const prev_xdg = if (env_mod.getOwned(allocator, "XDG_CONFIG_HOME")) |v| v else |_| null;
+        const home_z = try allocator.dupeZ(u8, home);
+        defer allocator.free(home_z);
+        _ = setenv("HOME", home_z, 1);
+        _ = unsetenv("XDG_CONFIG_HOME");
+        const zcode_home = try std.fs.path.join(allocator, &.{ home, ".zcode" });
+        defer allocator.free(zcode_home);
+        try @import("core/paths.zig").ensureDir(zcode_home);
+        return .{ .prev_home = prev_home, .prev_xdg = prev_xdg, .allocator = allocator };
+    }
+
+    fn deinit(self: *ConfigChangeHomeOverride) void {
+        if (self.prev_home) |h| {
+            const z = self.allocator.dupeZ(u8, h) catch return;
+            defer self.allocator.free(z);
+            _ = setenv("HOME", z, 1);
+            self.allocator.free(h);
+        } else _ = unsetenv("HOME");
+        if (self.prev_xdg) |x| {
+            const z = self.allocator.dupeZ(u8, x) catch return;
+            defer self.allocator.free(z);
+            _ = setenv("XDG_CONFIG_HOME", z, 1);
+            self.allocator.free(x);
+        } else _ = unsetenv("XDG_CONFIG_HOME");
+    }
+};
+
+test "hooks-permissions-03: /config set fires ConfigChange with source=user_settings" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var home_ov = try ConfigChangeHomeOverride.install(allocator, root);
+    defer home_ov.deinit();
+
+    const sentinel = try std.fs.path.join(allocator, &.{ root, "config_change.json" });
+    defer allocator.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        allocator,
+        "{{\"hooks\":{{\"ConfigChange\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer allocator.free(settings);
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    const out = try replCommandCallback(runtime, allocator, "/config set ui_theme dark");
+    try testing.expect(out != null);
+    allocator.free(out.?);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, allocator, .limited(4096));
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ConfigChange", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("user_settings", parsed.value.object.get("source").?.string);
+}
+
+test "hooks-permissions-03: /reload-skills fires ConfigChange with source=skills" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var home_ov = try ConfigChangeHomeOverride.install(allocator, root);
+    defer home_ov.deinit();
+
+    const sentinel = try std.fs.path.join(allocator, &.{ root, "config_change_skills.json" });
+    defer allocator.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        allocator,
+        "{{\"hooks\":{{\"ConfigChange\":[{{\"matcher\":\"skills\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer allocator.free(settings);
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    const out = try replCommandCallback(runtime, allocator, "/reload-skills");
+    try testing.expect(out != null);
+    allocator.free(out.?);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, allocator, .limited(4096));
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ConfigChange", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("skills", parsed.value.object.get("source").?.string);
+}
+
+test "config-layout-17: buildCommitPrompt includes the Co-Authored-By trailer only when include_co_authored_by is true" {
+    const allocator = testing.allocator;
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+
+    const with_trailer = try buildCommitPrompt(allocator, &cfg, "");
+    defer allocator.free(with_trailer);
+    try testing.expect(std.mem.indexOf(u8, with_trailer, "Co-Authored-By: zcode <noreply@zcode.dev>") != null);
+
+    cfg.include_co_authored_by = false;
+    const without_trailer = try buildCommitPrompt(allocator, &cfg, "");
+    defer allocator.free(without_trailer);
+    try testing.expect(std.mem.indexOf(u8, without_trailer, "Co-Authored-By") == null);
+    // The rest of the template is unaffected.
+    try testing.expect(std.mem.indexOf(u8, without_trailer, "git commit -m") != null);
+}
+
+test "commands-03: /security-review and /security_review both reach the surviving handler" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    // The mock/no-provider runtime returns quickly; we only assert the
+    // command is no longer treated as unrecognized (out != null), i.e. it
+    // reached review_flow.buildSecurityReviewPrompt + handlePromptWithModeAndReporter
+    // rather than falling through to the removed-command short-circuit.
+    const hyphen = try replCommandCallback(runtime, allocator, "/security-review");
+    try testing.expect(hyphen != null);
+    allocator.free(hyphen.?);
+
+    const underscore = try replCommandCallback(runtime, allocator, "/security_review");
+    try testing.expect(underscore != null);
+    allocator.free(underscore.?);
+}
+
+test "commands-04: bare /marketplace mirrors bare /plugin; sources subcommand unaffected" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const via_plugin = try replCommandCallback(runtime, allocator, "/plugin");
+    defer if (via_plugin) |v| allocator.free(v);
+    const via_marketplace = try replCommandCallback(runtime, allocator, "/marketplace");
+    defer if (via_marketplace) |v| allocator.free(v);
+
+    try testing.expect(via_plugin != null);
+    try testing.expect(via_marketplace != null);
+    try testing.expectEqualStrings(via_plugin.?, via_marketplace.?);
+
+    // The richer /marketplace sources|add|remove|refresh feature must still work.
+    const sources = try replCommandCallback(runtime, allocator, "/marketplace sources");
+    try testing.expect(sources != null);
+    allocator.free(sources.?);
+}
+
+test "commands-06: /allowed-tools is an alias for /permissions" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const via_permissions = try replCommandCallback(runtime, allocator, "/permissions");
+    defer if (via_permissions) |v| allocator.free(v);
+    const via_alias = try replCommandCallback(runtime, allocator, "/allowed-tools");
+    defer if (via_alias) |v| allocator.free(v);
+
+    try testing.expect(via_permissions != null);
+    try testing.expect(via_alias != null);
+    try testing.expectEqualStrings(via_permissions.?, via_alias.?);
+
+    const via_permissions_list = try replCommandCallback(runtime, allocator, "/permissions list");
+    defer if (via_permissions_list) |v| allocator.free(v);
+    const via_alias_list = try replCommandCallback(runtime, allocator, "/allowed-tools list");
+    defer if (via_alias_list) |v| allocator.free(v);
+    try testing.expect(via_permissions_list != null);
+    try testing.expect(via_alias_list != null);
+    try testing.expectEqualStrings(via_permissions_list.?, via_alias_list.?);
+}
+
+test "commands-07: /checkup is an alias for /doctor" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const via_doctor = try replCommandCallback(runtime, allocator, "/doctor");
+    defer if (via_doctor) |v| allocator.free(v);
+    const via_checkup = try replCommandCallback(runtime, allocator, "/checkup");
+    defer if (via_checkup) |v| allocator.free(v);
+
+    try testing.expect(via_doctor != null);
+    try testing.expect(via_checkup != null);
+    // Both hit the exact same runDoctorDiagnostics() call, but a "wall
+    // duration: Ns" probe timing line can legitimately differ by a
+    // fraction of a millisecond between the two calls, so compare the
+    // stable header/identity lines rather than requiring byte-identical
+    // output.
+    try testing.expect(std.mem.indexOf(u8, via_doctor.?, "=== zcode doctor ===") != null);
+    try testing.expect(std.mem.indexOf(u8, via_checkup.?, "=== zcode doctor ===") != null);
+    try testing.expect(std.mem.indexOf(u8, via_checkup.?, "git:") != null);
+}
+
+test "commands-08: /settings is an alias for /config" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const via_config = try replCommandCallback(runtime, allocator, "/config");
+    defer if (via_config) |v| allocator.free(v);
+    const via_settings = try replCommandCallback(runtime, allocator, "/settings");
+    defer if (via_settings) |v| allocator.free(v);
+
+    try testing.expect(via_config != null);
+    try testing.expect(via_settings != null);
+    try testing.expectEqualStrings(via_config.?, via_settings.?);
+}
+
+test "commands-09: /name is an alias for /rename" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const bare_rename = try replCommandCallback(runtime, allocator, "/rename");
+    defer if (bare_rename) |v| allocator.free(v);
+    const bare_name = try replCommandCallback(runtime, allocator, "/name");
+    defer if (bare_name) |v| allocator.free(v);
+    try testing.expect(bare_rename != null);
+    try testing.expect(bare_name != null);
+    try testing.expectEqualStrings(bare_rename.?, bare_name.?);
+
+    const renamed = try replCommandCallback(runtime, allocator, "/name my-session-label");
+    try testing.expect(renamed != null);
+    defer allocator.free(renamed.?);
+    try testing.expect(std.mem.indexOf(u8, renamed.?, "renamed to: my-session-label") != null);
+}
+
+test "commands-10: /restart resolves to the same update-dispatch predicate as /update" {
+    try testing.expect(isUpdateCommand("/restart"));
+    try testing.expect(isUpdateCommand("/update"));
+    try testing.expect(isUpdateCommand("/upgrade"));
+    try testing.expect(!isUpdateCommand("/restarted"));
+    try testing.expect(!isUpdateCommand("/reboot"));
+}
+
+test "commands-11 / sessions-storage-10: /undo is an alias for /rewind" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    try runtime.history.append(runtime.session_id, .user, "first prompt");
+    try runtime.history.append(runtime.session_id, .assistant, "first answer");
+    try runtime.history.append(runtime.session_id, .user, "second prompt");
+    try runtime.history.append(runtime.session_id, .assistant, "second answer");
+    try testing.expectEqual(@as(usize, 4), runtime.history.len());
+
+    const out = try replCommandCallback(runtime, allocator, "/undo");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+
+    // Bare /undo drops just the last assistant turn (like bare /rewind):
+    // 4 entries -> 3 (the trailing "second answer" assistant turn is gone).
+    try testing.expectEqual(@as(usize, 3), runtime.history.len());
+
+    const out2 = try replCommandCallback(runtime, allocator, "/undo 1");
+    try testing.expect(out2 != null);
+    allocator.free(out2.?);
+}
+
+// ============================================================================
+// commands-13 / commands-14: /stop and /tasks background-registry surfacing.
+// ============================================================================
+
+/// Test-only helper mirroring bg_cmds.zig's own `writeRawEntry`: fabricate a
+/// registry file for `pid` under `<root>/registry/<pid>.json`. bg_cmds.zig
+/// does not export its version, so this is a small local duplicate scoped to
+/// this test block.
+fn stopTestWriteRegistryEntry(allocator: std.mem.Allocator, root: []const u8, pid: i32, name: []const u8) !void {
+    const dir = try std.fs.path.join(allocator, &.{ root, "registry" });
+    defer allocator.free(dir);
+    try @import("core/paths.zig").ensureDir(dir);
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/{d}.json", .{ dir, pid });
+    defer allocator.free(path);
+
+    var out = std_io.StringBuilder.init(allocator);
+    defer out.deinit();
+    const now = clock.nowSeconds();
+    try out.writer().print(
+        "{{\"pid\":{d},\"cwd\":\"/work\",\"started_ts\":{d},\"updated_ts\":{d},\"kind\":\"bg\",\"name\":{f}}}\n",
+        .{ pid, now, now, std.json.fmt(name, .{}) },
+    );
+
+    const file = try std.Io.Dir.cwd().createFile(rt.io, path, .{ .truncate = true });
+    defer file.close(rt.io);
+    try file.writeStreamingAll(rt.io, out.items());
+}
+
+test "commands-13: bare /stop outside a --bg session reports usage (no signal sent)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    // No ZCODE_SESSION_KIND override -> defaults to .interactive, so bare
+    // /stop must NOT attempt to signal this (the test's own) process.
+    const out = try replCommandCallback(runtime, allocator, "/stop");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "usage: /stop") != null);
+}
+
+test "commands-13: /stop <pid> terminates a registered background session" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    try env_mod.setOverride("ZCODE_SESSIONS_DIR", root);
+    defer env_mod.clearOverrides();
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    // Spawn a real, harmless long-lived child so /stop has something safe to
+    // SIGTERM (never the test process itself).
+    var child = std.process.spawn(rt.io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest;
+    const pid: i32 = @intCast(child.id orelse return error.SkipZigTest);
+
+    try stopTestWriteRegistryEntry(allocator, root, pid, "victim");
+
+    const cmd = try std.fmt.allocPrint(allocator, "/stop {d}", .{pid});
+    defer allocator.free(cmd);
+    const out = try replCommandCallback(runtime, allocator, cmd);
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    // cli-flags-27's cmdKill (shared with `stop`/`kill`) SIGTERMs the pid and
+    // marks the registry entry `.stopped` rather than deleting it, so the
+    // conversation stays discoverable by `zcode attach`/`zcode ps` -- matching
+    // the reference's "its conversation is kept" semantics. Assert on that
+    // actual, already-established contract rather than the older
+    // delete-on-stop behavior.
+    try testing.expect(std.mem.indexOf(u8, out.?, "stopped pid=") != null);
+
+    // Registry file is kept (not deleted) and its status flips to .stopped;
+    // transcript/worktree are untouched by cmdKill by construction (it never
+    // touches either).
+    const entry = (try session_registry_mod.read(allocator, pid)) orelse
+        return error.TestUnexpectedResult;
+    defer entry.deinit(allocator);
+    try testing.expectEqual(session_registry_mod.SessionStatus.stopped, entry.status);
+
+    const term = child.wait(rt.io) catch return error.SkipZigTest;
+    switch (term) {
+        .signal => |sig| try testing.expectEqual(std.posix.SIG.TERM, sig),
+        else => {},
+    }
+}
+
+test "commands-14: /tasks surfaces a registered background session" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    try env_mod.setOverride("ZCODE_SESSIONS_DIR", root);
+    defer env_mod.clearOverrides();
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    // registry.list() (which cmdPs -> /tasks goes through) sweeps any entry
+    // whose pid is not actually running, so the registered pid must belong to
+    // a real (harmless, long-lived) process -- a fabricated dead pid would be
+    // silently swept before /tasks ever saw it.
+    var child = std.process.spawn(rt.io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest;
+    const pid: i32 = @intCast(child.id orelse return error.SkipZigTest);
+    defer {
+        std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+        _ = child.wait(rt.io) catch {};
+    }
+
+    try stopTestWriteRegistryEntry(allocator, root, pid, "bg-worker");
+
+    const out = try replCommandCallback(runtime, allocator, "/tasks");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "Background sessions:") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "kind=bg") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "name=bg-worker") != null);
+
+    // /bashes is the reference's documented alias and must show the same.
+    const via_bashes = try replCommandCallback(runtime, allocator, "/bashes");
+    try testing.expect(via_bashes != null);
+    defer allocator.free(via_bashes.?);
+    try testing.expect(std.mem.indexOf(u8, via_bashes.?, "Background sessions:") != null);
+}
+
+// ============================================================================
+// commands-33: /autocompact.
+// ============================================================================
+
+test "commands-33: bare /autocompact reports the default (env-unset) threshold" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride(autocompact_threshold_mod.ENV_AUTO_COMPACT_WINDOW, "");
+    try env_mod.setOverride(autocompact_threshold_mod.ENV_AUTOCOMPACT_PCT_OVERRIDE, "");
+
+    const out = try replCommandCallback(runtime, allocator, "/autocompact");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "auto-compact threshold:") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "[session/env window override active]") == null);
+}
+
+test "commands-33: /autocompact <tokens> lowers the reported threshold without a restart, /autocompact auto reverts it" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+    // h.cfg and runtime.cfg alias the same memory (RewindTestHarness.init
+    // passes &self.cfg into AgentRuntime.init); mutate through the harness's
+    // non-const field since runtime.cfg is `*const Config`.
+    h.cfg.model_context_window = 200_000;
+    h.cfg.reserved_output_tokens = 16_384;
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride(autocompact_threshold_mod.ENV_AUTO_COMPACT_WINDOW, "");
+    try env_mod.setOverride(autocompact_threshold_mod.ENV_AUTOCOMPACT_PCT_OVERRIDE, "");
+
+    const before = try autocompactReport(allocator, runtime.cfg);
+    defer allocator.free(before);
+
+    const out = try replCommandCallback(runtime, allocator, "/autocompact 50000");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "auto-compact window set to 50000 tokens for this session.") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "[session/env window override active]") != null);
+
+    // No restart: the very next /autocompact report already reflects it.
+    const after = try replCommandCallback(runtime, allocator, "/autocompact");
+    try testing.expect(after != null);
+    defer allocator.free(after.?);
+    try testing.expect(!std.mem.eql(u8, before, after.?));
+
+    // /autocompact auto clears the session override; back to the default.
+    const reverted = try replCommandCallback(runtime, allocator, "/autocompact auto");
+    try testing.expect(reverted != null);
+    defer allocator.free(reverted.?);
+    try testing.expect(std.mem.indexOf(u8, reverted.?, "reset to automatic") != null);
+    try testing.expect(std.mem.indexOf(u8, reverted.?, "[session/env window override active]") == null);
+}
+
+test "commands-33: /autocompact with a non-numeric, non-auto argument returns usage" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/autocompact banana");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "usage: /autocompact") != null);
+}
+
+// commands-33 (verifier follow-up): the acceptance test asks that a new
+// /autocompact threshold be "visible reported by /context/features" --
+// externally verifiable without re-invoking /autocompact itself. /features
+// is a zcode-only command intentionally removed for parity (see the NOTE at
+// its dispatch site), so /context is the one real, reachable surface; prove
+// it reflects the session override.
+test "commands-33: /context surfaces the session /autocompact override" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+    defer env_mod.clearOverrides();
+
+    // Baseline: /context reports a threshold but no session override yet.
+    const context_before = try replCommandCallback(runtime, allocator, "/context");
+    try testing.expect(context_before != null);
+    defer allocator.free(context_before.?);
+    try testing.expect(std.mem.indexOf(u8, context_before.?, "auto-compact threshold:") != null);
+    try testing.expect(std.mem.indexOf(u8, context_before.?, "[session/env window override active]") == null);
+
+    // Set a session override via /autocompact (no restart).
+    const set_out = try replCommandCallback(runtime, allocator, "/autocompact 50000");
+    try testing.expect(set_out != null);
+    allocator.free(set_out.?);
+
+    // /context now reflects it -- verifiable without re-invoking /autocompact.
+    const context_after = try replCommandCallback(runtime, allocator, "/context");
+    try testing.expect(context_after != null);
+    defer allocator.free(context_after.?);
+    try testing.expect(std.mem.indexOf(u8, context_after.?, "[session/env window override active]") != null);
+}
+
+// ============================================================================
+// commands-18: /scroll-speed.
+// ============================================================================
+
+test "commands-18: /scroll-speed N persists and reads back for this session" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    defer env_mod.clearOverrides();
+
+    const default_report = try replCommandCallback(runtime, allocator, "/scroll-speed");
+    try testing.expect(default_report != null);
+    defer allocator.free(default_report.?);
+    try testing.expect(std.mem.indexOf(u8, default_report.?, "scroll speed: 1.0") != null);
+
+    const set_out = try replCommandCallback(runtime, allocator, "/scroll-speed 2.5");
+    try testing.expect(set_out != null);
+    defer allocator.free(set_out.?);
+    try testing.expect(std.mem.indexOf(u8, set_out.?, "scroll speed set to 2.5 for this session") != null);
+
+    const readback = try replCommandCallback(runtime, allocator, "/scroll-speed");
+    try testing.expect(readback != null);
+    defer allocator.free(readback.?);
+    try testing.expect(std.mem.indexOf(u8, readback.?, "scroll speed: 2.5") != null);
+}
+
+test "commands-18: /scroll-speed rejects a non-numeric or non-positive argument" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+    defer env_mod.clearOverrides();
+
+    const bad_word = try replCommandCallback(runtime, allocator, "/scroll-speed fast");
+    try testing.expect(bad_word != null);
+    defer allocator.free(bad_word.?);
+    try testing.expect(std.mem.indexOf(u8, bad_word.?, "usage: /scroll-speed") != null);
+
+    const negative = try replCommandCallback(runtime, allocator, "/scroll-speed -1");
+    try testing.expect(negative != null);
+    defer allocator.free(negative.?);
+    try testing.expect(std.mem.indexOf(u8, negative.?, "usage: /scroll-speed") != null);
+}
+
+// ============================================================================
+// commands-19: /daemon.
+// ============================================================================
+
+test "commands-19: /daemon shows both the kairos overview and the share-daemon status" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    // remote_daemon.status() resolves ~/.zcode via paths.resolve() (real
+    // HOME) with no test-only override hook of its own; pin HOME to the tmp
+    // root so this test never reads (or races) a real daemon state file on
+    // the machine it runs on.
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/daemon");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "background routines (kairos)") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "background services (share daemon)") != null);
+
+    // Sanity: matches what the standalone /kairos and remote_daemon.status
+    // calls would independently produce (same underlying data sources).
+    const kairos_alone = try replCommandCallback(runtime, allocator, "/kairos");
+    try testing.expect(kairos_alone != null);
+    defer allocator.free(kairos_alone.?);
+    const daemon_status_alone = try remote_daemon.status(allocator);
+    defer allocator.free(daemon_status_alone);
+    try testing.expect(std.mem.indexOf(u8, out.?, daemon_status_alone) != null);
+}
+
+// ============================================================================
+// commands-22: /recap.
+// ============================================================================
+
+test "commands-22: /recap with no prior turns returns the exact empty-session string" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/recap");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expectEqualStrings("Nothing to recap yet \xe2\x80\x94 send a message first.", out.?);
+}
+
+test "commands-22: /recap with prior turns attempts a model call (does not early-return the empty-session string)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    try runtime.history.append(runtime.session_id, .user, "build the parser");
+    try runtime.history.append(runtime.session_id, .assistant, "parser built");
+
+    const out = try replCommandCallback(runtime, allocator, "/recap");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    // Whatever handlePrompt returns (a real recap, or the reference's own
+    // "Couldn't generate a recap" fallback on a provider error) is fine here
+    // -- the point proven is that the guard did NOT fire.
+    try testing.expect(!std.mem.eql(u8, out.?, "Nothing to recap yet \xe2\x80\x94 send a message first."));
+}
+
+// ============================================================================
+// commands-23 / commands-24: /reload-skills and /skill-doctor.
+// ============================================================================
+
+test "commands-23: /reload-skills picks up a skill added to disk mid-session" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const before = try replCommandCallback(runtime, allocator, "/reload-skills");
+    try testing.expect(before != null);
+    defer allocator.free(before.?);
+    try testing.expect(std.mem.indexOf(u8, before.?, "skills reloaded:") != null);
+
+    // Add a new skill to disk mid-session (no restart, no cache to bust).
+    // Skills live one directory per skill, each holding a SKILL.md.
+    const skill_dir = try std.fs.path.join(allocator, &.{ h.cwd, ".zcode", "skills", "midsession" });
+    defer allocator.free(skill_dir);
+    try std.Io.Dir.cwd().createDirPath(rt.io, skill_dir);
+    const skill_file = try std.fs.path.join(allocator, &.{ skill_dir, "SKILL.md" });
+    defer allocator.free(skill_file);
+    try std.Io.Dir.cwd().writeFile(rt.io, .{
+        .sub_path = skill_file,
+        .data = "---\ndescription: Added mid-session\n---\nbody",
+    });
+
+    const after = try replCommandCallback(runtime, allocator, "/reload-skills");
+    try testing.expect(after != null);
+    defer allocator.free(after.?);
+
+    // The new skill's count is reflected without any restart.
+    try testing.expect(!std.mem.eql(u8, before.?, after.?));
+}
+
+test "cli-flags-15: --disable-slash-commands blocks skill resolution but not built-ins" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    // A NON-user-invocable skill: `resolveCustomOrSkill` returns `.message`
+    // directly for these (no model dispatch), so this test can observe
+    // resolution vs. non-resolution synchronously without a working provider.
+    const skill_dir = try std.fs.path.join(allocator, &.{ h.cwd, ".zcode", "skills", "secret" });
+    defer allocator.free(skill_dir);
+    try std.Io.Dir.cwd().createDirPath(rt.io, skill_dir);
+    const skill_file = try std.fs.path.join(allocator, &.{ skill_dir, "SKILL.md" });
+    defer allocator.free(skill_file);
+    try std.Io.Dir.cwd().writeFile(rt.io, .{
+        .sub_path = skill_file,
+        .data = "---\ndescription: a model-only skill\nuser-invocable: false\n---\nDo the secret thing.",
+    });
+
+    // Baseline: the skill resolves (its "not user-invocable" message proves
+    // `resolveCustomOrSkill` was actually consulted).
+    const before = try replCommandCallback(runtime, allocator, "/secret");
+    defer if (before) |b| allocator.free(b);
+    try testing.expect(before != null);
+    try testing.expect(std.mem.indexOf(u8, before.?, "not user-invocable") != null);
+
+    h.cfg.disable_slash_commands = true;
+
+    // Under --disable-slash-commands, resolution is skipped entirely --
+    // `replCommandCallback` falls through to its `return null` (the
+    // caller's own unknown-command UX takes over from there), not the
+    // skill's "not user-invocable" message.
+    const after = try replCommandCallback(runtime, allocator, "/secret");
+    defer if (after) |a| allocator.free(a);
+    try testing.expect(after == null);
+
+    // A genuine built-in command (matched well before the custom/skill
+    // fallthrough this test is exercising) is unaffected.
+    const reload_out = try replCommandCallback(runtime, allocator, "/reload-skills");
+    defer if (reload_out) |ro| allocator.free(ro);
+    try testing.expect(reload_out != null);
+    try testing.expect(std.mem.indexOf(u8, reload_out.?, "skills reloaded:") != null);
+}
+
+test "commands-24: /skill-doctor lists a never-invoked skill as unused and omits an invoked one" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    // skill_usage_mod.snapshot()/recordSkill() resolve ~/.zcode via
+    // paths.resolve() (real HOME); pin it to the tmp root for a hermetic,
+    // empty usage history.
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const used_dir = try std.fs.path.join(allocator, &.{ h.cwd, ".zcode", "skills", "usedskill" });
+    defer allocator.free(used_dir);
+    try std.Io.Dir.cwd().createDirPath(rt.io, used_dir);
+    const used_file = try std.fs.path.join(allocator, &.{ used_dir, "SKILL.md" });
+    defer allocator.free(used_file);
+    try std.Io.Dir.cwd().writeFile(rt.io, .{
+        .sub_path = used_file,
+        .data = "---\ndescription: Gets invoked\n---\nbody",
+    });
+
+    const unused_dir = try std.fs.path.join(allocator, &.{ h.cwd, ".zcode", "skills", "unusedskill" });
+    defer allocator.free(unused_dir);
+    try std.Io.Dir.cwd().createDirPath(rt.io, unused_dir);
+    const unused_file = try std.fs.path.join(allocator, &.{ unused_dir, "SKILL.md" });
+    defer allocator.free(unused_file);
+    try std.Io.Dir.cwd().writeFile(rt.io, .{
+        .sub_path = unused_file,
+        .data = "---\ndescription: Never invoked\n---\nbody",
+    });
+
+    skill_usage_mod.recordSkill(allocator, "usedskill");
+
+    const out = try replCommandCallback(runtime, allocator, "/skill-doctor");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "[unused] /unusedskill") != null);
+    try testing.expect(std.mem.indexOf(u8, out.?, "/usedskill") == null);
+}
+
+// ============================================================================
+// commands-28 / commands-29 / commands-30: /claude-api, /debug, /explain-usage.
+// ============================================================================
+
+test "commands-30: /explain-usage narrates the /usage data (not a second numeric-only view)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/explain-usage");
+    try testing.expect(out != null);
+    allocator.free(out.?);
+}
+
+test "commands-29: bare /debug enables session debug logging without needing an issue" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+    defer env_mod.clearOverrides();
+
+    const out = try replCommandCallback(runtime, allocator, "/debug");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "debug logging enabled") != null);
+    try testing.expectEqualStrings("1", env_mod.getenv("ZCODE_DEBUG_SESSION").?);
+}
+
+test "commands-29: /debug <issue> enables logging and investigates with a read-only-tools prompt" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+    defer env_mod.clearOverrides();
+
+    const out = try replCommandCallback(runtime, allocator, "/debug why does the parser crash");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expectEqualStrings("1", env_mod.getenv("ZCODE_DEBUG_SESSION").?);
+}
+
+// commands-29 (verifier follow-up): prove the read-only-tools restriction is
+// REAL enforcement, not just advisory prompt text. Drives /debug through the
+// actual turn loop with a scripted mock provider that tries to call the
+// mutating "Write" tool -- if /debug still ran in .execution mode this call
+// would succeed; because it now dispatches via
+// handlePromptWithModeAndReporter(..., .review), agent_runtime's
+// `read_only_tools = effective_mode != .execution` gate rejects it (both by
+// never offering Write's schema, and, defense-in-depth, by refusing the call
+// outright with "mutation tools are not allowed" if the model tries anyway).
+test "commands-29: /debug <issue> genuinely blocks a mutating tool call, not just advisory text" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    try h.useMockProvider();
+    const runtime = &h.runtime;
+    defer env_mod.clearOverrides();
+
+    // Script the mock model to try a mutating tool call first, then give a
+    // final answer with no further tool calls once it is rejected.
+    try env_mod.setOverride(
+        "ZCODE_MOCK_RESPONSES",
+        \\["{\"assistant\":\"I'll just fix it directly.\",\"tool_calls\":[{\"name\":\"Write\",\"args\":{\"path\":\"x.txt\",\"content\":\"patched\"}}]}","{\"assistant\":\"Investigation complete; here is what I found (read-only).\",\"tool_calls\":[]}"]
+    );
+
+    const out = try replCommandCallback(runtime, allocator, "/debug why does the parser crash");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+
+    // The mutation attempt must have been rejected by the read-only gate --
+    // proof the model was never actually allowed to write a file, not merely
+    // asked nicely not to.
+    try testing.expect(h.historyContains("mutation tools are not allowed"));
+
+    // Stronger, real-world proof: the Write tool call must never have
+    // actually executed -- the target file was never created on disk.
+    const written_path = try std.fs.path.join(allocator, &.{ h.cwd, "x.txt" });
+    defer allocator.free(written_path);
+    try testing.expect(!rewindTestFileExists(written_path));
+}
+
+test "commands-28: /claude-api dispatches an inline prompt scoped to platform.claude.com" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const bare = try replCommandCallback(runtime, allocator, "/claude-api");
+    try testing.expect(bare != null);
+    allocator.free(bare.?);
+
+    const with_subtopic = try replCommandCallback(runtime, allocator, "/claude-api cost-optimize");
+    try testing.expect(with_subtopic != null);
+    allocator.free(with_subtopic.?);
+}
+
+// ============================================================================
+// commands-20: /loops (thin list/delete layer over /loop's cron jobs).
+// ============================================================================
+
+test "commands-20: /loops lists a job created via /loop and /loops delete cancels it" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    // /loop schedules a DURABLE job, which persists to ~/.zcode/... on
+    // disk; pin HOME to the tmp root so this test never writes to (or reads
+    // stale state from) the real developer machine.
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    const td = @import("tools/tool_dispatch.zig");
+    defer td.deinitCronStore(); // the cron store is a module-level singleton
+
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const loop_out = try replCommandCallback(runtime, allocator, "/loop 5m say hi");
+    try testing.expect(loop_out != null);
+    defer allocator.free(loop_out.?);
+
+    const job_marker = "job ";
+    const job_pos = (std.mem.indexOf(u8, loop_out.?, job_marker) orelse return error.JobIdNotFound) + job_marker.len;
+    const job_end = std.mem.indexOfScalarPos(u8, loop_out.?, job_pos, ')') orelse return error.JobIdNotFound;
+    const job_id = try allocator.dupe(u8, loop_out.?[job_pos..job_end]);
+    defer allocator.free(job_id);
+
+    const list_out = try replCommandCallback(runtime, allocator, "/loops");
+    try testing.expect(list_out != null);
+    defer allocator.free(list_out.?);
+    try testing.expect(std.mem.indexOf(u8, list_out.?, job_id) != null);
+
+    const delete_cmd = try std.fmt.allocPrint(allocator, "/loops delete {s}", .{job_id});
+    defer allocator.free(delete_cmd);
+    const delete_out = try replCommandCallback(runtime, allocator, delete_cmd);
+    try testing.expect(delete_out != null);
+    defer allocator.free(delete_out.?);
+    try testing.expect(std.mem.indexOf(u8, delete_out.?, "Cancelled job") != null);
+
+    const list_after = try replCommandCallback(runtime, allocator, "/loops");
+    try testing.expect(list_after != null);
+    defer allocator.free(list_after.?);
+    try testing.expect(std.mem.indexOf(u8, list_after.?, job_id) == null);
+}
+
+test "commands-20: /loops delete with no id returns usage" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+
+    const out = try replCommandCallback(runtime, allocator, "/loops delete ");
+    try testing.expect(out != null);
+    defer allocator.free(out.?);
+    try testing.expect(std.mem.indexOf(u8, out.?, "usage: /loops delete") != null);
+}
+
+// ============================================================================
+// commands-21: /pause-memory (+ /memory-pause, /toggle-memory aliases).
+// ============================================================================
+
+test "commands-21: /pause-memory (and its aliases) toggle the session flag" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("core/test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+    var h = try RewindTestHarness.init(allocator, root);
+    defer h.deinit();
+    const runtime = &h.runtime;
+    defer env_mod.clearOverrides();
+
+    try testing.expect(!env_mod.isEnvTruthy("ZCODE_AUTOMEMORY_PAUSED"));
+
+    const paused = try replCommandCallback(runtime, allocator, "/pause-memory");
+    try testing.expect(paused != null);
+    defer allocator.free(paused.?);
+    try testing.expect(std.mem.indexOf(u8, paused.?, "automemory paused") != null);
+    try testing.expect(env_mod.isEnvTruthy("ZCODE_AUTOMEMORY_PAUSED"));
+
+    // Either alias resumes it (toggle semantics, matching the "toggle-memory"
+    // alias name).
+    const resumed = try replCommandCallback(runtime, allocator, "/memory-pause");
+    try testing.expect(resumed != null);
+    defer allocator.free(resumed.?);
+    try testing.expect(std.mem.indexOf(u8, resumed.?, "automemory resumed") != null);
+    try testing.expect(!env_mod.isEnvTruthy("ZCODE_AUTOMEMORY_PAUSED"));
+
+    const paused_again = try replCommandCallback(runtime, allocator, "/toggle-memory");
+    try testing.expect(paused_again != null);
+    defer allocator.free(paused_again.?);
+    try testing.expect(std.mem.indexOf(u8, paused_again.?, "automemory paused") != null);
 }

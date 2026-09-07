@@ -10,6 +10,7 @@ const compaction = @import("compaction.zig");
 const tokenizer = @import("tokenizer.zig");
 const policy_mod = @import("../policy/policy.zig");
 const prompt_helpers = @import("prompt_helpers.zig");
+const system_prompt = @import("system_prompt.zig");
 const skills_mod = @import("skills.zig");
 const env_mod = @import("env.zig");
 
@@ -113,10 +114,21 @@ pub fn build(
     /// so the model knows what to PRODUCE (a structured plan vs
     /// free discussion) not just what tools are blocked.
     prompt_mode: types.PromptMode,
+    /// system-prompt-missed-74: true when this session is running
+    /// non-interactively (headless / `--print`, no user watching in real
+    /// time). Threaded straight through to
+    /// prompt_helpers.renderDynamicSystemPolicy -- see its doc comment.
+    is_headless: bool,
 ) !BuildOutput {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
+
+    // cli-flags-12: --safe-mode disables custom output styles for this run
+    // -- render as though the default style were active, regardless of
+    // what the caller (REPL /output-style, config, or a saved session)
+    // resolved `output_style_name` to.
+    const effective_output_style_name: []const u8 = if (cfg.safe_mode) "default" else output_style_name;
 
     const budget = types.BudgetPlan.init(
         cfg.model_context_window,
@@ -164,22 +176,30 @@ pub fn build(
     // prompt view only; the stored transcript keeps full results. Best-effort.
     const effective_history = compaction.microcompact(a, tb_history, compaction.MICROCOMPACT_KEEP_LAST) catch tb_history;
 
-    const instruction_stack = try instructions.discover(
-        a,
-        cwd,
-        .{
-            .per_file_cap = cfg.instruction_file_cap_bytes,
-            .total_cap = cfg.instruction_total_cap_bytes,
-            .imports_enabled = cfg.instruction_imports_enabled,
-            .import_max_depth = cfg.instruction_import_max_depth,
-            .cache = instruction_cache,
-            .axis_epoch = instruction_axis_epoch,
-        },
-    );
+    // cli-flags-12: --safe-mode disables CLAUDE.md/AGENTS.md/GEMINI.md/
+    // ZCODE.md (and their .local variants) entirely for this run -- skip
+    // discovery altogether rather than discover-then-filter, so a broken or
+    // malicious instruction file can't even be stat'd/read while
+    // troubleshooting under --safe-mode.
+    const instruction_stack = if (cfg.safe_mode)
+        try a.alloc(types.InstructionEntry, 0)
+    else
+        try instructions.discover(
+            a,
+            cwd,
+            .{
+                .per_file_cap = cfg.instruction_file_cap_bytes,
+                .total_cap = cfg.instruction_total_cap_bytes,
+                .imports_enabled = cfg.instruction_imports_enabled,
+                .import_max_depth = cfg.instruction_import_max_depth,
+                .cache = instruction_cache,
+                .axis_epoch = instruction_axis_epoch,
+            },
+        );
 
     const tool_schemas_owned = try prompt_helpers.cloneToolSchemas(a, tool_schemas);
-    const system_policy = try prompt_helpers.renderSystemPolicy(a, cfg, policy, cwd, user_turn, output_style_name, session_system_prompt, preferred_language, prompt_mode);
-    const dynamic_policy = try prompt_helpers.renderDynamicSystemPolicy(a, cfg, policy, cwd, user_turn, output_style_name, session_system_prompt, preferred_language, prompt_mode);
+    const system_policy = try prompt_helpers.renderSystemPolicy(a, cfg, policy, cwd, user_turn, effective_output_style_name, session_system_prompt, preferred_language, prompt_mode);
+    const dynamic_policy = try prompt_helpers.renderDynamicSystemPolicy(a, cfg, policy, cwd, user_turn, effective_output_style_name, session_system_prompt, preferred_language, prompt_mode, is_headless);
     const context_candidates = try context.gather(a, cwd, user_turn, snapshot, git_capture_cache);
     const context_blocks = try selectBudgetedContextBlocks(
         a,
@@ -222,29 +242,58 @@ pub fn build(
     // don't scan the real ~/.zcode/skills tree; a discovery error degrades to
     // no listing rather than failing the whole prompt build.
     const skill_listing_budget = getCharBudget(cfg.model_context_window, readCharBudgetEnvOverride());
-    const skills_listing = if (@import("builtin").is_test)
+    // cli-flags-12: --safe-mode disables skills (built-in, project, and
+    // plugin-contributed) too -- suppress the listing the same way the test
+    // guard does, so a skill's frontmatter/instructions never reach the
+    // model while troubleshooting under --safe-mode.
+    // cli-flags-15: --disable-slash-commands -- Claude's own help text
+    // describes this flag as "Disable all skills" (despite its
+    // slash-command-shaped name), so it shares the exact same suppression.
+    const skills_listing = if (@import("builtin").is_test or cfg.safe_mode or cfg.disable_slash_commands)
         try a.dupe(u8, "")
     else
         skills_mod.renderModelListing(a, cwd, snapshot.file_focus, snapshot.activated_conditional_skills, skill_listing_budget) catch try a.dupe(u8, "");
 
+    // regression fix: build the inner envelope (every field of which may
+    // call `a.dupe`, and `a.dupe` may grow the arena to a new backing block)
+    // as its OWN statement, completed before `arena` is copied by value into
+    // the returned `PromptEnvelopeOwned` below. Struct-literal fields
+    // evaluate in source order, so writing `.arena = arena` ahead of a
+    // nested `.envelope = .{ ... try a.dupe(...) ... }` (as this used to)
+    // snapshots the arena's buffer-list BEFORE those later dupes run --  any
+    // block a later dupe allocates is invisible to that snapshot and never
+    // freed by `PromptEnvelopeOwned.deinit`'s `arena.deinit()`, since it
+    // deinits the (stale) copy, not the one the later dupes actually grew.
+    // This was dormant while every dupe fit in the arena's first block;
+    // adding `system_prompt_override` (cli-flags-10) was enough combined
+    // allocation pressure to grow a second block on some inputs, at which
+    // point that block leaked every time. Splitting the two statements
+    // removes the ordering hazard regardless of how many fields are added
+    // later.
+    const envelope_out = types.PromptEnvelope{
+        .system_policy = system_policy,
+        .dynamic_policy = dynamic_policy,
+        .instruction_stack = instruction_stack,
+        .user_turn = try a.dupe(u8, user_turn),
+        .working_context = try a.dupe(u8, working_context),
+        .tool_schemas = tool_schemas_owned,
+        .history = effective_history,
+        .context_blocks = context_blocks,
+        .budget_plan = budget,
+        .cache_hints = cache_hints,
+        .preprocessor_intent = preprocessor_intent,
+        .focus_directive = focus,
+        .skills_listing = skills_listing,
+        // cli-flags-10: dupe into the arena so the envelope's lifetime
+        // rules stay uniform (every string field is arena-owned) even
+        // though `cfg` outlives it anyway.
+        .system_prompt_override = try a.dupe(u8, cfg.system_prompt_override),
+    };
+
     return .{
         .envelope = .{
             .arena = arena,
-            .envelope = .{
-                .system_policy = system_policy,
-                .dynamic_policy = dynamic_policy,
-                .instruction_stack = instruction_stack,
-                .user_turn = try a.dupe(u8, user_turn),
-                .working_context = try a.dupe(u8, working_context),
-                .tool_schemas = tool_schemas_owned,
-                .history = effective_history,
-                .context_blocks = context_blocks,
-                .budget_plan = budget,
-                .cache_hints = cache_hints,
-                .preprocessor_intent = preprocessor_intent,
-                .focus_directive = focus,
-                .skills_listing = skills_listing,
-            },
+            .envelope = envelope_out,
         },
         .compaction_applied = compact_result.did_compact,
         .compaction_hash = compact_result.summary_hash,
@@ -361,6 +410,16 @@ pub fn renderPromptPacket(allocator: std.mem.Allocator, env: *const types.Prompt
 }
 
 fn renderSystemPromptPacket(allocator: std.mem.Allocator, env: *const types.PromptEnvelope) ![]u8 {
+    // cli-flags-10: `--system-prompt`/`--system-prompt-file` replace the
+    // ENTIRE system prompt -- none of zcode's default sections (runtime
+    // policy, security advisory, epistemic honesty, tone/style, tool
+    // schemas, skills listing, etc) are included, matching Claude Code's own
+    // documented behavior for this flag (distinct from
+    // `--append-system-prompt`, which layers on top and is unaffected here).
+    if (env.system_prompt_override.len > 0) {
+        return allocator.dupe(u8, env.system_prompt_override);
+    }
+
     var buf = std_io.StringBuilder.init(allocator);
     defer buf.deinit();
 
@@ -424,6 +483,22 @@ fn renderSystemPromptPacket(allocator: std.mem.Allocator, env: *const types.Prom
         try buf.writer().writeAll("\n</system-reminder>\n\n");
     }
 
+    // system-prompt-missed-75: ported from cc_system_prompt_2.1.261.md's
+    // "# Session-specific guidance" section. Only the two bullets that map
+    // 1:1 onto features zcode actually has are ported: the shell-passthrough
+    // hint (phrased for zcode's own `/!` interactive-shell syntax, verified
+    // in src/cli/repl.zig, rather than the reference's bare `! <command>`)
+    // and the /<skill-name>-invokes-via-Skill rule. The reference's third
+    // bullet (an "ultrareview" explainer for /code-review ultra) is omitted:
+    // zcode has no such command, and claiming one exists would violate the
+    // "never make zcode claim features it doesn't have" rule.
+    try buf.writer().writeAll(
+        "<system-reminder name=\"zcode-session-tips\">\n" ++
+            " - If you need the user to run a shell command themselves (e.g., an interactive login like `gcloud auth login`), suggest they type `/! <command>` in the prompt -- the `/!` prefix runs the command in this session so its output lands directly in the conversation.\n" ++
+            " - When the user types `/<skill-name>`, invoke it via Skill. Only use skills listed in the user-invocable skills section -- don't guess.\n" ++
+            "</system-reminder>\n\n",
+    );
+
     // Skill awareness: the model discovers available skills here and invokes
     // them via the Skill tool (or the user via /<name>). Per-turn + dynamic so
     // paths-gated skills surface when relevant. See core/skills.renderModelListing.
@@ -462,7 +537,7 @@ fn renderSystemPromptPacket(allocator: std.mem.Allocator, env: *const types.Prom
             "For repository change questions (what changed/additions/removals), call GitDiff with relevant args (path, staged, context) and use tool output as source of truth.\n" ++
             "When GitDiff returns changes, include one or more exact hunks in assistant output using ```diff.\n" ++
             "When including multi-line source code or command snippets in assistant text, always wrap them in fenced code blocks with an explicit language tag (for example ```typescript or ```bash).\n" ++
-            "When launching background work, use TaskRun and then TaskPoll/TaskOutput before claiming completion.\n" ++
+            "When launching background work, use TaskRun and then TaskGet/TaskOutput before claiming completion.\n" ++
             "Use Bash only for non-interactive commands. Interactive terminal commands such as vim, less, top, ssh, or REPLs require the local `/!` interactive-shell workflow instead of Bash.\n" ++
             "CRITICAL: Never claim a background service (dev server, daemon, API, database) is 'still running' based on memory of launching it earlier. Processes die -- they crash, get killed by OOM, get reaped by signals, or never started at all. Before telling the user a service is up, you MUST verify with a FRESH tool call in the current round: `curl -s -o /dev/null -w '%{http_code}' http://localhost:PORT` for HTTP servers, `kill -0 PID` for tracked PIDs, `lsof -i :PORT` for port listeners, or `ps -p PID` for process checks. If the check shows the service is dead, say so plainly and offer to restart it. Do NOT say 'the server is already running' without a verification call in the same turn.\n" ++
             "For long or piped Bash commands, prefix the command with a single `# label` first line describing what the command does (e.g. `# regenerate generated parser`). zcode renders that label as the bash card title so the user can skim activity without parsing the raw command.\n" ++
@@ -654,8 +729,12 @@ fn renderOrchestrationReminder(allocator: std.mem.Allocator, env: *const types.P
     var out = std_io.StringBuilder.init(allocator);
     defer out.deinit();
 
-    const has_task_tools = hasAnyTool(env.tool_schemas, &.{ "TodoWrite", "TodoRead", "TaskCreate", "TaskUpdate", "TaskList", "TaskRun", "TaskPoll", "TaskOutput" });
-    const has_subagent = hasAnyTool(env.tool_schemas, &.{"AgentRun"});
+    const has_task_tools = hasAnyTool(env.tool_schemas, &.{ "TodoWrite", "TodoRead", "TaskCreate", "TaskUpdate", "TaskList", "TaskRun", "TaskGet", "TaskOutput" });
+    // tools-01 (wp2-tools-surface): the advertised schema name is now "Agent"
+    // (AgentRun kept only as a dispatch-only legacy synonym), so this check
+    // must look for either name to keep matching a live turn's actual schema
+    // set.
+    const has_subagent = hasAnyTool(env.tool_schemas, &.{ "Agent", "AgentRun" });
     const has_verification = hasAnyTool(env.tool_schemas, &.{ "RunTests", "Bash", "shell", "GitDiff", "git_status" });
 
     if (has_task_tools and prompt_helpers.shouldEncourageTaskTracking(env.user_turn)) {
@@ -908,6 +987,66 @@ test "response-contract section is gated by suppress_response_contract" {
     try testing.expect(std.mem.indexOf(u8, without, "zcode-response-contract") == null);
 }
 
+test "renderSystemPromptPacket includes the session-specific guidance tips (system-prompt-missed-75)" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const env = types.PromptEnvelope{
+        .system_policy = "system",
+        .instruction_stack = &.{},
+        .user_turn = "hi",
+        .tool_schemas = &.{},
+        .history = &.{},
+        .context_blocks = &.{},
+        .budget_plan = types.BudgetPlan.init(100, 10, 10),
+        .cache_hints = &.{},
+    };
+
+    const rendered = try renderSystemPromptPacket(a, &env);
+    try testing.expect(std.mem.indexOf(u8, rendered, "zcode-session-tips") != null);
+    // Phrased for zcode's actual `/!` interactive-shell syntax, not the
+    // reference's bare `!` -- zcode reserves bare `!` for a different,
+    // non-interactive fast path (see src/cli/repl.zig).
+    try testing.expect(std.mem.indexOf(u8, rendered, "/! <command>") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "invoke it via Skill") != null);
+    // Never claim the ultrareview command exists -- zcode has no such
+    // command yet.
+    try testing.expect(std.mem.indexOf(u8, rendered, "ultrareview") == null);
+}
+
+test "renderSystemPromptPacket never leaks Claude Code or Anthropic identity (identity-leak)" {
+    // End-to-end identity check: builds the real static prefix (system_prompt.zig)
+    // and folds it through the full dynamic system-reminder pipeline
+    // (renderSystemPromptPacket), then asserts the combined rendered system
+    // prompt never claims zcode IS Claude Code or Anthropic. This is the
+    // pipeline the CLI actually uses (`prompt inspect --json`), so a leak
+    // introduced in either the static sections or any dynamic
+    // system-reminder block is caught here.
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const static_prefix = try system_prompt.renderStaticPrefix(a, true);
+
+    const env = types.PromptEnvelope{
+        .system_policy = static_prefix,
+        .instruction_stack = &.{},
+        .user_turn = "hi",
+        .tool_schemas = &.{},
+        .history = &.{},
+        .context_blocks = &.{},
+        .budget_plan = types.BudgetPlan.init(100, 10, 10),
+        .cache_hints = &.{},
+    };
+
+    const rendered = try renderSystemPromptPacket(a, &env);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Claude Code") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Anthropic") == null);
+}
+
 test "renderPromptPacket builds system and user packets" {
     const allocator = testing.allocator;
     const env = types.PromptEnvelope{
@@ -962,6 +1101,85 @@ test "renderPromptPacket builds system and user packets" {
     // And the background-service verification rule from the same
     // pass must also land.
     try testing.expect(std.mem.indexOf(u8, rendered.system, "Never claim a background service") != null);
+}
+
+test "cli-flags-10: system_prompt_override replaces the entire rendered system prompt" {
+    const allocator = testing.allocator;
+    const env = types.PromptEnvelope{
+        .system_policy = "base-policy",
+        .dynamic_policy = "# Environment\ncwd=/tmp/zcode-test\n",
+        .instruction_stack = &.{},
+        .user_turn = "inspect src/main.zig",
+        .tool_schemas = &.{},
+        .history = &.{},
+        .context_blocks = &.{},
+        .budget_plan = types.BudgetPlan.init(100, 10, 10),
+        .cache_hints = &.{},
+        .system_prompt_override = "You are a terse bot.",
+    };
+
+    var rendered = try renderPromptPacket(allocator, &env);
+    defer rendered.deinit(allocator);
+
+    try testing.expectEqualStrings("You are a terse bot.", rendered.system);
+    // None of the default sections leak through when the override is set.
+    try testing.expect(std.mem.indexOf(u8, rendered.system, "zcode-runtime-policy") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered.system, "zcode-epistemic-honesty") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered.system, "base-policy") == null);
+}
+
+test "cli-flags-10: build() threads cfg.system_prompt_override into the envelope" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(rt.io, "repo");
+    const cwd = try allocator.dupe(u8, "repo");
+    defer allocator.free(cwd);
+
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+    allocator.free(cfg.system_prompt_override);
+    cfg.system_prompt_override = try allocator.dupe(u8, "You are a terse bot.");
+
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const snapshot = types.SessionSnapshot{
+        .facts = &.{},
+        .decisions = &.{},
+        .open_tasks = &.{},
+        .file_focus = &.{},
+        .recent_tool_outcomes = &.{},
+        .handoff_summary = "",
+    };
+
+    var built = try build(
+        allocator,
+        &cfg,
+        &policy,
+        "hi",
+        &.{},
+        &.{},
+        cwd,
+        &snapshot,
+        null,
+        cfg.output_style,
+        "",
+        "",
+        null,
+        0,
+        null,
+        "",
+        .execution,
+        true,
+    );
+    defer built.envelope.deinit();
+
+    try testing.expectEqualStrings("You are a terse bot.", built.envelope.envelope.system_prompt_override);
+
+    var rendered = try renderPromptPacket(allocator, &built.envelope.envelope);
+    defer rendered.deinit(allocator);
+    try testing.expectEqualStrings("You are a terse bot.", rendered.system);
 }
 
 test "renderPromptPacket surfaces MCP server instructions when attached" {
@@ -1135,6 +1353,7 @@ test "prompt fixture preserves instruction precedence" {
         null,
         "goal=Update tests and keep behavior stable\nrequired_next_action=inspect_or_act",
         .execution,
+        false,
     );
     defer built.envelope.deinit();
 
@@ -1151,6 +1370,77 @@ test "prompt fixture preserves instruction precedence" {
     const zig_idx = std.mem.indexOf(u8, rendered, "ZCODE.md") orelse return error.MissingZcodeInstruction;
     const agents_idx = std.mem.indexOf(u8, rendered, "AGENTS.md") orelse return error.MissingAgentsInstruction;
     try testing.expect(zig_idx < agents_idx);
+}
+
+test "cli-flags-12: --safe-mode drops CLAUDE.md/instruction-file content from the rendered prompt" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(rt.io, "repo");
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "repo/CLAUDE.md", .data = "ZCODE_UNIQUE_MARKER_XYZ123 do not forget this" });
+
+    const cwd = try @import("test_helpers.zig").tmpDirPath(allocator, &tmp, "repo");
+    defer allocator.free(cwd);
+
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+    cfg.model_context_window = 1024;
+    cfg.reserved_output_tokens = 128;
+    cfg.reserved_reasoning_tokens = 64;
+    cfg.instruction_file_cap_bytes = 1024;
+    cfg.instruction_total_cap_bytes = 2048;
+    cfg.max_history_turns = 8;
+    cfg.safe_mode = true;
+
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const snapshot = types.SessionSnapshot{
+        .facts = &.{},
+        .decisions = &.{},
+        .open_tasks = &.{},
+        .file_focus = &.{},
+        .recent_tool_outcomes = &.{},
+        .handoff_summary = "",
+    };
+
+    var built = try build(
+        allocator,
+        &cfg,
+        &policy,
+        "hi",
+        &.{},
+        &.{},
+        cwd,
+        &snapshot,
+        null,
+        "investigative", // a non-default style, to prove it gets overridden too
+        "",
+        "",
+        null,
+        0,
+        null,
+        "",
+        .execution,
+        false,
+    );
+    defer built.envelope.deinit();
+
+    // The instruction file was discovered on disk, but --safe-mode drops it
+    // before it ever reaches the envelope. (`[INSTRUCTIONS]` itself is
+    // unconditionally *mentioned* by name in the always-present prompt
+    // guide -- see the `project_rules=[INSTRUCTIONS] are ordered...` line
+    // above -- so the real assertion is that the actual CLAUDE.md CONTENT
+    // never appears, not that the literal string "[INSTRUCTIONS]" is gone.)
+    try testing.expectEqual(@as(usize, 0), built.envelope.envelope.instruction_stack.len);
+    try testing.expectEqualStrings("", built.envelope.envelope.skills_listing);
+
+    const rendered = try renderPromptText(allocator, &built.envelope.envelope);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "ZCODE_UNIQUE_MARKER_XYZ123") == null);
+    // The custom "investigative" output style did not leak through either.
+    try testing.expect(std.mem.indexOf(u8, rendered, "output_style=investigative") == null);
 }
 
 test "prompt build includes configured output style and orchestration reminder" {
@@ -1189,7 +1479,15 @@ test "prompt build includes configured output style and orchestration reminder" 
         allocator,
         &cfg,
         &policy,
-        "Investigate deeply across modules and implement the fix",
+        // Pre-existing test bug fixed in passing (wp2-tools-surface): the
+        // original prompt ("Investigate deeply across modules and implement
+        // the fix") only ever scored 30 in assessSubagentNeed (Signal 4
+        // "across modules" alone), below the 40-point should_encourage
+        // threshold -- so the "AgentRun" assertion below could never have
+        // passed regardless of tool-schema naming. Adding "in parallel"
+        // (Signal 3, +40) pushes the score to 70 so the orchestration
+        // guidance text this test actually means to exercise gets emitted.
+        "Investigate deeply across modules in parallel and implement the fix",
         &.{},
         schemas[0..],
         cwd,
@@ -1203,6 +1501,7 @@ test "prompt build includes configured output style and orchestration reminder" 
         null,
         "",
         .execution,
+        false,
     );
     defer built.envelope.deinit();
 
@@ -1213,4 +1512,73 @@ test "prompt build includes configured output style and orchestration reminder" 
     try testing.expect(std.mem.indexOf(u8, rendered.system, "zcode-orchestration-playbook") != null);
     try testing.expect(std.mem.indexOf(u8, rendered.system, "task checklist") != null);
     try testing.expect(std.mem.indexOf(u8, rendered.system, "AgentRun") != null);
+}
+
+test "build threads is_headless through to the rendered dynamic policy (system-prompt-missed-74)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(rt.io, "repo");
+    const cwd = try allocator.dupe(u8, "repo");
+    defer allocator.free(cwd);
+
+    var cfg = try config_mod.Config.init(allocator);
+    defer cfg.deinit(allocator);
+    var policy = try policy_mod.Policy.init(allocator);
+    defer policy.deinit();
+
+    const snapshot = types.SessionSnapshot{
+        .facts = &.{},
+        .decisions = &.{},
+        .open_tasks = &.{},
+        .file_focus = &.{},
+        .recent_tool_outcomes = &.{},
+        .handoff_summary = "",
+    };
+
+    var headless_built = try build(
+        allocator,
+        &cfg,
+        &policy,
+        "do the thing",
+        &.{},
+        &.{},
+        cwd,
+        &snapshot,
+        null,
+        cfg.output_style,
+        "",
+        "",
+        null,
+        0,
+        null,
+        "",
+        .execution,
+        true,
+    );
+    defer headless_built.envelope.deinit();
+    try testing.expect(std.mem.indexOf(u8, headless_built.envelope.envelope.dynamic_policy, "operating autonomously") != null);
+
+    var interactive_built = try build(
+        allocator,
+        &cfg,
+        &policy,
+        "do the thing",
+        &.{},
+        &.{},
+        cwd,
+        &snapshot,
+        null,
+        cfg.output_style,
+        "",
+        "",
+        null,
+        0,
+        null,
+        "",
+        .execution,
+        false,
+    );
+    defer interactive_built.envelope.deinit();
+    try testing.expect(std.mem.indexOf(u8, interactive_built.envelope.envelope.dynamic_policy, "operating autonomously") == null);
 }

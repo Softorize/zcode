@@ -321,11 +321,24 @@ pub fn openFlagsAlloc(allocator: std.mem.Allocator, path: []const u8, flags: std
 }
 
 /// streamUntilDelimiter shim: read from stdin into a writer until a delimiter byte.
+///
+/// r3-mock-01: stdin is a pipe or PTY in every REPL invocation, and
+/// `readPositionalAll` issues a `pread`-style positional read at a fixed
+/// offset. `pread` on a non-seekable fd fails with ESPIPE on the very
+/// first byte (see CLAUDE.md's "0.16 gotchas": "For pipes use
+/// `readStreaming` ... since pread is ESPIPE on pipes"), which the old
+/// `catch return error.EndOfStream` swallowed -- so the REPL's
+/// `--no-fullscreen` input path (cli/repl.zig's non-raw-mode fallback,
+/// the only caller of this function) failed with a misleading
+/// "error: EndOfStream (provider=..., model=...)" before the user typed
+/// anything, and no `provider`/model call was ever involved. `readStreaming`
+/// is the pread-free primitive already used by `StdinReader.read` and by
+/// the (correct) `readUntilDelimiterOrEofAlloc` method below -- mirror it.
 pub fn streamUntilDelimiter(w: *std.Io.Writer, delim: u8, max: usize) !void {
     var count: usize = 0;
     while (count < max) : (count += 1) {
         var b: [1]u8 = undefined;
-        const n = std.Io.File.stdin().readPositionalAll(rt.io, &b, 0) catch return error.EndOfStream;
+        const n = std.Io.File.stdin().readStreaming(rt.io, &.{&b}) catch return error.EndOfStream;
         if (n == 0) return error.EndOfStream;
         if (b[0] == delim) return;
         try w.writeByte(b[0]);
@@ -334,13 +347,21 @@ pub fn streamUntilDelimiter(w: *std.Io.Writer, delim: u8, max: usize) !void {
 }
 
 /// Read from stdin until delim or EOF; allocates the line.
+///
+/// r3-mock-01: same `readPositionalAll`-on-a-non-seekable-fd bug as
+/// `streamUntilDelimiter` above. This particular overload (taking a
+/// `StdinReader` by value as its first, unused parameter) currently has
+/// no callers -- every live call site goes through the method of the
+/// same name defined on `StdinReader` itself (which already uses
+/// `readStreaming` correctly) -- but fix it too so it is not a latent
+/// landmine for the next caller.
 pub fn readUntilDelimiterOrEofAlloc(_: StdinReader, allocator: std.mem.Allocator, delim: u8, max: usize) !?[]u8 {
     var buf = StringBuilder.init(allocator);
     errdefer buf.deinit();
     var count: usize = 0;
     while (count < max) : (count += 1) {
         var b: [1]u8 = undefined;
-        const n = std.Io.File.stdin().readPositionalAll(rt.io, &b, 0) catch {
+        const n = std.Io.File.stdin().readStreaming(rt.io, &.{&b}) catch {
             if (buf.items().len == 0) return null;
             return try buf.toOwnedSlice();
         };

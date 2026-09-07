@@ -23,6 +23,7 @@ const jwks_cache = @import("core/jwks_cache.zig");
 const policy_mod = @import("policy/policy.zig");
 const session_store = @import("session/store.zig");
 const mcp_client = @import("mcp/client.zig");
+const mcp_config = @import("core/mcp_config.zig");
 const browser_bridge_mod = @import("mcp/browser_bridge.zig");
 
 const session_mgmt = @import("session_mgmt.zig");
@@ -36,6 +37,8 @@ const remote_daemon = @import("remote_daemon.zig");
 const kairos = @import("kairos.zig");
 const bg_cmds = @import("bg_cmds.zig");
 const tool_dispatch = @import("tools/tool_dispatch.zig");
+const project_purge = @import("cli/project_purge.zig");
+const worktree_launch = @import("cli/worktree_launch.zig");
 
 // Reachable-from-main registry for orphan utility modules so their
 // tests run under `zig build test`. The Zig 0.15 test runner only
@@ -187,6 +190,8 @@ comptime {
     _ = @import("core/hook_config.zig");
     _ = @import("core/hook_exec_prompt.zig");
     _ = @import("core/hook_exec_http.zig");
+    _ = @import("core/hook_exec_mcp_tool.zig");
+    _ = @import("core/permission_rule_validation.zig");
     _ = @import("core/async_hook_registry.zig");
     _ = @import("core/hooks_snapshot.zig");
     _ = @import("core/session_hooks.zig");
@@ -194,6 +199,7 @@ comptime {
     _ = @import("core/hooks_lifecycle_test.zig");
     _ = @import("core/hooks_runtime_wire_test.zig");
     _ = @import("core/settings_sources.zig");
+    _ = @import("core/status_line.zig");
     _ = @import("core/config_migrations.zig");
     _ = @import("core/mcp_name.zig");
     _ = @import("core/model_alias.zig");
@@ -245,6 +251,7 @@ comptime {
     _ = @import("core/cc_stub_commands.zig");
     _ = @import("core/parity_command_coverage.zig");
     _ = @import("core/parity_tool_coverage.zig");
+    _ = @import("core/command_list_format.zig");
     _ = @import("core/wire_protocol.zig");
     _ = @import("core/retry_policy.zig");
     _ = @import("core/token_count.zig");
@@ -314,6 +321,18 @@ comptime {
     // socket so `tmux kill-server` via Bash cannot touch the user's real
     // session (phase-26 daemon-background-06). Register so its tests run.
     _ = @import("core/tmux_socket.zig");
+    // cli-flags-31: `zcode project purge [path]` -- deletes a project's
+    // `.zcode/` workspace state. Register so its tests run.
+    _ = @import("cli/project_purge.zig");
+    // cli-flags-08: `-w/--worktree`/`--tmux` launch-time git worktree
+    // creation. Register so its tests run.
+    _ = @import("cli/worktree_launch.zig");
+    // wp1b-commands-new: new-in-2.1.261 commands (background/list-agents/
+    // subtask/goal/team-onboarding/fewer-permission-prompts/auto-mode-setup/
+    // bug/import/skill-doctor/reload-skills) + the codex/gemini config
+    // importer they share with the `zcode import` CLI subcommand.
+    _ = @import("repl_commands_parity.zig");
+    _ = @import("core/import_agent_config.zig");
 }
 
 fn verboseLogsEnabled(opts: *const cli.CliOptions) bool {
@@ -396,6 +415,109 @@ fn installInterruptHandlers() void {
     // Route to restoreTermAndExit so a Ctrl+\ on a stuck REPL
     // leaves the terminal in a usable state.
     std.posix.sigaction(std.posix.SIG.QUIT, &act, null);
+}
+
+/// cli-flags-06: read every `--mcp-config <configs...>` entry (each already
+/// validated by `args.zig`'s `validateMcpConfigEntry` as either inline JSON
+/// -- a value that, once trimmed, starts with `{` -- or a path to a JSON
+/// file) and parse the servers out of each one's `mcpServers` block,
+/// concatenating them in flag order (a later `--mcp-config` wins a same-name
+/// collision, matching `mergeScopes`'s general later-wins rule). Parsed at
+/// `ConfigScope.local` with `${VAR}` expansion enabled, same as the rest of
+/// the local/project scope. The caller owns the returned slice.
+fn loadCliMcpConfig(allocator: std.mem.Allocator, entries: []const []const u8) ![]mcp_config.ServerConfig {
+    var servers: []mcp_config.ServerConfig = &.{};
+    errdefer mcp_config.freeServerConfigs(allocator, servers);
+
+    for (entries) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        var owned_bytes: ?[]u8 = null;
+        defer if (owned_bytes) |b| allocator.free(b);
+        const bytes: []const u8 = if (trimmed.len > 0 and trimmed[0] == '{')
+            trimmed
+        else blk: {
+            const b = std.Io.Dir.cwd().readFileAlloc(rt.io, trimmed, allocator, .limited(1 * 1024 * 1024)) catch |err| {
+                std.log.warn("--mcp-config: could not re-read '{s}' ({s}); skipping this entry", .{ trimmed, @errorName(err) });
+                continue;
+            };
+            owned_bytes = b;
+            break :blk b;
+        };
+
+        const result = try mcp_config.parseMcpJson(allocator, bytes, .local, true);
+        if (result.errors.len > 0) {
+            mcp_config.renderValidationErrors(std_io.stderrWriter(), result.errors) catch {};
+        }
+        // Free just the errors -- `result.servers` is about to be moved into
+        // `servers` via `concatServerConfigs`, which takes ownership of both
+        // the accumulator-so-far and this entry's slice (freeing only their
+        // container arrays; the individual `ServerConfig`s move across
+        // unchanged).
+        for (result.errors) |*e| e.deinit(allocator);
+        if (result.errors.len > 0) allocator.free(result.errors);
+        servers = try mcp_config.concatServerConfigs(allocator, servers, result.servers);
+    }
+
+    return servers;
+}
+
+/// wp4-cli-flags: copy the raw value of every CLI-flag-carrier field (see
+/// core/config.zig's field docs) from `opts` into `cfg`, for whichever
+/// parity package (permissions/sessions/sdk) reads it next. Deliberately
+/// does no validation beyond what `args.zig` already did at parse time --
+/// this is a pure carry, not a policy decision.
+fn applyCliFlagCarrierFields(allocator: std.mem.Allocator, cfg: *config_mod.Config, opts: *const cli.CliOptions) !void {
+    if (opts.used_permission_mode_flag) {
+        // approval_mode already carries the (possibly auto->tiered-auto
+        // normalized) value; permission_mode carries the flag's own raw
+        // effect for a package that wants to distinguish "--permission-mode"
+        // from "--approval-mode" specifically.
+        try cfg.setOwnedString(allocator, &cfg.permission_mode, cfg.approval_mode);
+    }
+    if (opts.allowed_tools) |v| try cfg.setOwnedString(allocator, &cfg.allowed_tools, v);
+    if (opts.disallowed_tools) |v| try cfg.setOwnedString(allocator, &cfg.disallowed_tools, v);
+    if (opts.tools_flag) |v| {
+        try cfg.setOwnedString(allocator, &cfg.tools_allowlist, v);
+        cfg.tools_flag_set = true;
+    }
+    if (opts.add_dir) |v| try cfg.setOwnedString(allocator, &cfg.additional_directories, v);
+    if (opts.session_id) |v| try cfg.setOwnedString(allocator, &cfg.session_id, v);
+    if (opts.permission_prompts) |v| try cfg.setOwnedString(allocator, &cfg.permission_prompts, v);
+    if (opts.system_prompt) |v| try cfg.setOwnedString(allocator, &cfg.system_prompt_override, v);
+    cfg.no_session_persistence = cfg.no_session_persistence or opts.no_session_persistence;
+    cfg.await_initialize = cfg.await_initialize or opts.await_initialize;
+    cfg.allow_dangerously_skip_permissions = cfg.allow_dangerously_skip_permissions or opts.allow_dangerously_skip_permissions;
+    cfg.verbose = cfg.verbose or opts.verbose;
+    cfg.disable_slash_commands = cfg.disable_slash_commands or opts.disable_slash_commands;
+    cfg.safe_mode = cfg.safe_mode or opts.safe_mode;
+    cfg.brief = cfg.brief or opts.brief;
+}
+
+/// cli-flags-23: apply `--autocompact <auto|N[k]>` as a process-wide
+/// override via `core/env.zig`'s in-process override map, so
+/// `autocompact_threshold.zig`'s existing `*FromEnv` readers pick it up
+/// with zero changes to that module. "auto" clears any override (an
+/// explicit override map entry set to "" is treated as absent by
+/// `parseUsizeEnv`'s empty-after-trim check). Rejects a value outside
+/// Claude's documented 100k-1M range.
+fn applyAutocompactOverride(raw: []const u8) !void {
+    const env_mod = @import("core/env.zig");
+    if (std.ascii.eqlIgnoreCase(raw, "auto")) {
+        try env_mod.setOverride(@import("core/autocompact_threshold.zig").ENV_AUTO_COMPACT_WINDOW, "");
+        return;
+    }
+    var digits = raw;
+    var multiplier: usize = 1;
+    if (digits.len > 0 and (digits[digits.len - 1] == 'k' or digits[digits.len - 1] == 'K')) {
+        multiplier = 1000;
+        digits = digits[0 .. digits.len - 1];
+    }
+    const value = try std.fmt.parseInt(usize, digits, 10);
+    const tokens = value * multiplier;
+    if (tokens < 100_000 or tokens > 1_000_000) return error.OutOfRange;
+    var buf: [24]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{d}", .{tokens});
+    try env_mod.setOverride(@import("core/autocompact_threshold.zig").ENV_AUTO_COMPACT_WINDOW, s);
 }
 
 /// settings-03 approval gate. Runs the dangerous-key prompt for managed config
@@ -489,6 +611,18 @@ pub fn main(init: std.process.Init) !void {
     @import("core/resource_limits.zig").applyParentLimits();
 
     defer tool_dispatch.deinitCronStore();
+    // regression fix: core/env.zig's in-process override map (populated by
+    // --agents/--betas/--effort and friends via env.setOverride) is a
+    // process-lifetime global by design (see its doc comment), but Juicy
+    // Main's automatic leak check at the end of `main` still flags its
+    // still-live entries as leaked. Free them here, the same way
+    // deinitCronStore above tears down its own process-lifetime global,
+    // rather than leaving debug-build leak noise on every --agents/--betas
+    // run.
+    defer @import("core/env.zig").clearOverrides();
+    // Same class of fix, same reason: `-d, --debug <filter>` installs a
+    // process-lifetime allocation in log_runtime's category-filter global.
+    defer log_runtime.clearCategoryFilter();
     const allocator = init.gpa;
 
     // Convert init.minimal.args.vector ([*:0]const u8 sentinel ptrs)
@@ -593,6 +727,31 @@ pub fn main(init: std.process.Init) !void {
     if (opts.quiet and opts.log_level == null) {
         log_runtime.setLevelFromString("error") catch {};
     }
+    // cli-flags-14: -d/--debug (and --debug-file, which implies it) enable
+    // debug-level logging, equivalent to --log-level debug, unless an
+    // explicit --log-level already won above. The category filter
+    // (--debug=<filter>) narrows which `std.log.scoped(.<category>)`
+    // call sites actually emit at debug level -- see
+    // `log_runtime.debugCategoryAllowed`'s doc comment for the include/
+    // exclude ("api,hooks" vs "!1p,!file") syntax. Only scoped call sites
+    // participate; unscoped (`.default`-scope) debug lines are unaffected by
+    // an include-only filter (their scope name never matches a category) but
+    // ARE covered by an exclude-only filter unless "!default" is listed --
+    // this mirrors the reference's own category taxonomy, which only a
+    // subset of log call sites are tagged with today (a full retrofit of
+    // every debug call site in the codebase is a follow-on, not done here).
+    if (opts.debug and opts.log_level == null) {
+        log_runtime.setLevelFromString("debug") catch {};
+    }
+    if (opts.debug_filter) |filter| {
+        log_runtime.setCategoryFilter(filter) catch {};
+    }
+    if (opts.debug_file) |path| {
+        log_runtime.setOutputFile(path) catch |err| {
+            try std_io.stderrWriter().print("error: --debug-file: cannot open {s} for writing ({s}).\n", .{ path, @errorName(err) });
+            std.process.exit(2);
+        };
+    }
     // Silence the plaintext-api-key warning in machine-readable or
     // explicitly-quiet modes. The warning is security-relevant, so we
     // still emit it by default; operators who asked for --quiet /
@@ -633,6 +792,64 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // regression fix: `resolveWorktreePath` below hands back a heap-owned
+    // path that gets stashed into `opts.cwd`; `resolveWorkingDirectory`
+    // (right after this block) only ever reads through that pointer and
+    // returns its OWN independent dupe as `cwd`, so the worktree path
+    // itself is never freed once installed into `opts.cwd` -- tracked here
+    // so it can be freed right after `resolveWorkingDirectory` has made its
+    // copy (see the `defer` beside `cwd` below).
+    var worktree_owned_cwd: ?[]u8 = null;
+
+    // cli-flags-08: -w/--worktree creates (or reuses) a git worktree for
+    // this session BEFORE the working directory is resolved, by rewriting
+    // opts.cwd -- resolveWorkingDirectory below then validates/adopts it
+    // exactly like an explicit --cwd, with no other code path changes.
+    if (opts.worktree_requested) {
+        // regression fix: when `--cwd` was not also passed, `base_cwd` is a
+        // fresh `currentPathAlloc` allocation used only to resolve the
+        // worktree path below (the worktree path itself, not this raw cwd,
+        // is what gets carried forward into `opts.cwd`) -- free it once
+        // `resolveWorktreePath` is done with it, whichever way that call
+        // returns, instead of leaking one cwd string per `--worktree`
+        // launch that omits an explicit `--cwd`.
+        //
+        // Sentinel gotcha (same class of bug as mcp/client.zig's scopedCwd,
+        // see its doc comment): `currentPathAlloc` returns a `[:0]u8` built
+        // via `dupeZ` (len+1 bytes allocated). Storing that value directly
+        // into a plain `?[]u8` and later calling `allocator.free` on it
+        // frees one byte short of what was allocated, corrupting the
+        // DebugAllocator. Dupe a plain, non-sentinel copy HERE while the
+        // original still has its correct sentinel-aware type, and free the
+        // original with that type via `defer` in the same scope.
+        var owned_base_cwd: ?[]u8 = null;
+        defer if (owned_base_cwd) |p| allocator.free(p);
+        const base_cwd: []const u8 = opts.cwd orelse blk: {
+            if (std.process.currentPathAlloc(rt.io, allocator)) |sentinel_cwd| {
+                defer allocator.free(sentinel_cwd);
+                const p = allocator.dupe(u8, sentinel_cwd) catch break :blk ".";
+                owned_base_cwd = p;
+                break :blk p;
+            } else |_| {
+                break :blk ".";
+            }
+        };
+        const wt_path = worktree_launch.resolveWorktreePath(allocator, base_cwd, opts.worktree_name) catch |err| {
+            try std_io.stderrWriter().print(
+                "error: --worktree: could not create/reuse a git worktree in {s} ({s}).\n  - --worktree requires the current directory to be inside a git repository.\n",
+                .{ base_cwd, @errorName(err) },
+            );
+            std.process.exit(2);
+        };
+        opts.cwd = wt_path;
+        worktree_owned_cwd = wt_path;
+        if (opts.tmux_mode) |mode| {
+            const session_name = std.fs.path.basename(wt_path);
+            worktree_launch.spawnTmux(allocator, wt_path, session_name);
+            _ = mode; // both "" (bare --tmux) and "classic" degrade to plain tmux (see worktree_launch doc comment)
+        }
+    }
+
     const cwd = config_mod.resolveWorkingDirectory(allocator, &opts) catch |err| {
         // resolveWorkingDirectory printed its own targeted stderr
         // message for InvalidCwd; exit 2 without piling on.
@@ -640,6 +857,10 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer allocator.free(cwd);
+    // `resolveWorkingDirectory` has now made its own independent copy of the
+    // worktree path (or errored/exited above) -- see the comment on
+    // `worktree_owned_cwd`'s declaration.
+    defer if (worktree_owned_cwd) |p| allocator.free(p);
 
     // Idempotent startup pass that renames/relocates deprecated config keys
     // before the config is parsed, so migrated keys are picked up by load().
@@ -706,7 +927,7 @@ pub fn main(init: std.process.Init) !void {
                 .{loaded_cfg.config.sandbox},
             ),
             error.InvalidApprovalMode => try stderr.print(
-                "error: invalid --approval-mode '{s}'. Expected one of: tiered-auto, manual, strict.\n",
+                "error: invalid --approval-mode/--permission-mode '{s}'. Expected one of: tiered-auto, manual, strict, acceptEdits, plan, bypassPermissions, dontAsk.\n",
                 .{loaded_cfg.config.approval_mode},
             ),
             error.InvalidProvider => try stderr.print(
@@ -768,6 +989,80 @@ pub fn main(init: std.process.Init) !void {
         }
         std.process.exit(2);
     };
+
+    // wp4-cli-flags: copy every CLI-flag-carrier value into its matching new
+    // Config field (see core/config.zig's field docs). These flags' actual
+    // BEHAVIOR is owned by other parity packages (permissions/sessions/sdk);
+    // this package's contract is only that the flag parses and the value
+    // reaches `cfg` unmutated for that package to consume.
+    try applyCliFlagCarrierFields(allocator, &loaded_cfg.config, &opts);
+    // cli-flags-missed-115: `applyCliFlagCarrierFields` above OR's the CLI
+    // flag INTO `cfg.verbose` (config -> cfg is a one-way carry by design),
+    // but every actual verbosity gate in the codebase reads `opts.verbose`
+    // directly, not `cfg.verbose` -- so a `verbose = true` config.toml
+    // default with no `--verbose` flag on the command line previously had
+    // zero effect anywhere. Carry the merged value back so `--verbose`
+    // genuinely "overrides" (i.e. is layered over) the config default, per
+    // the reference's own help text for this flag.
+    opts.verbose = loaded_cfg.config.verbose;
+
+    // cli-flags-21/22/23: session-scoped overrides that are fully owned by
+    // this package (they layer on top of already-implemented engines --
+    // fallback_model/effort_level/autocompact_threshold -- without touching
+    // config.toml).
+    if (opts.effort) |lvl| {
+        // Already validated/normalized ("xhigh"->"max") at parse time.
+        try loaded_cfg.config.setOwnedString(allocator, &loaded_cfg.config.reasoning_effort, lvl);
+    }
+    if (opts.autocompact) |raw| {
+        applyAutocompactOverride(raw) catch {
+            try std_io.stderrWriter().print(
+                "error: invalid --autocompact '{s}'. Expected \"auto\" or a token count like 200000 or 200k (100k-1M).\n",
+                .{raw},
+            );
+            std.process.exit(2);
+        };
+    }
+    if (opts.agents_json) |raw| {
+        // cli-flags-05: reuse the "spawner sets env, reader reads it"
+        // pattern -- core/agents.zig's list()/findByName() pick this up
+        // via ENV_CLI_AGENTS_JSON with no signature changes at any call
+        // site. Already validated as well-formed JSON at parse time.
+        try @import("core/env.zig").setOverride(@import("core/agents.zig").ENV_CLI_AGENTS_JSON, raw);
+    }
+    if (opts.betas) |raw| {
+        // cli-flags-19: reuse the existing ZCODE_ANTHROPIC_BETA passthrough
+        // (providers/anthropic.zig's buildAnthropicBetaValue already reads
+        // it and appends it to every Anthropic request's anthropic-beta
+        // header) instead of adding a parallel header-injection path.
+        try @import("core/env.zig").setOverride("ZCODE_ANTHROPIC_BETA", raw);
+    }
+    if (opts.fallback_model) |raw| {
+        if (!opts.print) {
+            try std_io.stderrWriter().writeAll("error: --fallback-model only works with --print.\n");
+            std.process.exit(2);
+        }
+        // Claude accepts a comma-separated chain and retries each in order;
+        // zcode's fallback_model field is a single model name today, so the
+        // first entry drives the existing single-hop fallback (documented
+        // narrowing -- a full chain is a follow-on for whichever package
+        // extends agent_runtime.zig's retry loop).
+        var it = std.mem.splitScalar(u8, raw, ',');
+        if (it.next()) |first| {
+            const trimmed = std.mem.trim(u8, first, " \t");
+            if (trimmed.len > 0) {
+                try loaded_cfg.config.setOwnedString(allocator, &loaded_cfg.config.fallback_model, trimmed);
+            }
+        }
+    }
+    if (opts.await_initialize and !(opts.input_format != null and std.mem.eql(u8, opts.input_format.?, "stream-json"))) {
+        try std_io.stderrWriter().writeAll("error: --await-initialize requires --input-format=stream-json.\n");
+        std.process.exit(2);
+    }
+    if (opts.no_session_persistence and !opts.print) {
+        try std_io.stderrWriter().writeAll("error: --no-session-persistence only works with --print.\n");
+        std.process.exit(2);
+    }
 
     // settings-03: before applying managed-file keys for real, gate any
     // dangerous ones (command-helper keys, non-safe env vars, a [hooks]
@@ -861,16 +1156,45 @@ pub fn main(init: std.process.Init) !void {
 
     var mcp = try mcp_client.Client.init(allocator, loaded_cfg.paths.mcp_registry_path);
     defer mcp.deinit();
+
+    // cli-flags-06: --mcp-config/--strict-mcp-config install CLI-supplied,
+    // this-process-only MCP servers before scoped config is enabled, so both
+    // `mcp list` and every tool call see them. `loadCliMcpConfig` takes
+    // ownership; `setCliMcpConfig` hands that ownership to `mcp`, which
+    // consumes it the first time it loads scoped config (or frees it in
+    // `mcp.deinit()` if that never happens, e.g. `mcp add`/`mcp remove`
+    // subcommands that never touch scoped config at all).
+    if (opts.mcp_config.len > 0 or opts.strict_mcp_config) {
+        var cli_servers: []mcp_config.ServerConfig = &.{};
+        if (opts.mcp_config.len > 0) {
+            cli_servers = loadCliMcpConfig(allocator, opts.mcp_config) catch |err| blk: {
+                std.log.warn("--mcp-config: failed to load one or more entries ({s})", .{@errorName(err)});
+                break :blk &.{};
+            };
+        }
+        mcp.setCliMcpConfig(cli_servers, opts.strict_mcp_config);
+    }
+
     // Enable structured scoped-config loading so servers declared in a project
     // `.mcp.json` (with command/args/env or url/headers/headersHelper) actually
     // drive live connections, merged with the legacy `mcp add` registry. Unit
     // tests never call this, so they stay hermetic.
-    mcp.enableScopedConfig();
+    //
+    // cli-flags-12: --safe-mode disables MCP servers for this run -- skip
+    // enabling scoped config entirely, so `.mcp.json`/`~/.claude.json`/
+    // enterprise-managed/plugin-contributed servers never load. (The
+    // legacy `zcode mcp add` registry is a narrower, disclosed exception:
+    // its entries are consulted by a few call sites outside the scoped-config
+    // path and are not suppressed here.)
+    if (!loaded_cfg.config.safe_mode) mcp.enableScopedConfig();
 
     // Chrome browser bridge (WebSocket server for lchrome extension)
     var browser_bridge = browser_bridge_mod.BrowserBridge.init(allocator, loaded_cfg.config.browser_bridge_port);
     var browser_bridge_started = false;
-    if (loaded_cfg.config.browser_bridge_enabled) {
+    // cli-flags-20: --chrome/--no-chrome override browser_bridge_enabled for
+    // this process only.
+    const chrome_enabled = opts.chrome orelse loaded_cfg.config.browser_bridge_enabled;
+    if (chrome_enabled) {
         browser_bridge.start() catch |err| {
             std.log.warn("Chrome bridge: failed to start: {s}", .{@errorName(err)});
         };
@@ -923,7 +1247,11 @@ fn dispatch(
     allocator: std.mem.Allocator,
     opts: *cli.CliOptions,
     cwd: []const u8,
-    cfg: *const config_mod.Config,
+    // headless-sdk-missed-183: widened from `*const` to `*` (the caller's
+    // `&loaded_cfg.config` was always a mutable pointer to begin with) so
+    // runHeadlessDispatch can hand a genuinely mutable Config to
+    // sdk_headless.RunContext -- see that struct field's doc comment.
+    cfg: *config_mod.Config,
     policy: *policy_mod.Policy,
     audit: *logger_mod.AuditLogger,
     store: *session_store.Store,
@@ -940,7 +1268,7 @@ fn dispatch(
     // anything else the flag is a no-op. The child re-invokes zcode without
     // `--bg`, self-registers with kind=bg, and captures its output to a log.
     if (opts.bg and (opts.command == .repl or opts.command == .run or opts.command == .exec)) {
-        try bg_cmds.spawnBackground(allocator, rt.argv, cwd, stdout);
+        try bg_cmds.spawnBackground(allocator, rt.argv, cwd, stdout, null);
         return;
     }
 
@@ -964,29 +1292,21 @@ fn dispatch(
             };
             const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, run_prompt, false, auto_approve_high, opts.strict, yolo_mode, opts.agent);
             defer allocator.free(one_shot.body);
+            defer allocator.free(one_shot.session_id);
+            // headless-sdk-02: `--no-session-persistence` used to be a silent
+            // no-op here -- this LEGACY plain-text `--print` path (no
+            // --output-format json|stream-json) never routed through
+            // sdk_headless.runOutput/removeSessionFile at all, so a session
+            // file (and its `.origin` sidecar) was always left behind despite
+            // the flag. Clean up the same way the SDK-transport path does.
+            if (opts.no_session_persistence) sdk_headless.removeSessionArtifacts(allocator, store, one_shot.session_id);
             // Clean tool-call envelopes out of the one-shot body so
             // `zcode run "..."` matches the REPL's rendering discipline
             // (pass 12). Leaves ordinary prose intact; returns empty
             // when the model emitted only protocol bytes, which we
             // surface as "(no narration)" so the user gets a signal
             // the turn completed but had nothing text-worthy to say.
-            const assistant_render = @import("core/assistant_render.zig");
-            const cleaned = try assistant_render.cleanAssistantText(allocator, one_shot.body);
-            defer allocator.free(cleaned);
-            const rendered = if (cleaned.len == 0) "(no narration; see tool output above)" else cleaned;
-            const repl_markdown = @import("cli/repl_markdown.zig");
-            if (std.c.isatty(std.Io.File.stdout().handle) != 0) {
-                try repl_markdown.writeStyledText(stdout, rendered, .{
-                    .color_enabled = true,
-                    .highlight_code_blocks = true,
-                    .highlight_links = true,
-                    .highlight_paths = true,
-                    .color_lists = true,
-                });
-            } else {
-                try stdout.writeAll(rendered);
-            }
-            if (!std.mem.endsWith(u8, rendered, "\n")) try stdout.writeByte('\n');
+            try renderOneShotText(allocator, stdout, one_shot.body);
             if (one_shot.strict_violation) {
                 const stderr = std_io.stderrWriter();
                 try stderr.writeAll(
@@ -1010,6 +1330,9 @@ fn dispatch(
             };
             const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, exec_prompt, true, auto_approve_high, opts.strict, yolo_mode, opts.agent);
             defer allocator.free(one_shot.body);
+            defer allocator.free(one_shot.session_id);
+            // headless-sdk-02: see the identical comment in the .run branch above.
+            if (opts.no_session_persistence) sdk_headless.removeSessionArtifacts(allocator, store, one_shot.session_id);
             try stdout.writeAll(one_shot.body);
             if (!std.mem.endsWith(u8, one_shot.body, "\n")) try stdout.writeByte('\n');
             if (one_shot.strict_violation) {
@@ -1278,14 +1601,101 @@ fn dispatch(
             }
             break :blk;
         },
-        .session_list => try session_mgmt.cmdSessionList(allocator, store, stdout),
-        .session_resume => session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent) catch |err| switch (err) {
-            // session_cmds printed the targeted message already; exit
-            // 2 cleanly without the Zig error trace.
-            error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
-            else => return err,
+        .session_list => try session_mgmt.cmdSessionList(allocator, store, cwd, opts.all_projects, stdout),
+        .session_resume => blk: {
+            // commands-12: a `/background`/`/bg` (or bare `--bg`) spawner sets
+            // ZCODE_SESSION_KIND=bg in this child's env before re-invoking it
+            // as `--resume <id>`. That child's stdin is `.ignore`'d (there is
+            // no terminal to read from anymore), so it must never enter the
+            // ordinary interactive resume path -- `cmdSessionResume` blocks
+            // reading stdin the instant there is no queued input, which
+            // crashes with EndOfStream. Route it to the headless variant
+            // instead: answer the queued `ZCODE_BG_INITIAL_PROMPT` (if any)
+            // and idle, never touching stdin.
+            const session_kind_mod = @import("core/session_registry.zig");
+            if (opts.subject != null and session_kind_mod.SessionKind.fromEnv(allocator) == .bg) {
+                const env_mod2 = @import("core/env.zig");
+                const queued = env_mod2.getOwned(allocator, "ZCODE_BG_INITIAL_PROMPT") catch null;
+                defer if (queued) |q| allocator.free(q);
+                try session_mgmt.resumeSessionHeadless(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject.?, queued, auto_approve_high, opts.strict, yolo_mode, opts.agent);
+                break :blk;
+            }
+
+            // sessions-storage-12: `--resume <id> [--fork-session] --print
+            // [prompt]` used to fall through to `cmdSessionResume` below
+            // unconditionally, which always ends by opening the interactive
+            // REPL (`resumeSessionInteractive`) -- wrong for a `--print`
+            // caller with no attached terminal, and it silently dropped the
+            // queued prompt entirely (args.zig never captured it for
+            // `.session_resume`). Answer it headlessly instead, exactly the
+            // way a brand-new `--print "<prompt>"` run does.
+            if (opts.print) {
+                const subject = opts.subject orelse {
+                    try std_io.stderrWriter().writeAll("error: --resume requires a session id when used with --print.\n");
+                    std.process.exit(2);
+                };
+                const prompt = opts.prompt orelse {
+                    try std_io.stderrWriter().writeAll(
+                        "error: --print without a prompt requires --input-format stream-json (the prompt arrives over stdin).\n",
+                    );
+                    std.process.exit(2);
+                };
+                store.active_cwd = cwd;
+                const session_id = session_mgmt.session_cmds.resolveResumeSubject(allocator, store, opts.all_projects, subject) catch |err| switch (err) {
+                    error.SessionNotFound => std.process.exit(2),
+                    else => return err,
+                };
+                defer allocator.free(session_id);
+                try runResumeOrContinuePrint(allocator, opts, cwd, cfg, policy, audit, store, mcp, browser, session_id, prompt, auto_approve_high, yolo_mode, stdout);
+                break :blk;
+            }
+
+            session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.subject, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session) catch |err| switch (err) {
+                // session_cmds printed the targeted message already; exit
+                // 2 cleanly without the Zig error trace.
+                error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
+                else => return err,
+            };
         },
-        .session_continue => try session_mgmt.cmdSessionContinue(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.prompt, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent),
+        .session_continue => blk: {
+            // sessions-storage-12: same headless-vs-interactive split as
+            // `.session_resume` above, for `--continue --print [prompt]`.
+            if (opts.print) {
+                store.active_cwd = cwd;
+                const maybe_id = try session_mgmt.session_cmds.resolveContinueTarget(allocator, store, opts.all_projects);
+                if (maybe_id) |session_id| {
+                    defer allocator.free(session_id);
+                    const prompt = opts.prompt orelse {
+                        try std_io.stderrWriter().writeAll(
+                            "error: --print without a prompt requires --input-format stream-json (the prompt arrives over stdin).\n",
+                        );
+                        std.process.exit(2);
+                    };
+                    try runResumeOrContinuePrint(allocator, opts, cwd, cfg, policy, audit, store, mcp, browser, session_id, prompt, auto_approve_high, yolo_mode, stdout);
+                    break :blk;
+                }
+                // No previous session: matches the interactive
+                // cmdSessionContinue's own "no previous sessions, starting
+                // new session" fallback, except this stays headless -- the
+                // interactive REPL would block forever reading stdin for a
+                // --print caller.
+                try stdout.writeAll("no previous sessions, starting new session\n");
+                if (try runHeadlessDispatch(allocator, opts, cwd, cfg, policy, audit, store, mcp, browser, auto_approve_high, yolo_mode)) break :blk;
+                const prompt = opts.prompt orelse {
+                    try std_io.stderrWriter().writeAll(
+                        "error: --print without a prompt requires --input-format stream-json (the prompt arrives over stdin).\n",
+                    );
+                    std.process.exit(2);
+                };
+                const one_shot = try session_mgmt.runOneShot(allocator, cwd, cfg, policy, audit, store, mcp, browser, prompt, false, auto_approve_high, opts.strict, yolo_mode, opts.agent);
+                defer allocator.free(one_shot.body);
+                defer allocator.free(one_shot.session_id);
+                if (opts.no_session_persistence) sdk_headless.removeSessionArtifacts(allocator, store, one_shot.session_id);
+                try renderOneShotText(allocator, stdout, one_shot.body);
+                break :blk;
+            }
+            try session_mgmt.cmdSessionContinue(allocator, cwd, cfg, policy, audit, store, mcp, browser, opts.prompt, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, opts.fork_session);
+        },
         .session_compact => session_mgmt.cmdSessionCompact(allocator, cfg, store, opts.subject, stdout) catch |err| switch (err) {
             error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
             else => return err,
@@ -1402,7 +1812,36 @@ fn dispatch(
         },
         // phase-26 daemon-background-01/09/10: the detached-session surface.
         .ps => try bg_cmds.cmdPs(allocator, stdout),
+        // cli-flags-27: kill/stop keep the registry entry (marking it
+        // .stopped) so `attach` can reopen the conversation; `rm` is the
+        // destructive delete kill used to perform unconditionally.
         .kill => try bg_cmds.cmdKill(allocator, opts.subject orelse return error.MissingToolArg, stdout),
+        .rm => try bg_cmds.cmdRm(allocator, opts.subject orelse return error.MissingToolArg, stdout),
+        .attach => {
+            const subject = opts.subject orelse return error.MissingToolArg;
+            const session_id = bg_cmds.resolveAttachSessionId(allocator, subject) catch |err| switch (err) {
+                error.NoSessionId => {
+                    try stdout.print("session {s} has no recorded session_id; cannot attach.\n", .{subject});
+                    std.process.exit(1);
+                },
+                else => return err,
+            };
+            const sid = session_id orelse {
+                try stdout.print("no such session: {s}\n", .{subject});
+                std.process.exit(1);
+            };
+            defer allocator.free(sid);
+            // Reuse the exact interactive-resume path `--resume`/`session
+            // resume` already implements, just with the id resolved from
+            // the background-session registry instead of typed by hand.
+            // `attach` reconnects to an already-registered background
+            // session by its known id -- never forks it (that would attach
+            // to a copy the background process never actually ran).
+            session_mgmt.cmdSessionResume(allocator, cwd, cfg, policy, audit, store, mcp, browser, sid, stdout, auto_approve_high, opts.strict, yolo_mode, opts.agent, opts.all_projects, false) catch |err| switch (err) {
+                error.SessionNotFound, error.InvalidSessionId => std.process.exit(2),
+                else => return err,
+            };
+        },
         .logs => try bg_cmds.cmdLogs(allocator, opts.subject orelse return error.MissingToolArg, stdout),
         .mcp_list => session_mgmt.cmdMcpList(allocator, mcp, stdout) catch |err| switch (err) {
             error.InvalidMcpRegistry => std.process.exit(1),
@@ -1499,6 +1938,15 @@ fn dispatch(
             const ok = try enterprise_doctor.run(allocator, cwd, cfg, opts.json, stdout);
             if (!ok) std.process.exit(1);
         },
+        // cli-flags-28: bare `zcode doctor` is a general installation health
+        // check, distinct from the managed-policy-specific `doctor
+        // enterprise`.
+        .doctor_general => {
+            const ok = try enterprise_doctor.runGeneral(allocator, cwd, cfg, opts.json, stdout);
+            if (!ok) std.process.exit(1);
+        },
+        .project_purge => try project_purge.run(allocator, cwd, opts.subject, opts.dry_run, opts.yolo, stdout),
+        .respawn => try bg_cmds.cmdRespawn(allocator, opts.subject, opts.respawn_all, stdout),
         .benchmark_run => try session_mgmt.cmdBenchmarkRun(allocator, cwd, cfg, policy, stdout),
         .api_schema => try api_server.cmdApiSchema(stdout),
         .api_serve => try api_server.cmdApiServe(allocator, cwd, cfg, policy, audit, store, mcp, browser, stdout),
@@ -1523,7 +1971,25 @@ fn dispatch(
             error.UsageErrorReported => std.process.exit(2),
             else => return err,
         },
-        .update => try update.cmdUpdateWithConfig(allocator, cfg, stdout),
+        .update => {
+            // cli-flags-30: `zcode install <target>` with a concrete
+            // pinned-version target (not "stable"/"latest"/absent) has no
+            // support in the self-updater yet -- report that plainly
+            // rather than silently installing latest under a different
+            // name than the one requested.
+            if (opts.install_requested) {
+                if (opts.subject) |target| {
+                    if (!std.mem.eql(u8, target, "stable") and !std.mem.eql(u8, target, "latest")) {
+                        try stdout.print(
+                            "zcode install: pinned-version installs ('{s}') are not yet supported.\n  - Run `zcode update` (or `zcode install latest`) for the latest version.\n",
+                            .{target},
+                        );
+                        return;
+                    }
+                }
+            }
+            try update.cmdUpdateWithConfig(allocator, cfg, stdout);
+        },
         .help => try cli.printUsage(stdout),
         .list_env => {
             // Already handled in main() before dispatch; reach this
@@ -1560,7 +2026,104 @@ fn dispatch(
             defer allocator.free(script);
             try stdout.writeAll(script);
         },
+        // cli-flags-29: `zcode import [codex|gemini] [--dry-run] [--yes]`.
+        // `--dry-run`/`--yes` were already parsed generically above (into
+        // opts.dry_run/opts.yolo); forward them plus the source name (if
+        // any) into the thin argv-shaped entry point import_agent_config.zig
+        // already exposes.
+        .import_agent_config => {
+            const import_agent_config = @import("core/import_agent_config.zig");
+            var forwarded: std.array_list.Managed([]const u8) = .init(allocator);
+            defer forwarded.deinit();
+            if (opts.subject) |s| try forwarded.append(s);
+            if (opts.dry_run) try forwarded.append("--dry-run");
+            if (opts.yolo) try forwarded.append("--yes");
+            const code = try import_agent_config.runImportSubcommand(allocator, cwd, forwarded.items);
+            if (code != 0) std.process.exit(code);
+        },
     }
+}
+
+/// Render a one-shot assistant reply the same way the legacy plain-text
+/// `--print`/`run` path always has: strip tool-call envelopes down to
+/// narration (surfacing "(no narration; see tool output above)" when there
+/// is none), then markdown-style it on a tty or write it plain otherwise.
+/// Shared by `.run`'s legacy branch and the `--resume`/`--continue --print`
+/// headless paths (sessions-storage-12) so all three render identically.
+fn renderOneShotText(allocator: std.mem.Allocator, stdout: anytype, body: []const u8) !void {
+    const assistant_render = @import("core/assistant_render.zig");
+    const cleaned = try assistant_render.cleanAssistantText(allocator, body);
+    defer allocator.free(cleaned);
+    const rendered = if (cleaned.len == 0) "(no narration; see tool output above)" else cleaned;
+    const repl_markdown = @import("cli/repl_markdown.zig");
+    if (std.c.isatty(std.Io.File.stdout().handle) != 0) {
+        try repl_markdown.writeStyledText(stdout, rendered, .{
+            .color_enabled = true,
+            .highlight_code_blocks = true,
+            .highlight_links = true,
+            .highlight_paths = true,
+            .color_lists = true,
+        });
+    } else {
+        try stdout.writeAll(rendered);
+    }
+    if (!std.mem.endsWith(u8, rendered, "\n")) try stdout.writeByte('\n');
+}
+
+/// sessions-storage-12: answer `prompt` against an already-resolved
+/// `session_id` in one headless shot (applying `--fork-session` first via
+/// `session_cmds.runResumePrint`) and render the result -- `--output-format
+/// json` as a single SDK `result` object (matching a brand-new `--print
+/// --output-format json` run), anything else as plain/markdown text
+/// (matching a brand-new plain `--print` run). `--output-format
+/// stream-json` and `--input-format stream-json` are not supported on the
+/// resume/continue path yet (building the full `system:init` line needs the
+/// same tool/MCP enumeration `sdk_headless.runTurn` does for a fresh
+/// session; left to a follow-on) and report a clear error instead of
+/// emitting the wrong shape.
+fn runResumeOrContinuePrint(
+    allocator: std.mem.Allocator,
+    opts: *cli.CliOptions,
+    cwd: []const u8,
+    cfg: *config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    prompt: []const u8,
+    auto_approve_high: bool,
+    yolo_mode: bool,
+    stdout: anytype,
+) !void {
+    const transport = sdk_headless.resolve(opts.output_format, opts.input_format) catch {
+        std.process.exit(2);
+    };
+    if (transport.output_format == .stream_json or transport.input_format != .text) {
+        try std_io.stderrWriter().writeAll(
+            "error: --resume/--continue --print does not yet support --output-format stream-json or --input-format stream-json.\n",
+        );
+        std.process.exit(2);
+    }
+
+    var result = try session_mgmt.session_cmds.runResumePrint(allocator, cwd, cfg, policy, audit, store, mcp, browser, session_id, prompt, auto_approve_high, opts.strict, yolo_mode, opts.fork_session, stdout);
+    defer session_mgmt.freeHeadlessResult(allocator, &result);
+
+    if (opts.no_session_persistence) sdk_headless.removeSessionArtifacts(allocator, store, result.session_id);
+
+    if (transport.output_format == .json) {
+        const uuid_mod = @import("core/uuid.zig");
+        result.uuid = try uuid_mod.allocV4(allocator);
+        defer allocator.free(result.uuid);
+        const line = try sdk_output.serializeResult(allocator, result, &.{});
+        defer allocator.free(line);
+        try stdout.writeAll(line);
+        if (!std.mem.endsWith(u8, line, "\n")) try stdout.writeByte('\n');
+        return;
+    }
+
+    try renderOneShotText(allocator, stdout, result.result_text);
 }
 
 /// sdk-headless LIVE wiring entry. Routes a `.run`/`.exec` invocation into the
@@ -1580,7 +2143,7 @@ fn runHeadlessDispatch(
     allocator: std.mem.Allocator,
     opts: *cli.CliOptions,
     cwd: []const u8,
-    cfg: *const config_mod.Config,
+    cfg: *config_mod.Config,
     policy: *policy_mod.Policy,
     audit: *logger_mod.AuditLogger,
     store: *session_store.Store,
@@ -1598,6 +2161,23 @@ fn runHeadlessDispatch(
     // stream-json output requires --verbose (matches the reference). The gate
     // prints its own usage line; exit non-zero on failure.
     sdk_output.validateVerboseGate(transport.output_format, opts.verbose) catch {
+        std.process.exit(2);
+    };
+
+    // headless-sdk-14: --forward-subagent-text requires --print and
+    // --output-format=stream-json, matching the reference's own gate.
+    // zcode's `run`/`exec` subcommands are documented print-equivalent
+    // headless entry points (they set opts.headless the same way --print
+    // does -- see this function's own doc comment), so either satisfies the
+    // "requires --print" half of the gate.
+    sdk_output.validateForwardSubagentTextGate(opts.print or opts.headless, transport.output_format, opts.forward_subagent_text) catch {
+        std.process.exit(2);
+    };
+
+    // headless-sdk-15: --prompt-suggestions requires --print and
+    // --output-format=stream-json, matching the reference's own gate. Same
+    // print-equivalence reasoning as --forward-subagent-text above.
+    sdk_output.validatePromptSuggestionsGate(opts.print or opts.headless, transport.output_format, opts.prompt_suggestions) catch {
         std.process.exit(2);
     };
 
@@ -1619,6 +2199,11 @@ fn runHeadlessDispatch(
             .max_budget_usd = opts.max_budget_usd,
             .json_schema = opts.json_schema,
             .max_thinking_tokens = opts.max_thinking_tokens,
+            .session_id_override = opts.session_id_override,
+            .no_session_persistence = opts.no_session_persistence,
+            .forward_subagent_text = opts.forward_subagent_text,
+            .prompt_suggestions = opts.prompt_suggestions,
+            .enable_auth_status = opts.enable_auth_status,
         },
     };
 

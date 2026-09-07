@@ -23,9 +23,13 @@ const map = [_]Pair{
     .{ .spelling = "/reload_plugins", .canonical = "/reload-plugins" },
     .{ .spelling = "/reload", .canonical = "/reload-plugins" },
     .{ .spelling = "/autofix_pr", .canonical = "/autofix-pr" },
-    .{ .spelling = "/terminal-setup", .canonical = "/terminalSetup" },
-    .{ .spelling = "/terminal_setup", .canonical = "/terminalSetup" },
-    .{ .spelling = "/terminalsetup", .canonical = "/terminalSetup" },
+    // commands-05: the reference command is "/terminal-setup" (bundle:
+    // name:"terminal-setup"; "/terminalSetup" has zero hits anywhere in the
+    // 2.1.261 bundle). zcode's own spellings all canonicalize TO the
+    // hyphenated reference form, not the other way around.
+    .{ .spelling = "/terminalSetup", .canonical = "/terminal-setup" },
+    .{ .spelling = "/terminal_setup", .canonical = "/terminal-setup" },
+    .{ .spelling = "/terminalsetup", .canonical = "/terminal-setup" },
     .{ .spelling = "/pr-comments", .canonical = "/pr_comments" },
     .{ .spelling = "/releasenotes", .canonical = "/release-notes" },
 };
@@ -37,9 +41,14 @@ const map = [_]Pair{
 const dispatch_fallback = [_]Pair{
     .{ .spelling = "/output-style", .canonical = "/style" },
     .{ .spelling = "/terminalSetup", .canonical = "/terminal-setup" },
-    // commands-sweep-02: reference `/branch` carries alias `['fork']`. zcode's
-    // dispatcher matches `/branch`, so resolve the reference `/fork` spelling to it.
-    .{ .spelling = "/fork", .canonical = "/branch" },
+    // sessions-storage-09: 2.1.261 ships `/fork` and `/branch` as two
+    // DISTINCT top-level commands with different descriptions ("Copy this
+    // conversation into a new background session and keep working here" vs
+    // "Create a branch of the current conversation at this point") -- unlike
+    // the older edualc snapshot this codebase was originally checked
+    // against, `/branch` does NOT carry a `/fork` alias in the current
+    // reference. zcode's dispatcher (repl_commands.zig) now has its own
+    // `/fork` arm, so `/fork` must NOT be redirected to `/branch` here.
     // commands-sweep-04: reference `/resume` carries alias `['continue']`. zcode's
     // dispatcher matches `/resume`, so resolve the reference `/continue` spelling
     // to it (handles `/continue <id>` and `/continue list`; the bare-`/continue`
@@ -77,7 +86,12 @@ test "hyphen/underscore/spelling variants reconcile to the reference name" {
     try testing.expectEqualStrings("/output-style", toCanonical("/styles"));
     try testing.expectEqualStrings("/reload-plugins", toCanonical("/reload_plugins"));
     try testing.expectEqualStrings("/autofix-pr", toCanonical("/autofix_pr"));
-    try testing.expectEqualStrings("/terminalSetup", toCanonical("/terminal-setup"));
+    // commands-05: "/terminal-setup" IS the reference spelling (bundle has
+    // name:"terminal-setup"; "/terminalSetup" has zero hits), so the other
+    // three zcode spellings canonicalize TO it, not the other way around.
+    try testing.expectEqualStrings("/terminal-setup", toCanonical("/terminalSetup"));
+    try testing.expectEqualStrings("/terminal-setup", toCanonical("/terminal_setup"));
+    try testing.expectEqualStrings("/terminal-setup", toCanonical("/terminalsetup"));
     try testing.expectEqualStrings("/pr_comments", toCanonical("/pr-comments"));
     try testing.expectEqualStrings("/release-notes", toCanonical("/releasenotes"));
 }
@@ -90,6 +104,8 @@ test "already-canonical and unknown commands pass through" {
     try testing.expectEqualStrings("/ctx_viz", toCanonical("/ctx_viz"));
     try testing.expectEqualStrings("/model", toCanonical("/model"));
     try testing.expectEqualStrings("/commit", toCanonical("/commit"));
+    // commands-05: the reference spelling itself is already canonical.
+    try testing.expectEqualStrings("/terminal-setup", toCanonical("/terminal-setup"));
 }
 
 test "toDispatch resolves reference-only spellings to an accepted form" {
@@ -103,10 +119,12 @@ test "toDispatch leaves already-accepted spellings unchanged" {
     try testing.expectEqualStrings("/model", toDispatch("/model"));
 }
 
-test "toDispatch resolves the reference /fork alias to /branch" {
-    try testing.expectEqualStrings("/branch", toDispatch("/fork"));
-    try testing.expectEqualStrings("/branch", toDispatch("/FORK"));
-    // /branch itself is the accepted form and passes through unchanged.
+test "sessions-storage-09: /fork is its own command, no longer redirected to /branch" {
+    // 2.1.261 ships /fork and /branch as distinct commands with distinct
+    // semantics (copy-to-background vs switch-current-session), so toDispatch
+    // must leave /fork exactly as typed for the dispatcher's own /fork arm.
+    try testing.expectEqualStrings("/fork", toDispatch("/fork"));
+    try testing.expectEqualStrings("/FORK", toDispatch("/FORK"));
     try testing.expectEqualStrings("/branch", toDispatch("/branch"));
 }
 

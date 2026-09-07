@@ -7,8 +7,8 @@ parity, not aspiration.
 """
 import os, re, glob
 
-CC = "/Users/example/Downloads/claude-code-main"
-ZC = "/Users/example/Projects/zig-code"
+CC = os.environ.get("ZCODE_CC_REF", os.path.expanduser("~/projects/experiments/edualc"))
+ZC = os.environ.get("ZCODE_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 cc_tools = set(d[:-4] for d in os.listdir(f"{CC}/src/tools") if d.endswith("Tool"))
 
@@ -33,10 +33,10 @@ with open(f"{ZC}/src/tools/tool_schemas.zig") as f:
         zc_names.add(m)
 
 aliases = {
-    "FileRead": "file_read", "FileWrite": "file_write", "FileEdit": "file_edit",
-    "Agent": "AgentRun", "MCP": "mcp_invoke",
-    "ListMcpResources": "mcp_resources_list", "ReadMcpResource": "mcp_resource_read",
-    "ScheduleCron": "CronCreate",
+    "FileRead": "Read", "FileWrite": "Write", "FileEdit": "Edit",
+    "Agent": "Agent", "MCP": "mcp_invoke",
+    "ListMcpResources": "ListMcpResourcesTool", "ReadMcpResource": "ReadMcpResourceTool",
+    "ScheduleCron": "CronCreate", "Brief": "SendUserMessage",
 }
 
 have, miss = [], []

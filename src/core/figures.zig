@@ -114,6 +114,19 @@ pub const WARNING: []const u8 = "\xe2\x9a\xa0";
 /// centers better in the typical terminal font.
 pub const RECORD: []const u8 = "\xe2\x8f\xba";
 
+/// ⎿ U+23BF SQUARE FOOT -- the reference's flat tool-result connector.
+/// Rendered as "  ⎿  <dim result>" beneath a "⏺ Tool(args)" call line
+/// (repl-ux-02); zcode's card renderer used a bordered rail instead.
+pub const CONNECTOR: []const u8 = "\xe2\x8e\xbf";
+
+/// Tool-call bullet glyph, OS-aware to match the reference exactly
+/// (cc_strings.txt: `Ar=P()==="macos"?"⏺":"●"`): RECORD (⏺) renders
+/// with better vertical centering in macOS's default terminal fonts;
+/// BLACK_CIRCLE (●) is the portable fallback used everywhere else.
+pub fn toolCallGlyph() []const u8 {
+    return if (@import("builtin").os.tag == .macos) RECORD else BLACK_CIRCLE;
+}
+
 /// ⚑ U+2691 BLACK FLAG -- issue flag banner. Claude Code uses
 /// this in the ultrareview status widget to mark a task that a
 /// reviewer flagged for attention.
@@ -186,6 +199,27 @@ pub const BLOCKQUOTE_BAR: []const u8 = "\xe2\x96\x8e";
 /// for section separators that need more visual weight than the
 /// default BOX_H (light horizontal).
 pub const HEAVY_HORIZONTAL: []const u8 = "\xe2\x94\x81";
+
+// ── Condensed startup banner mascot (r3-chrome-01) ─────────────────
+
+/// The three-row block-drawing mascot glyph used by Claude Code
+/// 2.1.261's default ("no release notes, no onboarding") startup
+/// banner -- edualc src/components/LogoV2/CondensedLogo.tsx +
+/// Clawd.tsx, "default" pose, in the reference's original (non
+/// vertically-mirrored) orientation. Each row is right-padded with
+/// spaces to the widest row (9 cells) so the three lines form a
+/// fixed-width column when a caller concatenates them with the
+/// header's info lines (version / model / cwd) at a fixed gap.
+///
+/// Row bytes, left to right:
+///   row 0: ' ' ▐(U+2590) ▛(U+259B) █ █ █ (U+2588 x3) ▜(U+259C) ▌(U+258C) ' '
+///   row 1: ▝(U+259D) ▜(U+259C) █ █ █ █ █ (U+2588 x5) ▛(U+259B) ▘(U+2598)
+///   row 2: ' ' ' ' ▘(U+2598) ▘(U+2598) ' ' ▝(U+259D) ▝(U+259D) ' ' ' '
+pub const CONDENSED_LOGO_ROWS = [3][]const u8{
+    " \xe2\x96\x90\xe2\x96\x9b\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9c\xe2\x96\x8c ",
+    "\xe2\x96\x9d\xe2\x96\x9c\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9b\xe2\x96\x98",
+    "  \xe2\x96\x98\xe2\x96\x98 \xe2\x96\x9d\xe2\x96\x9d  ",
+};
 
 const testing = std.testing;
 
@@ -284,4 +318,23 @@ test "ELLIPSIS matches the truncation marker from pass 74" {
 
 test "BULLET matches the welcome-tip marker" {
     try testing.expectEqualStrings("\xe2\x80\xa2", BULLET);
+}
+
+test "CONDENSED_LOGO_ROWS rows are valid UTF-8 and equal cell width" {
+    for (CONDENSED_LOGO_ROWS) |row| {
+        try testing.expect(std.unicode.utf8ValidateSlice(row));
+    }
+    // Each row is a sequence of 1-cell block-drawing glyphs (no wide
+    // codepoints), so codepoint count doubles as cell width here.
+    var widths: [3]usize = undefined;
+    for (CONDENSED_LOGO_ROWS, 0..) |row, i| {
+        widths[i] = std.unicode.utf8CountCodepoints(row) catch 0;
+    }
+    try testing.expectEqual(widths[0], widths[1]);
+    try testing.expectEqual(widths[1], widths[2]);
+}
+
+test "CONDENSED_LOGO_ROWS middle row is the reference's five-wide filled body" {
+    // "▝▜█████▛▘" -- five FULL BLOCK (U+2588) glyphs form the torso.
+    try testing.expect(std.mem.count(u8, CONDENSED_LOGO_ROWS[1], "\xe2\x96\x88") == 5);
 }

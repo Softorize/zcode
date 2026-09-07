@@ -57,6 +57,9 @@ pub fn modeTitle(mode: permission_decision.Mode) []const u8 {
         .plan => "Plan Mode",
         .bypassPermissions => "Bypass Permissions",
         .dontAsk => "Don't Ask",
+        // hooks-permissions-05: the reference's sixth mode. See
+        // permission_decision.Mode's doc comment for zcode's approximation.
+        .auto => "Auto",
     };
 }
 

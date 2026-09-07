@@ -17,6 +17,7 @@ const security_mod = @import("core/security.zig");
 const agents_mod = @import("core/agents.zig");
 const permission_rules_mod = @import("core/permission_rules.zig");
 const bash_segment_permission = @import("core/bash_segment_permission.zig");
+const command_prefix = @import("core/command_prefix.zig");
 const destructive_warning = @import("core/destructive_warning.zig");
 const path_safety_mod = @import("core/path_safety.zig");
 const arg_parse = @import("tools/arg_parse.zig");
@@ -116,25 +117,25 @@ pub fn effectiveMode(active_agent: ?@import("core/agents.zig").AgentSpec, curren
 // Also reflected as is_read_only=true on ToolSchema for metadata.
 
 pub const read_only_tool_names = [_][]const u8{
-    "file_read",          "Read",              "read",
-    "Glob",               "glob",              "Grep",
-    "grep",               "GitDiff",           "git_diff",
-    "GitLog",             "git_log",           "git_status",
-    "WebFetch",           "web_fetch",         "WebSearch",
-    "web_search",         "JsonQuery",         "json_query",
-    "AskUserQuestion",    "ask_user_question", "HttpRequest",
-    "http_request",       "TaskGet",           "task_get",
-    "TaskPoll",           "task_poll",         "TaskOutput",
-    "task_output",        "TodoRead",          "todo_read",
-    "TodoWrite",          "todo_write",        "ListDir",
-    "list_dir",           "Stat",              "stat",
-    "Sleep",              "sleep",             "mcp_servers_list",
-    "McpServersList",     "mcp_tools_list",    "McpToolsList",
-    "mcp_resources_list", "mcp_resource_read", "mcp_resource_templates_list",
-    "mcp_prompts_list",   "mcp_prompt_get",    "mcp_notifications",
-    "mcp_complete",       "EnterPlanMode",     "ExitPlanMode",
-    "enter_plan_mode",    "exit_plan_mode",    "Skill",
-    "skill",              "Command",           "command",
+    "file_read",         "Read",                        "read",
+    "Glob",              "glob",                        "Grep",
+    "grep",              "GitDiff",                     "git_diff",
+    "GitLog",            "git_log",                     "git_status",
+    "WebFetch",          "web_fetch",                   "WebSearch",
+    "web_search",        "JsonQuery",                   "json_query",
+    "AskUserQuestion",   "ask_user_question",           "HttpRequest",
+    "http_request",      "TaskGet",                     "task_get",
+    "task_poll",         "TaskOutput",                  "task_output",
+    "TodoRead",          "todo_read",                   "TodoWrite",
+    "todo_write",        "ListDir",                     "list_dir",
+    "Stat",              "stat",                        "Sleep",
+    "sleep",             "mcp_servers_list",            "McpServersList",
+    "mcp_tools_list",    "McpToolsList",                "mcp_resources_list",
+    "mcp_resource_read", "mcp_resource_templates_list", "mcp_prompts_list",
+    "mcp_prompt_get",    "mcp_notifications",           "mcp_complete",
+    "EnterPlanMode",     "ExitPlanMode",                "enter_plan_mode",
+    "exit_plan_mode",    "Skill",                       "skill",
+    "Command",           "command",
 };
 
 pub fn isReadOnlyTool(name: []const u8) bool {
@@ -149,21 +150,20 @@ pub fn isReadOnlyTool(name: []const u8) bool {
 /// these tools is not making user-visible progress.
 pub fn isInspectionOnlyTool(name: []const u8) bool {
     return matchesToolName(name, &.{
-        "file_read",          "Read",              "read",
-        "Glob",               "glob",              "Grep",
-        "grep",               "GitDiff",           "git_diff",
-        "GitLog",             "git_log",           "git_status",
-        "WebFetch",           "web_fetch",         "WebSearch",
-        "web_search",         "JsonQuery",         "json_query",
-        "HttpRequest",        "http_request",      "TaskGet",
-        "task_get",           "TaskPoll",          "task_poll",
-        "TaskOutput",         "task_output",       "TodoRead",
-        "todo_read",          "ListDir",           "list_dir",
-        "Stat",               "stat",              "mcp_servers_list",
-        "McpServersList",     "mcp_tools_list",    "McpToolsList",
-        "mcp_resources_list", "mcp_resource_read", "mcp_resource_templates_list",
-        "mcp_prompts_list",   "mcp_prompt_get",    "mcp_notifications",
-        "mcp_complete",
+        "file_read",         "Read",                        "read",
+        "Glob",              "glob",                        "Grep",
+        "grep",              "GitDiff",                     "git_diff",
+        "GitLog",            "git_log",                     "git_status",
+        "WebFetch",          "web_fetch",                   "WebSearch",
+        "web_search",        "JsonQuery",                   "json_query",
+        "HttpRequest",       "http_request",                "TaskGet",
+        "task_get",          "task_poll",                   "TaskOutput",
+        "task_output",       "TodoRead",                    "todo_read",
+        "ListDir",           "list_dir",                    "Stat",
+        "stat",              "mcp_servers_list",            "McpServersList",
+        "mcp_tools_list",    "McpToolsList",                "mcp_resources_list",
+        "mcp_resource_read", "mcp_resource_templates_list", "mcp_prompts_list",
+        "mcp_prompt_get",    "mcp_notifications",           "mcp_complete",
     });
 }
 
@@ -195,6 +195,21 @@ pub fn canonicalToolNameForArgs(name: []const u8, args: []const u8) []const u8 {
         if (hasAnyArg(args, &.{ "find", "replace", "old_string", "new_string", "edits" })) return "Edit";
         if (hasAnyArg(args, &.{"content"})) return "Write";
         if (hasAnyArg(args, &.{ "path", "file_path" })) return "Edit";
+    }
+
+    // tools-01: the reference's LEGACY_TOOL_NAME_ALIASES table maps the
+    // deprecated model-facing name "Task" onto the Agent/subagent-launcher
+    // tool, NOT onto zcode's own unrelated "Task" CRUD tool (create/get/
+    // update/list/stop/output/run/poll/claim task tracking). Per package
+    // notes (do not rename zcode's CRUD Task tool -- too disruptive, and no
+    // live permission-rule bug depends on it, see tools-01 corrected_change):
+    // a "Task" call is routed to Agent only when its arguments are
+    // Agent-shaped (carries `prompt`, `subagent_type`, or `description`, none
+    // of which the CRUD tool's own schema declares); a plain CRUD-shaped call
+    // (action=create/get/update/..., or the legacy `id`/`title` fields)
+    // keeps going to the CRUD handler exactly as before.
+    if (matchesToolName(name, &.{ "Task", "task" })) {
+        if (hasAnyArg(args, &.{ "prompt", "subagent_type", "description" })) return "Agent";
     }
 
     return name;
@@ -412,7 +427,13 @@ pub fn isAskUserQuestionTool(name: []const u8) bool {
 }
 
 pub fn isAgentRunTool(name: []const u8) bool {
-    return std.mem.eql(u8, name, "AgentRun") or std.mem.eql(u8, name, "agent_run");
+    // tools-01 (wp2-tools-surface): the advertised schema name is now
+    // "Agent" (reference-exact), with "AgentRun"/"agent_run" kept as
+    // dispatch-only legacy synonyms -- this gate must recognize all three or
+    // a model calling "Agent" would fall through to tool_dispatch.zig's
+    // handleAgentRun stub (which deliberately errors, since the real
+    // spawn-with-retry logic only runs via this special-cased path).
+    return std.mem.eql(u8, name, "Agent") or std.mem.eql(u8, name, "AgentRun") or std.mem.eql(u8, name, "agent_run");
 }
 
 pub fn isTodoTool(name: []const u8) bool {
@@ -458,6 +479,117 @@ pub fn filterAgentSchemas(allocator: std.mem.Allocator, schemas: []const types.T
     return out.toOwnedSlice();
 }
 
+/// cli-flags-04/missed-113/117: does `cfg` carry any of `--allowedTools`/
+/// `--disallowedTools`/`--tools` restrictions, or is `--brief` NOT set
+/// (which hides `SendUserMessage` by default -- see `isToolBlockedByCliFlags`)?
+/// Callers use this to skip the filter pass entirely (and its extra
+/// allocation) on the rare case none of these apply.
+pub fn hasCliToolFilters(cfg: *const @import("core/config.zig").Config) bool {
+    return cfg.allowed_tools.len > 0 or cfg.disallowed_tools.len > 0 or cfg.tools_flag_set or !cfg.brief;
+}
+
+/// cli-flags-missed-113/117: is `tool_name` the `SendUserMessage` tool (or
+/// its `send_user_message` dispatch synonym, per `tool_dispatch.zig`'s
+/// handler table)? `SendUserMessage` is hidden from the advertised/
+/// dispatchable tool set unless `--brief` was passed, matching Claude's own
+/// "Enable SendUserMessage tool for agent-to-user communication" wording
+/// (default OFF). Distinct from the unrelated, always-available
+/// `AttachContext` file-attachment tool (formerly named `Brief`, which is
+/// where the naming collision this flag's own help text could suggest comes
+/// from).
+fn isSendUserMessageToolName(tool_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(tool_name, "SendUserMessage") or std.ascii.eqlIgnoreCase(tool_name, "send_user_message");
+}
+
+/// cli-flags-04: does `csv` (a comma/space-separated tool-name list, as
+/// carried by `Config.allowed_tools`/`disallowed_tools`/`tools_allowlist`)
+/// name `tool_name`? Matching is a case-insensitive compare of the bare tool
+/// name; an entry written in Claude's `Bash(git *)` pattern form is accepted
+/// but only the part before the first `(` is compared -- argument-scoped
+/// pattern matching is a permission-engine concern, not a schema-visibility
+/// one, so `Bash(git *)` behaves like a plain `Bash` entry here.
+fn toolNameListContains(csv: []const u8, tool_name: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, csv, ", \t\r\n");
+    while (it.next()) |raw| {
+        var entry = raw;
+        if (std.mem.indexOfScalar(u8, entry, '(')) |paren_idx| entry = entry[0..paren_idx];
+        entry = std.mem.trim(u8, entry, " \t");
+        if (entry.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(entry, tool_name)) return true;
+    }
+    return false;
+}
+
+/// cli-flags-04: apply `--allowedTools`/`--disallowedTools`/`--tools` (their
+/// hyphenated reference spellings are folded into the same `Config` fields by
+/// `cli/args.zig`) to the primary session's own advertised/dispatchable tool
+/// schema list, so `zcode --tools "Read,Grep" ...` genuinely exposes only
+/// Read and Grep to the model, and `--disallowedTools Bash` genuinely removes
+/// Bash while leaving everything else intact. Precedence, matching Claude's
+/// own wording for `--tools`: an unset (not-passed) `--tools`, or the literal
+/// value "default", leaves the base tool set unrestricted; `--tools ""`
+/// (flag passed with an empty value) disables every tool; any other
+/// `--tools` value narrows the base set to just those names. `--allowedTools`
+/// then further narrows to its own list, and `--disallowedTools` removes its
+/// names last, so a name in both an allow-list and a deny-list ends up
+/// denied (deny wins, matching Claude's own "subtract disallowed" semantics
+/// already used by `filterAgentSchemas`/`agents_mod.allowsTool` above).
+/// cli-flags-04: the single source of truth for whether `tool_name` is shut
+/// out by `--allowedTools`/`--disallowedTools`/`--tools`. Shared by
+/// `filterByCliToolFlags` (advertised-schema visibility) and
+/// `executeToolCall`'s dispatch gate below (defense in depth: a model that
+/// calls a tool by an un-advertised alias, or from stale history, is still
+/// refused, exactly like the existing `active_agent`/`agents_mod.allowsTool`
+/// gate immediately above it).
+pub fn isToolBlockedByCliFlags(cfg: *const @import("core/config.zig").Config, tool_name: []const u8) bool {
+    if (!cfg.brief and isSendUserMessageToolName(tool_name)) return true;
+    const tools_csv_trimmed = std.mem.trim(u8, cfg.tools_allowlist, " \t");
+    if (cfg.tools_flag_set and tools_csv_trimmed.len == 0) return true; // --tools ""
+    const tools_unrestricted = !cfg.tools_flag_set or std.ascii.eqlIgnoreCase(tools_csv_trimmed, "default");
+    if (!tools_unrestricted and !toolNameListContains(cfg.tools_allowlist, tool_name)) return true;
+    if (cfg.allowed_tools.len > 0 and !toolNameListContains(cfg.allowed_tools, tool_name)) return true;
+    if (cfg.disallowed_tools.len > 0 and toolNameListContains(cfg.disallowed_tools, tool_name)) return true;
+    return false;
+}
+
+pub fn filterByCliToolFlags(
+    allocator: std.mem.Allocator,
+    schemas: []const types.ToolSchema,
+    cfg: *const @import("core/config.zig").Config,
+) ![]types.ToolSchema {
+    var out = std.array_list.Managed(types.ToolSchema).init(allocator);
+    errdefer {
+        for (out.items) |schema| {
+            allocator.free(schema.name);
+            allocator.free(schema.description);
+            allocator.free(schema.json_schema);
+            if (schema.usage_hint.len > 0) allocator.free(schema.usage_hint);
+        }
+        out.deinit();
+    }
+
+    for (schemas) |schema| {
+        if (isToolBlockedByCliFlags(cfg, schema.name)) continue;
+
+        try out.ensureUnusedCapacity(1);
+        const dup_name = try allocator.dupe(u8, schema.name);
+        errdefer allocator.free(dup_name);
+        const dup_description = try allocator.dupe(u8, schema.description);
+        errdefer allocator.free(dup_description);
+        const dup_schema = try allocator.dupe(u8, schema.json_schema);
+        errdefer allocator.free(dup_schema);
+        const dup_hint = try allocator.dupe(u8, schema.usage_hint);
+        out.appendAssumeCapacity(.{
+            .name = dup_name,
+            .description = dup_description,
+            .json_schema = dup_schema,
+            .usage_hint = dup_hint,
+        });
+    }
+
+    return out.toOwnedSlice();
+}
+
 // --- Approval helpers ---
 
 pub fn approvalStateToString(state: types.ApprovalState) []const u8 {
@@ -470,26 +602,120 @@ pub fn approvalStateToString(state: types.ApprovalState) []const u8 {
     };
 }
 
-fn buildApprovalDescription(out: []u8, name: []const u8, args: []const u8, risk: types.RiskTier) []const u8 {
-    var summary_buf: [256]u8 = undefined;
-    const summary = summarizeToolCallForProgress(&summary_buf, name, args);
-    const base = std.fmt.bufPrint(out, "{s} [{s}]: {s}", .{ name, types.riskTierToString(risk), summary }) catch return name;
+/// Append `text` as a new "\n{text}" line onto `out[0..pos.*]`, truncating
+/// (rather than dropping) `text` if it does not fully fit. Shared by every
+/// advisory/suggestion line `buildApprovalDescription` appends so a long
+/// note degrades gracefully instead of vanishing outright.
+fn appendApprovalLine(out: []u8, pos: *usize, text: []const u8) void {
+    if (pos.* >= out.len or out.len - pos.* < 2) return; // need "\n" + >=1 byte
+    out[pos.*] = '\n';
+    const room = out.len - pos.* - 1;
+    const take = @min(text.len, room);
+    @memcpy(out[pos.* + 1 ..][0..take], text[0..take]);
+    pos.* += 1 + take;
+}
+
+/// Copy as much of `text` as fits into `out` verbatim (no `bufPrint`
+/// template, so nothing is lost to formatting overhead). Used by
+/// `fullDetailForApproval` so a Bash command/URL/query longer than any
+/// fixed prefix-formatted line still comes through in full up to the
+/// buffer's real capacity, instead of collapsing to a generic fallback
+/// string the instant it does not fit a `bufPrint` call exactly.
+fn copyFullOrClip(out: []u8, text: []const u8) []const u8 {
+    const take = @min(text.len, out.len);
+    @memcpy(out[0..take], text[0..take]);
+    return out[0..take];
+}
+
+/// repl-ux-03: like `summarizeToolCallForProgress`, but for the approval
+/// DIALOG BODY specifically -- the text a human reads before approving a
+/// potentially dangerous action must never be silently clipped to a
+/// spinner-line length (the old 60/80-char `clipText` calls the progress
+/// line legitimately wants). The progress/spinner line stays short
+/// (`summarizeToolCallForProgress` is unchanged and still used there);
+/// this is the "show the whole thing" counterpart, used only when
+/// building the approval message. Tool names with no full-detail case
+/// here fall back to the (unclipped-for-them-anyway) progress summary.
+pub fn fullDetailForApproval(out: []u8, name: []const u8, args: []const u8) []const u8 {
+    const command = tool_registry.getArg(args, "command");
+    const url = tool_registry.getArg(args, "url");
+    const query = tool_registry.getArg(args, "query") orelse tool_registry.getArg(args, "q");
+
+    if (matchesToolName(name, &.{ "shell", "Bash", "bash" })) {
+        if (tool_registry.getArg(args, "description")) |d| {
+            const trimmed = std.mem.trim(u8, d, " \t\r\n\"'");
+            if (trimmed.len > 0) {
+                if (command) |cmd| {
+                    if (std.fmt.bufPrint(out, "{s} -- {s}", .{ trimmed, cmd }) catch null) |line| return line;
+                    return copyFullOrClip(out, cmd);
+                }
+                return copyFullOrClip(out, trimmed);
+            }
+        }
+        if (command) |cmd| return copyFullOrClip(out, cmd);
+        return "shell command";
+    }
+    if (matchesToolName(name, &.{ "WebFetch", "web_fetch", "HttpRequest", "http_request" })) {
+        if (url) |u| {
+            if (std.fmt.bufPrint(out, "fetch {s}", .{u}) catch null) |line| return line;
+            return copyFullOrClip(out, u);
+        }
+        return "http request";
+    }
+    if (matchesToolName(name, &.{ "WebSearch", "web_search" })) {
+        if (query) |q| {
+            if (std.fmt.bufPrint(out, "search {s}", .{q}) catch null) |line| return line;
+            return copyFullOrClip(out, q);
+        }
+        return "web search";
+    }
+    if (matchesToolName(name, &.{ "TaskRun", "task_run" })) {
+        if (command) |cmd| {
+            if (std.fmt.bufPrint(out, "run {s}", .{cmd}) catch null) |line| return line;
+            return copyFullOrClip(out, cmd);
+        }
+    }
+    return summarizeToolCallForProgress(out, name, args);
+}
+
+fn buildApprovalDescription(allocator: std.mem.Allocator, out: []u8, name: []const u8, args: []const u8, risk: types.RiskTier) []const u8 {
+    var summary_buf: [4096]u8 = undefined;
+    const summary = fullDetailForApproval(&summary_buf, name, args);
+
+    // Write "{name} [{risk}]: " (always short) then copy as much of the
+    // full-detail summary as fits, rather than a single `bufPrint` over
+    // the whole line -- a `bufPrint` that overflows fails atomically and
+    // used to fall back to the bare tool name, discarding the command
+    // entirely. This way a command longer than `out` still comes through
+    // up to the buffer's real capacity instead of vanishing outright.
+    const prefix = std.fmt.bufPrint(out, "{s} [{s}]: ", .{ name, types.riskTierToString(risk) }) catch return name;
+    var pos: usize = prefix.len;
+    const room = if (out.len > pos) out.len - pos else 0;
+    const take = @min(summary.len, room);
+    @memcpy(out[pos..][0..take], summary[0..take]);
+    pos += take;
 
     // bash-shell-05: append an advisory note for reversible-but-risky bash
     // commands (git force-push, rm -rf, DROP TABLE, ...). Advisory only -- this
-    // does not change risk tier or auto-approval. Best-effort: if the combined
-    // text would overflow `out`, keep the base description without the note.
+    // does not change risk tier or auto-approval.
     if (matchesToolName(name, &.{ "shell", "Bash", "bash" })) {
         if (tool_registry.getArg(args, "command")) |command| {
             if (destructive_warning.warning(command)) |note| {
-                // `base` aliases the front of `out`; append "\n{note}" after it
-                // in place rather than re-running bufPrint over `out` (which
-                // would alias src and dst and corrupt the result).
-                const needed = base.len + 1 + note.len;
-                if (needed <= out.len) {
-                    out[base.len] = '\n';
-                    @memcpy(out[base.len + 1 .. needed], note);
-                    return out[0..needed];
+                appendApprovalLine(out, &pos, note);
+            }
+
+            // repl-ux-03: derive a concrete "Suggested allow-rules: Bash(<rule>)"
+            // line for a single (non-compound) Bash command, the same static
+            // command_prefix heuristic already used for compound/piped Bash
+            // asks (bash_segment_permission.zig) -- so the overlay's "don't
+            // ask again" option can name an actual command/prefix instead of
+            // only the generic "for Bash this session" (mirrors the
+            // reference's Haiku-suggested prefix row / generateShellSuggestionsLabel).
+            if (command_prefix.extract(allocator, command) catch null) |prefix_text| {
+                defer allocator.free(prefix_text);
+                var rule_buf: [160]u8 = undefined;
+                if (std.fmt.bufPrint(&rule_buf, "Suggested allow-rules: {s}({s})", .{ name, prefix_text }) catch null) |line| {
+                    appendApprovalLine(out, &pos, line);
                 }
             }
         }
@@ -498,23 +724,18 @@ fn buildApprovalDescription(out: []u8, name: []const u8, args: []const u8, risk:
     // Phase 9 Task 3 (tools-03): for a WebFetch against a non-preapproved host,
     // append a suggested `domain:<host>` allow-rule so the user can grant the
     // host once and skip future prompts (mirrors the reference's
-    // webFetchToolInputToPermissionRuleContent suggestion). Best-effort: only
-    // when there is room in `out`. Preapproved hosts never reach the ask path
-    // (policy downgrades them to LOW), so we skip the note for them too.
+    // webFetchToolInputToPermissionRuleContent suggestion). Preapproved hosts
+    // never reach the ask path (policy downgrades them to LOW), so we skip
+    // the note for them too.
     if (matchesToolName(name, &.{ "WebFetch", "web_fetch" })) {
         if (tool_registry.getArg(args, "url")) |url| {
             var note_buf: [128]u8 = undefined;
             if (webFetchSuggestionNote(&note_buf, url)) |note| {
-                const needed = base.len + 1 + note.len;
-                if (needed <= out.len) {
-                    out[base.len] = '\n';
-                    @memcpy(out[base.len + 1 .. needed], note);
-                    return out[0..needed];
-                }
+                appendApprovalLine(out, &pos, note);
             }
         }
     }
-    return base;
+    return out[0..pos];
 }
 
 /// Build the "approve once, or add allow rule `domain:<host>`" advisory note for
@@ -650,6 +871,31 @@ pub const ToolExecContext = struct {
     /// `approval_handler` and the stdin fallback in `effectiveApproval`. Null at
     /// every local (non-host-driven) call site so the gate is unchanged there.
     sdk_relay: ?ApprovalHandler = null,
+    /// hooks-permissions-09: the session id threaded onto every hook's stdin
+    /// payload (reference `Se` base schema's `session_id`). Empty at every
+    /// non-main call site (tests, forks that don't care) so the field is
+    /// simply omitted from the JSON rather than emitted blank -- see
+    /// `hook_io.HookBaseFields`.
+    session_id: []const u8 = "",
+    /// hooks-permissions-09: the session's on-disk transcript path
+    /// (`AgentRuntime.transcript_path`), threaded the same way as
+    /// `session_id` above.
+    transcript_path: []const u8 = "",
+    /// hooks-permissions-09: the reference `Se` base schema's optional
+    /// `prompt_id` -- a per-user-turn correlator synthesized once at the top
+    /// of the root `AgentRuntime`'s `handlePromptDetailed*` (mirroring how
+    /// `tool_use_id` is synthesized once per tool call) and inherited by any
+    /// sub-agent spawned during that turn (`AgentRuntime.promptId()`). Empty
+    /// at every non-main call site, which `hook_io` treats as "omit".
+    prompt_id: []const u8 = "",
+    /// hooks-permissions-09: the reference `Se` base schema's optional
+    /// `agent_id`. zcode has no distinguishing identity for the single root
+    /// agent, so this stays empty there (an absent `agent_id` is valid per
+    /// the reference schema); a sub-agent spawned via the Agent/Task tool
+    /// gets one synthesized at spawn time (`AgentRuntime.agentId()`), so its
+    /// own tool calls and the parent's SubagentStart/SubagentStop hooks about
+    /// it all carry the same id.
+    agent_id: []const u8 = "",
 };
 
 /// Resolve the approval-mode string the gate evaluates under: a live permission
@@ -754,7 +1000,23 @@ const EffectiveApproval = struct { ctx: ?*anyopaque, prompt: ?ApprovalPromptFn }
 /// front-end's installed `approval_handler`; otherwise they fall back to
 /// the built-in stdin approver bound to `stdin_token`. Single source of
 /// truth for both the permission-rule prompt and the main approval gate.
+/// cli-flags-missed-114/116/headless-sdk-13: `--permission-prompts none` --
+/// "nobody" answers a prompt with `--print`: anything that would otherwise
+/// prompt (the SDK host relay, `--permission-prompt-tool`, or the local
+/// stdin prompt) is auto-denied instead, without ever asking. `""` (flag
+/// absent) and `"host"` (the default) both behave as before -- only the
+/// literal value "none" changes anything here.
+fn permissionPromptsNone(ctx: ToolExecContext) bool {
+    return std.mem.eql(u8, ctx.cfg.permission_prompts, "none");
+}
+
 fn effectiveApproval(ctx: ToolExecContext, stdin_token: *u8) EffectiveApproval {
+    // `--permission-prompts none` wins over EVERYTHING below, including the
+    // SDK host relay: nobody answers, so no `can_use_tool` control_request
+    // is ever emitted and no stdin prompt ever shown. This mirrors the
+    // `!ctx.interactive` no-relay case two lines down, which already
+    // produces exactly this auto-deny shape for a plain headless run.
+    if (permissionPromptsNone(ctx)) return .{ .ctx = null, .prompt = null };
     // sdk-headless-05: a host-driven session (input-format stream-json) relays
     // permission prompts to the SDK host via `can_use_tool`. This wins over
     // everything below -- including the `!interactive` short-circuit -- because
@@ -769,10 +1031,13 @@ fn effectiveApproval(ctx: ToolExecContext, stdin_token: *u8) EffectiveApproval {
 /// The interactivity flag the approval gate (`approval.evaluate`) runs under. A
 /// host-driven session (sdk-headless-05 `sdk_relay` set) is "interactive" for
 /// gate purposes -- the `can_use_tool` relay can produce a decision -- so the
-/// gate must not auto-deny it on the `!interactive` short-circuit. Otherwise it
-/// is `ctx.interactive` unchanged. Single source of truth so every evaluate
-/// call site agrees with `effectiveApproval`.
+/// gate must not auto-deny it on the `!interactive` short-circuit. `--permission-
+/// prompts none` overrides that back to non-interactive (nobody answers, so
+/// the gate must auto-deny ask-tier outcomes instead of trying to relay them).
+/// Otherwise it is `ctx.interactive` unchanged. Single source of truth so every
+/// evaluate call site agrees with `effectiveApproval`.
 fn effectiveInteractive(ctx: ToolExecContext) bool {
+    if (permissionPromptsNone(ctx)) return false;
     return ctx.interactive or ctx.sdk_relay != null;
 }
 
@@ -786,8 +1051,8 @@ fn promptForPermissionRule(
     var stdin_prompt_token: u8 = 0;
     const approver = effectiveApproval(ctx, &stdin_prompt_token);
 
-    var desc_buf: [512]u8 = undefined;
-    const tool_description = buildApprovalDescription(&desc_buf, name, args, risk);
+    var desc_buf: [4096]u8 = undefined;
+    const tool_description = buildApprovalDescription(ctx.allocator, &desc_buf, name, args, risk);
     const rule_reason = try formatPermissionRuleReason(ctx.allocator, "permission rule asks before running tool", matched);
     defer ctx.allocator.free(rule_reason);
     const message = try std.fmt.allocPrint(ctx.allocator, "{s}\n{s}", .{ rule_reason, tool_description });
@@ -1043,6 +1308,9 @@ fn segmentedBashPermission(
     // hooks-20: the PreToolUse hook already ran upstream in executeToolCall; hand
     // its result to runApprovedToolTrace so the command hook is not run twice.
     pre_hook_done: ?*hooks_mod.HookRunResult,
+    // hooks-permissions-09: forwarded straight through from executeToolCall --
+    // see runApprovedToolTrace's doc comment.
+    tool_use_id: []const u8,
 ) !?ToolTrace {
     const rules = ctx.permission_rules orelse return null;
     if (!matchesToolName(name, &.{ "shell", "Bash", "bash" })) return null;
@@ -1054,20 +1322,22 @@ fn segmentedBashPermission(
 
     switch (verdict.decision) {
         .allow => {
-            return try runApprovedToolTrace(ctx, name, args, risk, .user_approved, start, pre_hook_done);
+            return try runApprovedToolTrace(ctx, name, args, risk, .user_approved, start, pre_hook_done, tool_use_id);
         },
         .deny => {
             const output = try std.fmt.allocPrint(ctx.allocator, "denied by permission rule: {s}", .{verdict.reason});
+            firePermissionDeniedHook(ctx, name, args, output);
             const trace = try buildToolTrace(ctx.allocator, name, args, risk, .denied, false, 0, output);
             logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
             return trace;
         },
         .ask => {
             if (ctx.session_approved_tools.contains(name)) {
-                return try runApprovedToolTrace(ctx, name, args, risk, .session_approved, start, pre_hook_done);
+                return try runApprovedToolTrace(ctx, name, args, risk, .session_approved, start, pre_hook_done, tool_use_id);
             }
             const message = try buildSegmentedAskMessage(ctx.allocator, name, args, risk, verdict.reason, verdict.suggestions);
             defer ctx.allocator.free(message);
+            firePermissionRequestHook(ctx, name, args, message);
 
             var stdin_prompt_token: u8 = 0;
             const approver = effectiveApproval(ctx, &stdin_prompt_token);
@@ -1089,11 +1359,12 @@ fn segmentedBashPermission(
             }
             if (!approval.approved) {
                 const output = try std.fmt.allocPrint(ctx.allocator, "permission rule requires approval: {s}", .{verdict.reason});
+                firePermissionDeniedHook(ctx, name, args, output);
                 const trace = try buildToolTrace(ctx.allocator, name, args, risk, approval.state, false, 0, output);
                 logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
                 return trace;
             }
-            return try runApprovedToolTrace(ctx, name, args, risk, approval.state, start, pre_hook_done);
+            return try runApprovedToolTrace(ctx, name, args, risk, approval.state, start, pre_hook_done, tool_use_id);
         },
     }
 }
@@ -1114,8 +1385,8 @@ fn buildSegmentedAskMessage(
     errdefer out.deinit();
     const writer = out.writer();
 
-    var desc_buf: [512]u8 = undefined;
-    const tool_description = buildApprovalDescription(&desc_buf, name, args, risk);
+    var desc_buf: [4096]u8 = undefined;
+    const tool_description = buildApprovalDescription(allocator, &desc_buf, name, args, risk);
     try writer.print("{s}\n{s}", .{ reason, tool_description });
     if (suggestions.len > 0) {
         try writer.writeAll("\nSuggested allow-rules:");
@@ -1130,6 +1401,18 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
     const start = clock.nowSeconds();
     var stdin_prompt_token: u8 = 0;
     const effective_name = canonicalToolNameForArgs(name, args);
+    // hooks-permissions-09: a per-call correlator for the tool-shaped hook
+    // events (PreToolUse/PostToolUse/PostToolUseFailure/PermissionRequest/
+    // PermissionDenied all document `tool_use_id`). Generated ONCE here,
+    // before this call's own PreToolUse hook fires below, and threaded
+    // through every downstream path (segmentedBashPermission,
+    // runApprovedToolTrace, toolExecErrorTrace) so every hook firing for
+    // THIS call shares one id. SYNTHESIZED: zcode's
+    // `core.parse_helpers.ToolCall` carries no id from the model response
+    // (see `sdk/headless.zig`'s `ToolEvent` doc comment for the same
+    // documented gap at the SDK output layer).
+    var tool_use_id_buf: [32]u8 = undefined;
+    const tool_use_id = std.fmt.bufPrint(&tool_use_id_buf, "toolu_{x}", .{clock.nowNanos()}) catch "";
 
     // Refuse git tools in a non-git workspace at dispatch: weak models call
     // GitStatus from habit even when it isn't advertised, and running it just
@@ -1149,6 +1432,18 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
             logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
             return trace;
         }
+    }
+
+    // cli-flags-04: --allowedTools/--disallowedTools/--tools dispatch-level
+    // enforcement, in addition to filterByCliToolFlags removing the tool
+    // from what gets advertised -- a model that calls a tool it was never
+    // shown (an alias, or something left over in history) must still be
+    // refused.
+    if (isToolBlockedByCliFlags(ctx.cfg, effective_name)) {
+        const output = try ctx.allocator.dupe(u8, "tool blocked for this session by --allowedTools/--disallowedTools/--tools");
+        const trace = try buildToolTrace(ctx.allocator, effective_name, args, .BLOCKED, .blocked, false, 0, output);
+        logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
+        return trace;
     }
 
     // Phase 10 Task 5 (memory-01): auto-memory extraction fork allowlist.
@@ -1215,6 +1510,13 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
         .cwd = ctx.cwd,
         .tool_name = effective_name,
         .tool_args = args,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
+        .permission_mode = effectiveApprovalMode(ctx),
+        .tool_use_id = tool_use_id,
     });
     defer pre_hook.deinit(ctx.allocator);
 
@@ -1232,20 +1534,21 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
         },
         .allow => {
             // Auto-approve: bypass every permission gate below and run the tool.
-            return runApprovedToolTrace(ctx, effective_name, args, risk, .user_approved, start, &pre_hook);
+            return runApprovedToolTrace(ctx, effective_name, args, risk, .user_approved, start, &pre_hook, tool_use_id);
         },
         .ask => {
             // Force a prompt regardless of what rules/mode would have decided. A
             // non-interactive run cannot prompt, so the tool is blocked.
             var ask_token: u8 = 0;
             const approver = effectiveApproval(ctx, &ask_token);
-            var desc_buf: [512]u8 = undefined;
-            const tool_description = buildApprovalDescription(&desc_buf, effective_name, args, risk);
+            var desc_buf: [4096]u8 = undefined;
+            const tool_description = buildApprovalDescription(ctx.allocator, &desc_buf, effective_name, args, risk);
             const message = if (pre_hook.permission_reason) |r|
                 try std.fmt.allocPrint(ctx.allocator, "pre-tool-use hook asks before running tool: {s}\n{s}", .{ r, tool_description })
             else
                 try std.fmt.allocPrint(ctx.allocator, "pre-tool-use hook asks before running tool\n{s}", .{tool_description});
             defer ctx.allocator.free(message);
+            firePermissionRequestHook(ctx, effective_name, args, message);
             const approval = try approval_mod.evaluate(
                 "manual",
                 risk,
@@ -1264,11 +1567,12 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
             }
             if (!approval.approved) {
                 const output = try ctx.allocator.dupe(u8, approval.reason);
+                firePermissionDeniedHook(ctx, effective_name, args, output);
                 const trace = try buildToolTrace(ctx.allocator, effective_name, args, risk, approval.state, false, 0, output);
                 logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
                 return trace;
             }
-            return runApprovedToolTrace(ctx, effective_name, args, risk, approval.state, start, &pre_hook);
+            return runApprovedToolTrace(ctx, effective_name, args, risk, approval.state, start, &pre_hook, tool_use_id);
         },
         .none => {}, // fall through to the normal approval flow below
     }
@@ -1278,7 +1582,7 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
     // multi-cd and cd+git bare-repo guards. This MUST run before the whole-args
     // `decide` below so a segment verdict short-circuits the single-rule match
     // and we never double-prompt. Returns null for non-compound commands.
-    if (try segmentedBashPermission(ctx, effective_name, args, risk, start, &pre_hook)) |trace| {
+    if (try segmentedBashPermission(ctx, effective_name, args, risk, start, &pre_hook, tool_use_id)) |trace| {
         return trace;
     }
 
@@ -1291,16 +1595,22 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
             switch (decided.action) {
                 .deny => {
                     const output = try formatPermissionRuleReason(ctx.allocator, "denied by permission rule", matched_rule);
+                    firePermissionDeniedHook(ctx, effective_name, args, output);
                     const trace = try buildToolTrace(ctx.allocator, effective_name, args, risk, .denied, false, 0, output);
                     logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
                     return trace;
                 },
                 .allow => {
-                    return runApprovedToolTrace(ctx, effective_name, args, risk, .user_approved, start, &pre_hook);
+                    return runApprovedToolTrace(ctx, effective_name, args, risk, .user_approved, start, &pre_hook, tool_use_id);
                 },
                 .ask => {
                     if (ctx.session_approved_tools.contains(effective_name)) {
-                        return runApprovedToolTrace(ctx, effective_name, args, risk, .session_approved, start, &pre_hook);
+                        return runApprovedToolTrace(ctx, effective_name, args, risk, .session_approved, start, &pre_hook, tool_use_id);
+                    }
+                    {
+                        const req_reason = try formatPermissionRuleReason(ctx.allocator, "permission rule requires approval", matched_rule);
+                        defer ctx.allocator.free(req_reason);
+                        firePermissionRequestHook(ctx, effective_name, args, req_reason);
                     }
                     const approval = try promptForPermissionRule(ctx, matched_rule, effective_name, args, risk);
                     if (approval.state == .session_approved) {
@@ -1310,11 +1620,12 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
                     }
                     if (!approval.approved) {
                         const output = try formatPermissionRuleReason(ctx.allocator, "permission rule requires approval", matched_rule);
+                        firePermissionDeniedHook(ctx, effective_name, args, output);
                         const trace = try buildToolTrace(ctx.allocator, effective_name, args, risk, approval.state, false, 0, output);
                         logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
                         return trace;
                     }
-                    return runApprovedToolTrace(ctx, effective_name, args, risk, approval.state, start, &pre_hook);
+                    return runApprovedToolTrace(ctx, effective_name, args, risk, approval.state, start, &pre_hook, tool_use_id);
                 },
             }
         }
@@ -1329,17 +1640,17 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
     // falls through to the generic gate. The decision is mode-driven (distinct
     // from rule/session allows), recorded as .auto_approved.
     if (acceptEditsBashAutoAllows(effective_name, effectiveApprovalMode(ctx), args)) {
-        return runApprovedToolTrace(ctx, effective_name, args, risk, .auto_approved, start, &pre_hook);
+        return runApprovedToolTrace(ctx, effective_name, args, risk, .auto_approved, start, &pre_hook, tool_use_id);
     }
 
     // Check if this tool was already session-approved
     if (ctx.session_approved_tools.contains(effective_name)) {
-        return runApprovedToolTrace(ctx, effective_name, args, risk, .session_approved, start, &pre_hook);
+        return runApprovedToolTrace(ctx, effective_name, args, risk, .session_approved, start, &pre_hook, tool_use_id);
     }
 
     // Build descriptive approval message
-    var desc_buf: [512]u8 = undefined;
-    const tool_description = buildApprovalDescription(&desc_buf, effective_name, args, risk);
+    var desc_buf: [4096]u8 = undefined;
+    const tool_description = buildApprovalDescription(ctx.allocator, &desc_buf, effective_name, args, risk);
 
     const approver = effectiveApproval(ctx, &stdin_prompt_token);
     const approval = try approval_mod.evaluate(
@@ -1363,12 +1674,17 @@ pub fn executeToolCall(ctx: ToolExecContext, name: []const u8, args: []const u8)
 
     if (!approval.approved) {
         const output = try ctx.allocator.dupe(u8, approval.reason);
+        // hooks-permissions-01: mode/tier-driven denial (the generic path --
+        // no explicit rule matched, so the effective permission mode itself
+        // either refused to prompt in a non-interactive session or the user
+        // declined an interactive prompt).
+        firePermissionDeniedHook(ctx, effective_name, args, output);
         const trace = try buildToolTrace(ctx.allocator, effective_name, args, risk, approval.state, false, 0, output);
         logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, start, 1);
         return trace;
     }
 
-    return runApprovedToolTrace(ctx, effective_name, args, risk, approval.state, start, &pre_hook);
+    return runApprovedToolTrace(ctx, effective_name, args, risk, approval.state, start, &pre_hook, tool_use_id);
 }
 
 /// hooks-20: the approval action a PreToolUse hook's stdout JSON dictates.
@@ -1416,6 +1732,57 @@ fn runHooksWithTrustPrompt(allocator: std.mem.Allocator, cwd: []const u8, ask_us
     return hooks_mod.run(allocator, hook_ctx);
 }
 
+/// hooks-permissions-01: fire the `PermissionRequest` lifecycle hook
+/// immediately before the user is actually about to be prompted for a tool
+/// call (reference: "Run before permission prompt"). Best-effort and
+/// side-effect only -- a `PermissionRequest` hook cannot itself veto the
+/// prompt (the reference's `permission_suggestions` output only offers the
+/// UI alternate choices; it is not modeled here), so a failure or a blocking
+/// hook here never changes what happens next. `reason` is the same
+/// human-readable context already shown to the human approver, so a
+/// configured hook sees exactly what the user is being asked to approve.
+fn firePermissionRequestHook(ctx: ToolExecContext, tool_name: []const u8, tool_args: []const u8, reason: []const u8) void {
+    var result = hooks_mod.run(ctx.allocator, .{
+        .event = .permission_request,
+        .cwd = ctx.cwd,
+        .tool_name = tool_name,
+        .tool_args = tool_args,
+        .reason = reason,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
+        .permission_mode = effectiveApprovalMode(ctx),
+    }) catch return;
+    result.deinit(ctx.allocator);
+}
+
+/// hooks-permissions-01: fire the `PermissionDenied` lifecycle hook whenever a
+/// tool call's outcome resolves to denied -- by an explicit deny rule, by the
+/// user declining an interactive prompt, or by the effective permission mode
+/// refusing to prompt at all in a non-interactive session. Best-effort and
+/// side-effect only, mirroring `firePermissionRequestHook` -- the tool is
+/// already denied by the time this fires, so a hook here cannot change the
+/// outcome, only observe/log/notify it (matching the reference: PermissionDenied
+/// has no documented block-the-denial semantics of its own).
+fn firePermissionDeniedHook(ctx: ToolExecContext, tool_name: []const u8, tool_args: []const u8, reason: []const u8) void {
+    var result = hooks_mod.run(ctx.allocator, .{
+        .event = .permission_denied,
+        .cwd = ctx.cwd,
+        .tool_name = tool_name,
+        .tool_args = tool_args,
+        .reason = reason,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
+        .permission_mode = effectiveApprovalMode(ctx),
+    }) catch return;
+    result.deinit(ctx.allocator);
+}
+
 fn toolExecErrorTrace(
     ctx: ToolExecContext,
     name: []const u8,
@@ -1424,12 +1791,94 @@ fn toolExecErrorTrace(
     approval_state: types.ApprovalState,
     start: i64,
     err: anyerror,
+    tool_use_id: []const u8,
 ) !ToolTrace {
     const end = clock.nowSeconds();
     const output = try std.fmt.allocPrint(ctx.allocator, "tool execution error: {s}", .{@errorName(err)});
+    // hooks-permissions-01: a thrown dispatch-layer error is the harness-level
+    // "tool failed to run" case the reference's PostToolUseFailure documents
+    // (as opposed to a tool that ran fine and merely returned an
+    // application-level non-zero-exit/error result in its own output text,
+    // which stays a normal PostToolUse). This path previously fired NO hook
+    // of either kind, so a configured PostToolUseFailure hook silently never
+    // saw the one case that most unambiguously is a tool failure.
+    firePostToolUseFailureHook(ctx, name, args, output, tool_use_id, (end - start) * 1000);
     const trace = try buildToolTrace(ctx.allocator, name, args, risk, approval_state, false, (end - start) * 1000, output);
     logToolInvocationRecord(ctx.allocator, ctx.audit, ctx.cloud_telemetry_opt_in, ctx.control_plane_url, ctx.control_plane_token, trace, start, end, 1);
     return trace;
+}
+
+/// hooks-permissions-01: see `toolExecErrorTrace`'s call site. Best-effort and
+/// side-effect only (like `firePermissionDeniedHook`): the trace/output the
+/// caller returns is unaffected by a blocking hook outcome here -- the tool
+/// call has already unrecoverably failed by the time this runs, so there is
+/// nothing left to gate. `error_text` doubles as both `tool_output` and (via
+/// `HookContext.reason`, threaded into the payload's `reason`/`error`-shaped
+/// fields by `buildEventPayload`) the failure detail a hook script inspects.
+/// hooks-permissions-09: `tool_use_id` (the same synthesized id PreToolUse
+/// saw for this call, from `runApprovedToolTrace`'s only caller) and
+/// `duration_ms` (elapsed since dispatch started) round out the reference's
+/// documented PostToolUseFailure fields.
+fn firePostToolUseFailureHook(ctx: ToolExecContext, tool_name: []const u8, tool_args: []const u8, error_text: []const u8, tool_use_id: []const u8, duration_ms: i64) void {
+    var result = hooks_mod.runEvent(ctx.allocator, .{
+        .event = .post_tool_use_failure,
+        .cwd = ctx.cwd,
+        .tool_name = tool_name,
+        .tool_args = tool_args,
+        .tool_output = error_text,
+        .tool_success = false,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
+        .permission_mode = effectiveApprovalMode(ctx),
+        .tool_use_id = tool_use_id,
+        .duration_ms = @intCast(@max(@as(i64, 0), duration_ms)),
+    }) catch return;
+    result.deinit(ctx.allocator);
+}
+
+/// hooks-permissions-03: true for the tool names that write file content
+/// (reference FileChanged trigger set). Read-only tools (Read/Grep/Glob/...)
+/// and non-file tools never fire this event.
+fn isFileMutatingTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "Write") or
+        std.mem.eql(u8, name, "Edit") or
+        std.mem.eql(u8, name, "MultiEdit") or
+        std.mem.eql(u8, name, "NotebookEdit");
+}
+
+/// hooks-permissions-03: fire `FileChanged` after a file-mutating tool call
+/// genuinely wrote to disk. `file_path` is read straight out of the already-
+/// dispatched call's own args (file_path/notebook_path/path, covering every
+/// mutating tool's schema); a call this function cannot find a path for
+/// (should not happen for the four tools it is gated on) is silently
+/// skipped rather than firing a hook with no file_path. `event` is "add" for
+/// Write (creates-or-overwrites; approximated as "add" since zcode does not
+/// stat the file beforehand to distinguish create from overwrite) and
+/// "change" for Edit/MultiEdit/NotebookEdit (which only ever modify an
+/// existing file). Best-effort and non-blocking by construction, like every
+/// other post-hoc observability event in this file.
+fn fireFileChangedHook(ctx: ToolExecContext, name: []const u8, args: []const u8) void {
+    if (!isFileMutatingTool(name)) return;
+    const file_path = arg_parse.getArg(args, "file_path") orelse
+        arg_parse.getArg(args, "notebook_path") orelse
+        arg_parse.getArg(args, "path") orelse return;
+    const change_event = if (std.mem.eql(u8, name, "Write")) "add" else "change";
+    var result = hooks_mod.runEvent(ctx.allocator, .{
+        .event = .file_changed,
+        .cwd = ctx.cwd,
+        .file_path = file_path,
+        .file_change_event = change_event,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
+        .permission_mode = effectiveApprovalMode(ctx),
+    }) catch return;
+    result.deinit(ctx.allocator);
 }
 
 fn runApprovedToolTrace(
@@ -1444,6 +1893,15 @@ fn runApprovedToolTrace(
     // result off here so we do NOT re-run the command hook (which would fire its
     // side effects twice). When null we run the hook ourselves as before.
     pre_hook_done: ?*hooks_mod.HookRunResult,
+    // hooks-permissions-09: the per-call correlator generated once by
+    // `executeToolCall` (its only real caller path -- see that function's doc
+    // comment) BEFORE its own PreToolUse hook fired, so Pre and Post/
+    // PostFailure for the SAME call always share one id. zcode's
+    // `core.parse_helpers.ToolCall` carries no id from the model response
+    // (see `sdk/headless.zig`'s `ToolEvent` doc comment for the same
+    // documented gap at the SDK output layer), so this is SYNTHESIZED, not
+    // the model's own tool_use id.
+    tool_use_id: []const u8,
 ) !ToolTrace {
     var pre_plugin = try plugins_mod.run(ctx.allocator, .{
         .event = .pre_tool_use,
@@ -1476,6 +1934,13 @@ fn runApprovedToolTrace(
             .cwd = ctx.cwd,
             .tool_name = name,
             .tool_args = args,
+            .session_id = ctx.session_id,
+            .transcript_path = ctx.transcript_path,
+            .prompt_id = ctx.prompt_id,
+            .agent_id = ctx.agent_id,
+            .mcp_ctx = @ptrCast(ctx.mcp),
+            .permission_mode = effectiveApprovalMode(ctx),
+            .tool_use_id = tool_use_id,
         });
         break :blk &owned_pre_hook.?;
     };
@@ -1532,13 +1997,21 @@ fn runApprovedToolTrace(
     // exactly once (upstream in executeToolCall, passed in as `risk`).
     var executed = true;
     const gate_output: []u8 = if (tool_registry.applyExecutionGates(ctx.allocator, req) catch |err|
-        return toolExecErrorTrace(ctx, name, effective_args, risk, approval_state, start, err)) |blocked|
+        return toolExecErrorTrace(ctx, name, effective_args, risk, approval_state, start, err, tool_use_id)) |blocked|
     blk: {
         executed = false;
         break :blk blocked;
     } else tool_registry.dispatch(ctx.allocator, if (ctx.cfg.mcp_tool_bridge_enabled) ctx.mcp else null, req) catch |err|
-        return toolExecErrorTrace(ctx, name, effective_args, risk, approval_state, start, err);
+        return toolExecErrorTrace(ctx, name, effective_args, risk, approval_state, start, err, tool_use_id);
     defer ctx.allocator.free(gate_output);
+    // hooks-permissions-09: the tool's own execution time, in milliseconds
+    // (reference: "Tool execution time in milliseconds"), captured right
+    // after dispatch resolves and BEFORE any post-tool-use hook runs, so a
+    // synchronous hook's own runtime is never counted as tool time. Same
+    // second-granularity clock (`clock.nowSeconds`) `buildToolTrace`'s own
+    // `duration_ms` already uses throughout this file.
+    const dispatch_end = clock.nowSeconds();
+    const dispatch_duration_ms: u64 = @intCast(@max(@as(i64, 0), (dispatch_end - start) * 1000));
 
     var post_plugin = try plugins_mod.run(ctx.allocator, .{
         .event = .post_tool_use,
@@ -1550,15 +2023,42 @@ fn runApprovedToolTrace(
     });
     defer post_plugin.deinit(ctx.allocator);
 
+    // hooks-permissions-01: `executed == false` here means the execution
+    // gates (empty-workspace / bash_security / ...) refused to run the tool
+    // at all -- the reference's PostToolUseFailure case -- as opposed to the
+    // tool having genuinely run and produced output (including a non-zero
+    // shell exit, which is application-level and still a normal
+    // PostToolUse). A thrown Zig error from dispatch is handled separately
+    // by `toolExecErrorTrace`'s own `firePostToolUseFailureHook` call, since
+    // that path never reaches here.
     var post_hook = try runHooksWithTrustPrompt(ctx.allocator, ctx.cwd, ctx.ask_user_fn, ctx.ask_user_ctx, .{
-        .event = .post_tool_use,
+        .event = if (executed) .post_tool_use else .post_tool_use_failure,
         .cwd = ctx.cwd,
         .tool_name = name,
         .tool_args = effective_args,
         .tool_output = gate_output,
         .tool_success = executed,
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .prompt_id = ctx.prompt_id,
+        .agent_id = ctx.agent_id,
+        .mcp_ctx = @ptrCast(ctx.mcp),
+        .permission_mode = effectiveApprovalMode(ctx),
+        // hooks-permissions-09: the same per-call id PreToolUse saw (when run
+        // in this function -- see the top-of-function doc comment) and the
+        // tool's own execution time, captured just above before this hook ran.
+        .tool_use_id = tool_use_id,
+        .duration_ms = dispatch_duration_ms,
     });
     defer post_hook.deinit(ctx.allocator);
+
+    // hooks-permissions-03: fire FileChanged for a genuinely successful
+    // file-mutating call (executed, and neither hook layer blocked it) --
+    // the reference's `{file_path, event: "change"|"add"|"unlink"}` (unlink
+    // is unreachable here: none of these four tools delete a file).
+    if (executed and !post_hook.blocked) {
+        fireFileChangedHook(ctx, name, effective_args);
+    }
 
     // Ownership handoff pattern: `output` is a heap-allocated buffer we
     // build up here (possibly rewritten by the plugin/hook post passes)
@@ -2223,7 +2723,7 @@ pub fn summarizeToolCallForProgress(out: []u8, name: []const u8, args: []const u
     if (matchesToolName(name, &.{ "TodoWrite", "todo_write" })) {
         return "update todo checklist";
     }
-    if (matchesToolName(name, &.{ "TaskPoll", "task_poll", "TaskGet", "task_get" })) {
+    if (matchesToolName(name, &.{ "task_poll", "TaskGet", "task_get" })) {
         if (id) |task_id| return std.fmt.bufPrint(out, "task {s}", .{task_id}) catch "task status";
         return "task status";
     }
@@ -2837,11 +3337,11 @@ pub fn isStrictViolationTrace(trace: ToolTrace) bool {
 }
 
 pub fn isBackgroundTaskFollowupTool(name: []const u8) bool {
-    return matchesToolName(name, &.{ "TaskPoll", "task_poll", "TaskGet", "task_get", "TaskOutput", "task_output" });
+    return matchesToolName(name, &.{ "task_poll", "TaskGet", "task_get", "TaskOutput", "task_output" });
 }
 
 pub fn isVerificationTool(name: []const u8, args: []const u8) bool {
-    if (matchesToolName(name, &.{ "RunTests", "run_tests", "GitDiff", "git_diff", "git_status", "TaskPoll", "task_poll", "TaskOutput", "task_output", "TaskGet", "task_get" })) {
+    if (matchesToolName(name, &.{ "RunTests", "run_tests", "GitDiff", "git_diff", "git_status", "task_poll", "TaskOutput", "task_output", "TaskGet", "task_get" })) {
         return true;
     }
     if (matchesToolName(name, &.{ "shell", "Bash", "bash" })) {
@@ -3880,6 +4380,7 @@ test "dangerouslyDisableSandbox ignored for non-bash tools" {
 test "buildApprovalDescription appends destructive advisory note for Bash" {
     var buf: [512]u8 = undefined;
     const desc = buildApprovalDescription(
+        testing.allocator,
         &buf,
         "Bash",
         "command=\"git push --force origin main\"",
@@ -3895,6 +4396,7 @@ test "buildApprovalDescription appends destructive advisory note for Bash" {
 test "buildApprovalDescription omits note for benign Bash command" {
     var buf: [512]u8 = undefined;
     const desc = buildApprovalDescription(
+        testing.allocator,
         &buf,
         "Bash",
         "command=\"ls -la\"",
@@ -3909,6 +4411,7 @@ test "buildApprovalDescription does not add note for non-Bash tools" {
     // A non-Bash tool whose args happen to contain a destructive-looking
     // command must NOT get the advisory (it is bash-only).
     const desc = buildApprovalDescription(
+        testing.allocator,
         &buf,
         "Read",
         "command=\"git push --force\"",
@@ -3920,6 +4423,7 @@ test "buildApprovalDescription does not add note for non-Bash tools" {
 test "buildApprovalDescription appends domain allow-rule suggestion for non-preapproved WebFetch" {
     var buf: [512]u8 = undefined;
     const desc = buildApprovalDescription(
+        testing.allocator,
         &buf,
         "WebFetch",
         "url=\"https://blog.example.com/post\"",
@@ -3929,6 +4433,34 @@ test "buildApprovalDescription appends domain allow-rule suggestion for non-prea
     try testing.expect(parse_helpers.containsIgnoreCase(desc, "WebFetch"));
     // domain allow-rule suggestion appended for the URL's host
     try testing.expect(parse_helpers.containsIgnoreCase(desc, "domain:blog.example.com"));
+}
+
+// repl-ux-03: the approval dialog body must show the FULL command, not a
+// spinner-length summary truncated to ~60-80 chars (the old
+// `summarizeToolCallForProgress`-derived body did exactly that).
+test "buildApprovalDescription shows the full Bash command, not a ~80-char clipped summary" {
+    const long_command = "npm test -- --coverage --reporter=verbose --very-long-flag-that-pushes-this-command-well-past-eighty-characters-total";
+    try testing.expect(long_command.len > 100);
+    var args_buf: [256]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "command=\"{s}\"", .{long_command});
+
+    var buf: [4096]u8 = undefined;
+    const desc = buildApprovalDescription(testing.allocator, &buf, "Bash", args, .MEDIUM);
+
+    // The entire command must appear verbatim -- not clipped at 60 or 80
+    // characters the way the old clipText(cmd, 80) summary was.
+    try testing.expect(std.mem.indexOf(u8, desc, long_command) != null);
+}
+
+// repl-ux-03: a single (non-compound) Bash command with a derivable static
+// prefix gets a concrete "Suggested allow-rules: Bash(<rule>)" line, the
+// same convention already used for compound/piped Bash asks -- so the
+// overlay's "don't ask again" option can name an actual command/prefix
+// instead of only "for Bash this session".
+test "buildApprovalDescription suggests a concrete allow-rule for a single Bash command" {
+    var buf: [4096]u8 = undefined;
+    const desc = buildApprovalDescription(testing.allocator, &buf, "Bash", "command=\"npm run test\"", .MEDIUM);
+    try testing.expect(std.mem.indexOf(u8, desc, "Suggested allow-rules: Bash(npm run)") != null);
 }
 
 test "webFetchSuggestionNote: non-preapproved host yields a domain suggestion" {
@@ -4526,13 +5058,28 @@ test "tool name canonicalization repairs common model aliases" {
     try testing.expectEqualStrings("Write", canonicalToolNameForArgs("Update", "path=README.md,content=body"));
 }
 
+test "tools-01: a Task call with Agent-shaped args routes to Agent, a CRUD-shaped call does not" {
+    // Reference-exact behavior: "Task" is the deprecated legacy alias FOR
+    // the Agent/subagent-launcher tool. zcode also has an unrelated
+    // pre-existing "Task" CRUD tool (create/get/update/list/stop/output/
+    // run/poll/claim) that the package notes say NOT to rename. Instead the
+    // args shape decides where a "Task" call goes.
+    try testing.expectEqualStrings("Agent", canonicalToolNameForArgs("Task", "prompt=investigate the auth bug,subagent_type=explore"));
+    try testing.expectEqualStrings("Agent", canonicalToolNameForArgs("task", "prompt=do the thing"));
+    try testing.expectEqualStrings("Agent", canonicalToolNameForArgs("Task", "prompt=do it,description=short label"));
+    // A plain CRUD-shaped call (the tool's own advertised fields) is left
+    // alone and still reaches the CRUD handler.
+    try testing.expectEqualStrings("Task", canonicalToolNameForArgs("Task", "action=create,title=Fix bug,summary=details"));
+    try testing.expectEqualStrings("Task", canonicalToolNameForArgs("Task", "action=list"));
+}
+
 test "concrete action tool classification recognizes edit write and execution tools" {
     try testing.expect(isConcreteActionTool("Edit", "path=src/main.zig,find=a,replace=b"));
     try testing.expect(isConcreteActionTool("FileEdit", "path=src/main.zig,old_string=a,new_string=b"));
     try testing.expect(isConcreteActionTool("Write", "path=README.md,content=hi"));
     try testing.expect(isConcreteActionTool("GitApply", "patch=diff"));
     try testing.expect(isConcreteActionTool("Bash", "command=\"zig build test\""));
-    try testing.expect(!isConcreteActionTool("TaskPoll", "id=task-1"));
+    try testing.expect(!isConcreteActionTool("TaskGet", "id=task-1"));
     try testing.expect(!isConcreteActionTool("TaskOutput", "id=task-1"));
     try testing.expect(!isConcreteActionTool("Read", "path=src/main.zig"));
     try testing.expect(!isConcreteActionTool("Grep", "pattern=foo"));
@@ -4915,11 +5462,15 @@ test "effectiveApproval prefers the SDK relay when host-driven, else falls back"
     };
     const relay_handler = ApprovalHandler{ .ctx = @ptrCast(&Relay.sentinel), .prompt = Relay.prompt };
 
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+
     // Base context: non-interactive, no relay -> no approver (auto-deny path).
     var base = ToolExecContext{
         .allocator = testing.allocator,
         .cwd = "/repo",
-        .cfg = undefined,
+        .cfg = &cfg,
         .policy = undefined,
         .mcp = undefined,
         .browser = null,
@@ -4964,6 +5515,20 @@ test "effectiveApproval prefers the SDK relay when host-driven, else falls back"
     {
         const a = effectiveApproval(base, &tok);
         try testing.expect(a.prompt == stdinApprovalPromptWithCtx);
+    }
+
+    // 4. cli-flags-missed-114/116/headless-sdk-13: --permission-prompts none
+    // wins over EVERYTHING, including a live SDK relay and interactive mode
+    // -- nobody answers, so no can_use_tool relay, no REPL handler, no stdin
+    // prompt, and the gate is no longer "interactive" for ask-tier purposes.
+    base.sdk_relay = relay_handler;
+    testing.allocator.free(cfg.permission_prompts);
+    cfg.permission_prompts = try testing.allocator.dupe(u8, "none");
+    {
+        const a = effectiveApproval(base, &tok);
+        try testing.expect(a.prompt == null);
+        try testing.expect(a.ctx == null);
+        try testing.expect(!effectiveInteractive(base));
     }
 }
 
@@ -5333,6 +5898,535 @@ test "hooks-20: PreToolUse updatedInput rewrites the tool args before execution"
     try testing.expect(std.mem.indexOf(u8, trace.args, "original.txt") == null);
 }
 
+test "hooks-permissions-01: PermissionDenied hook fires when a deny rule blocks a Bash call" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "denied.txt" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PermissionDenied\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"touch '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "tiered-auto");
+    cfg.mcp_tool_bridge_enabled = false;
+    alloc.free(cfg.sandbox);
+    cfg.sandbox = try alloc.dupe(u8, "danger-full-access");
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    var rules = permission_rules_mod.Store.init(alloc);
+    defer rules.deinit();
+    try rules.addRule(.deny, .global, "Bash", "", "test", 0, "user");
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        // Non-interactive: a rule deny still fires PermissionDenied even though
+        // there is nobody to prompt.
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = &rules,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+        .session_id = "sess-permdenied-1",
+    };
+
+    var trace = try executeToolCall(ctx, "Bash", "command=echo hi");
+    defer trace.deinit(alloc);
+    try testing.expectEqual(types.ApprovalState.denied, trace.approval_state);
+
+    std.Io.Dir.cwd().access(rt.io, sentinel, .{}) catch |err| {
+        std.debug.print("PermissionDenied hook sentinel missing: {s} ({any})\n", .{ sentinel, err });
+        return error.PermissionDeniedHookDidNotRun;
+    };
+}
+
+test "hooks-permissions-01: PostToolUseFailure fires with an error field when the dispatch layer throws" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    const captured = try std.fs.path.join(alloc, &.{ root, "posttoolusefailure.json" });
+    defer alloc.free(captured);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PostToolUseFailure\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"PostToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"echo SHOULD_NOT_FIRE\"}}]}}]}}}}",
+        .{captured},
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+
+    const policy_mod = @import("policy/policy.zig");
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+
+    const logger_mod = @import("core/logger.zig");
+    var audit = try logger_mod.AuditLogger.init(alloc, root);
+    defer audit.deinit();
+
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = root,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = null,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+        .session_id = "sess-failure-1",
+        .transcript_path = "/tmp/sessions/sess-failure-1.jsonl",
+    };
+
+    // Exercises the exact call site `toolExecErrorTrace` uses
+    // (hooks-permissions-01): a real dispatch-layer error, not a normal
+    // tool call that merely returned an application-level error string.
+    firePostToolUseFailureHook(ctx, "Bash", "command=false", "tool execution error: SomeDispatchError", "toolu_test-1", 42);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("PostToolUseFailure hook did not capture stdin: {s} ({any})\n", .{ captured, err });
+        return error.PostToolUseFailureHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("PostToolUseFailure", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("Bash", parsed.value.object.get("tool_name").?.string);
+    try testing.expect(parsed.value.object.get("error") != null);
+    try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("error").?.string, "SomeDispatchError") != null);
+    try testing.expectEqualStrings("sess-failure-1", parsed.value.object.get("session_id").?.string);
+    try testing.expectEqualStrings("/tmp/sessions/sess-failure-1.jsonl", parsed.value.object.get("transcript_path").?.string);
+    // hooks-permissions-09: tool_use_id/duration_ms now round out the payload.
+    try testing.expectEqualStrings("toolu_test-1", parsed.value.object.get("tool_use_id").?.string);
+    try testing.expectEqual(@as(i64, 42), parsed.value.object.get("duration_ms").?.integer);
+}
+
+test "hooks-permissions-09: a real successful call's PreToolUse and PostToolUse share one synthesized tool_use_id, and PostToolUse carries duration_ms" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const pre_captured = try std.fs.path.join(alloc, &.{ root, "pre.json" });
+    defer alloc.free(pre_captured);
+    const post_captured = try std.fs.path.join(alloc, &.{ root, "post.json" });
+    defer alloc.free(post_captured);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"PostToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ pre_captured, post_captured },
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "tiered-auto");
+    cfg.mcp_tool_bridge_enabled = false;
+    alloc.free(cfg.sandbox);
+    cfg.sandbox = try alloc.dupe(u8, "danger-full-access");
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = null,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+    };
+
+    var trace = try executeToolCall(ctx, "Bash", "command=echo hi");
+    defer trace.deinit(alloc);
+    try testing.expect(trace.executed);
+
+    const pre_bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, pre_captured, alloc, .limited(16 * 1024));
+    defer alloc.free(pre_bytes);
+    var pre_parsed = try std.json.parseFromSlice(std.json.Value, alloc, pre_bytes, .{});
+    defer pre_parsed.deinit();
+    const pre_id = pre_parsed.value.object.get("tool_use_id").?.string;
+    try testing.expect(pre_id.len > 0);
+
+    const post_bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, post_captured, alloc, .limited(16 * 1024));
+    defer alloc.free(post_bytes);
+    var post_parsed = try std.json.parseFromSlice(std.json.Value, alloc, post_bytes, .{});
+    defer post_parsed.deinit();
+    const post_id = post_parsed.value.object.get("tool_use_id").?.string;
+
+    // Same call -> same correlator on both events.
+    try testing.expectEqualStrings(pre_id, post_id);
+    // duration_ms is present (non-negative; the test clock has second
+    // granularity so it may legitimately read 0 for a fast call).
+    try testing.expect(post_parsed.value.object.get("duration_ms").?.integer >= 0);
+}
+
+test "hooks-permissions-09: PreToolUse and PostToolUse carry agent_id/prompt_id when ToolExecContext sets them" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const pre_captured = try std.fs.path.join(alloc, &.{ root, "pre_ids.json" });
+    defer alloc.free(pre_captured);
+    const post_captured = try std.fs.path.join(alloc, &.{ root, "post_ids.json" });
+    defer alloc.free(post_captured);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"PostToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ pre_captured, post_captured },
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "tiered-auto");
+    cfg.mcp_tool_bridge_enabled = false;
+    alloc.free(cfg.sandbox);
+    cfg.sandbox = try alloc.dupe(u8, "danger-full-access");
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    // hooks-permissions-09: these are what AgentRuntime.buildToolExecContext
+    // now threads through from AgentRuntime.promptId()/agentId() (a
+    // sub-agent's synthesized id, in the production path) -- set directly
+    // here so the test exercises the payload-building side without needing
+    // a full sub-agent spawn.
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = null,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+        .prompt_id = "prompt_deadbeef",
+        .agent_id = "agent_cafef00d",
+    };
+
+    var trace = try executeToolCall(ctx, "Bash", "command=echo hi");
+    defer trace.deinit(alloc);
+    try testing.expect(trace.executed);
+
+    const pre_bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, pre_captured, alloc, .limited(16 * 1024));
+    defer alloc.free(pre_bytes);
+    var pre_parsed = try std.json.parseFromSlice(std.json.Value, alloc, pre_bytes, .{});
+    defer pre_parsed.deinit();
+    try testing.expectEqualStrings("prompt_deadbeef", pre_parsed.value.object.get("prompt_id").?.string);
+    try testing.expectEqualStrings("agent_cafef00d", pre_parsed.value.object.get("agent_id").?.string);
+
+    const post_bytes = try std.Io.Dir.cwd().readFileAlloc(rt.io, post_captured, alloc, .limited(16 * 1024));
+    defer alloc.free(post_bytes);
+    var post_parsed = try std.json.parseFromSlice(std.json.Value, alloc, post_bytes, .{});
+    defer post_parsed.deinit();
+    try testing.expectEqualStrings("prompt_deadbeef", post_parsed.value.object.get("prompt_id").?.string);
+    try testing.expectEqualStrings("agent_cafef00d", post_parsed.value.object.get("agent_id").?.string);
+}
+
+test "hooks-permissions-03: FileChanged fires with file_path and event=add after a successful Write" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const captured = try std.fs.path.join(alloc, &.{ root, "file_changed.json" });
+    defer alloc.free(captured);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"FileChanged\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{captured},
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "tiered-auto");
+    cfg.mcp_tool_bridge_enabled = false;
+    alloc.free(cfg.sandbox);
+    cfg.sandbox = try alloc.dupe(u8, "danger-full-access");
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = null,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+    };
+
+    var trace = try executeToolCall(ctx, "Write", "file_path=out.txt,content=hello");
+    defer trace.deinit(alloc);
+    try testing.expect(trace.executed);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(16 * 1024)) catch |err| {
+        std.debug.print("FileChanged hook did not fire: {s} ({any})\n", .{ captured, err });
+        return error.FileChangedHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("FileChanged", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("out.txt", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("add", parsed.value.object.get("event").?.string);
+}
+
+test "hooks-permissions-03: FileChanged does not fire for a read-only tool" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var env_ov = try PreToolHookTestEnv.install(alloc, root);
+    defer env_ov.deinit();
+
+    const rt = @import("zcode_runtime");
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "proj/readme.txt", .data = "hi" });
+
+    const captured = try std.fs.path.join(alloc, &.{ root, "file_changed.json" });
+    defer alloc.free(captured);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"FileChanged\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{captured},
+    );
+    defer alloc.free(settings);
+    tmp.dir.createDirPath(rt.io, ".zcode") catch {};
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = ".zcode/settings.json", .data = settings });
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.approval_mode);
+    cfg.approval_mode = try alloc.dupe(u8, "tiered-auto");
+    cfg.mcp_tool_bridge_enabled = false;
+    alloc.free(cfg.sandbox);
+    cfg.sandbox = try alloc.dupe(u8, "danger-full-access");
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = null,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = false,
+    };
+
+    var trace = try executeToolCall(ctx, "Read", "file_path=readme.txt");
+    defer trace.deinit(alloc);
+    try testing.expect(trace.executed);
+
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(rt.io, captured, .{}));
+}
+
 test "logToolInvocationRecord increments the tool_executions_total counter" {
     const alloc = testing.allocator;
     const test_helpers = @import("core/test_helpers.zig");
@@ -5449,4 +6543,195 @@ test "analytics-10: cardinality limit collapses the overflow value to <other> in
     // "Write" is the 2nd distinct tool_name value -> collapsed to "<other>".
     try testing.expect(std.mem.indexOf(u8, second, "\"tool_name\":\"<other>\"") != null);
     try testing.expect(std.mem.indexOf(u8, second, "\"tool_name\":\"Write\"") == null);
+}
+
+test "cli-flags-04: --tools narrows the advertised schema list to just the named tools" {
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+    testing.allocator.free(cfg.tools_allowlist);
+    cfg.tools_allowlist = try testing.allocator.dupe(u8, "Read,Grep");
+    cfg.tools_flag_set = true;
+
+    const schemas = [_]types.ToolSchema{
+        .{ .name = "Read", .description = "d", .json_schema = "{}" },
+        .{ .name = "Grep", .description = "d", .json_schema = "{}" },
+        .{ .name = "Bash", .description = "d", .json_schema = "{}" },
+    };
+
+    try testing.expect(hasCliToolFilters(&cfg));
+    const filtered = try filterByCliToolFlags(testing.allocator, &schemas, &cfg);
+    defer {
+        for (filtered) |s| {
+            testing.allocator.free(s.name);
+            testing.allocator.free(s.description);
+            testing.allocator.free(s.json_schema);
+        }
+        testing.allocator.free(filtered);
+    }
+
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+    try testing.expectEqualStrings("Read", filtered[0].name);
+    try testing.expectEqualStrings("Grep", filtered[1].name);
+}
+
+test "cli-flags-04: --disallowedTools removes just the named tool" {
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+    testing.allocator.free(cfg.disallowed_tools);
+    cfg.disallowed_tools = try testing.allocator.dupe(u8, "Bash");
+
+    const schemas = [_]types.ToolSchema{
+        .{ .name = "Read", .description = "d", .json_schema = "{}" },
+        .{ .name = "Bash", .description = "d", .json_schema = "{}" },
+    };
+
+    const filtered = try filterByCliToolFlags(testing.allocator, &schemas, &cfg);
+    defer {
+        for (filtered) |s| {
+            testing.allocator.free(s.name);
+            testing.allocator.free(s.description);
+            testing.allocator.free(s.json_schema);
+        }
+        testing.allocator.free(filtered);
+    }
+
+    try testing.expectEqual(@as(usize, 1), filtered.len);
+    try testing.expectEqualStrings("Read", filtered[0].name);
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "Bash"));
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "Read"));
+}
+
+test "cli-flags-04: --tools \"\" disables every tool while unset --tools leaves everything unrestricted" {
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+
+    // Not passed at all: --tools/--allowedTools/--disallowedTools are fully
+    // unrestricted (a plain tool like "Bash" is never blocked); the filter
+    // pass itself still runs by default because `--brief` defaults off (see
+    // the SendUserMessage-specific test below).
+    try testing.expect(hasCliToolFilters(&cfg));
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "Bash"));
+
+    // `--tools ""`: flag WAS passed, with an empty value -> disable all.
+    cfg.tools_flag_set = true;
+    try testing.expect(hasCliToolFilters(&cfg));
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "Bash"));
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "Read"));
+
+    // `--tools default`: flag WAS passed but the literal "default" keeps
+    // everything unrestricted, per Claude's own documented wording.
+    testing.allocator.free(cfg.tools_allowlist);
+    cfg.tools_allowlist = try testing.allocator.dupe(u8, "default");
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "Bash"));
+}
+
+test "cli-flags-missed-113/117: --brief gates SendUserMessage, off by default" {
+    const config_mod = @import("core/config.zig");
+    var cfg = try config_mod.Config.init(testing.allocator);
+    defer cfg.deinit(testing.allocator);
+
+    // Default (no --brief): SendUserMessage is hidden; every other tool
+    // (including the unrelated, always-available AttachContext) is not.
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "SendUserMessage"));
+    try testing.expect(isToolBlockedByCliFlags(&cfg, "send_user_message"));
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "AttachContext"));
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "Bash"));
+
+    const schemas = [_]types.ToolSchema{
+        .{ .name = "AttachContext", .description = "d", .json_schema = "{}" },
+        .{ .name = "SendUserMessage", .description = "d", .json_schema = "{}" },
+    };
+    {
+        const filtered = try filterByCliToolFlags(testing.allocator, &schemas, &cfg);
+        defer {
+            for (filtered) |s| {
+                testing.allocator.free(s.name);
+                testing.allocator.free(s.description);
+                testing.allocator.free(s.json_schema);
+            }
+            testing.allocator.free(filtered);
+        }
+        try testing.expectEqual(@as(usize, 1), filtered.len);
+        try testing.expectEqualStrings("AttachContext", filtered[0].name);
+    }
+
+    // --brief: SendUserMessage is now advertised too.
+    cfg.brief = true;
+    try testing.expect(!isToolBlockedByCliFlags(&cfg, "SendUserMessage"));
+    {
+        const filtered = try filterByCliToolFlags(testing.allocator, &schemas, &cfg);
+        defer {
+            for (filtered) |s| {
+                testing.allocator.free(s.name);
+                testing.allocator.free(s.description);
+                testing.allocator.free(s.json_schema);
+            }
+            testing.allocator.free(filtered);
+        }
+        try testing.expectEqual(@as(usize, 2), filtered.len);
+    }
+}
+
+test "cli-flags-04: executeToolCall denies a call to a tool excluded by --tools" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("core/test_helpers.zig");
+    const cwd = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(cwd);
+
+    const config_mod = @import("core/config.zig");
+    const policy_mod = @import("policy/policy.zig");
+    const logger_mod = @import("core/logger.zig");
+
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+    alloc.free(cfg.tools_allowlist);
+    cfg.tools_allowlist = try alloc.dupe(u8, "Read");
+    cfg.tools_flag_set = true;
+
+    var policy = try policy_mod.Policy.init(alloc);
+    defer policy.deinit();
+
+    var audit = try logger_mod.AuditLogger.init(alloc, cwd);
+    defer audit.deinit();
+
+    var session_tools = std.StringHashMap(void).init(alloc);
+    defer session_tools.deinit();
+
+    var rules = permission_rules_mod.Store.init(alloc);
+    defer rules.deinit();
+
+    const ctx = ToolExecContext{
+        .allocator = alloc,
+        .cwd = cwd,
+        .cfg = &cfg,
+        .policy = &policy,
+        .mcp = undefined,
+        .browser = null,
+        .audit = &audit,
+        .active_agent = null,
+        .interactive = false,
+        .auto_approve_high = false,
+        .plan_approved = false,
+        .yolo_mode = false,
+        .approval_handler = null,
+        .ask_user_ctx = null,
+        .ask_user_fn = null,
+        .session_approved_tools = &session_tools,
+        .permission_rules = &rules,
+        .cloud_telemetry_opt_in = false,
+        .control_plane_url = "",
+        .control_plane_token = "",
+        .is_git_repo = true,
+    };
+
+    var trace = try executeToolCall(ctx, "Bash", "command=echo hi");
+    defer trace.deinit(alloc);
+    try testing.expectEqual(types.RiskTier.BLOCKED, trace.risk);
+    try testing.expect(!trace.executed);
+    try testing.expect(std.mem.indexOf(u8, trace.output, "--allowedTools/--disallowedTools/--tools") != null);
 }

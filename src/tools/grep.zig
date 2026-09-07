@@ -45,7 +45,7 @@ pub const OutputMode = enum {
 };
 
 test "grep finds pattern in source" {
-    const result = try grep(testing.allocator, ".", "pub fn main", "src", 5, false, false, 0, "", "", .content);
+    const result = try grep(testing.allocator, ".", "pub fn main", "src", 5, false, false, 0, "", "", .content, 0, 0, 0, 0);
     defer testing.allocator.free(result);
     try testing.expect(result.len > 0);
     // If rg is not installed, we get an "unavailable" message instead of matches.
@@ -56,27 +56,27 @@ test "grep finds pattern in source" {
 }
 
 test "grep returns no matches or error for nonexistent pattern" {
-    const result = try grep(testing.allocator, ".", "ZZZZNONEXISTENT999", "src", 5, false, false, 0, "", "", .content);
+    const result = try grep(testing.allocator, ".", "ZZZZNONEXISTENT999", "src", 5, false, false, 0, "", "", .content, 0, 0, 0, 0);
     defer testing.allocator.free(result);
     // Either "no matches" or rg error message.
     try testing.expect(result.len > 0);
 }
 
 test "grep accepts glob filter" {
-    const result = try grep(testing.allocator, ".", "pub fn", "src", 5, false, false, 0, "*.zig", "", .content);
+    const result = try grep(testing.allocator, ".", "pub fn", "src", 5, false, false, 0, "*.zig", "", .content, 0, 0, 0, 0);
     defer testing.allocator.free(result);
     try testing.expect(result.len > 0);
 }
 
 test "grep accepts rg type filter" {
     // rg --type zig filters to just .zig files
-    const result = try grep(testing.allocator, ".", "pub fn", "src", 5, false, false, 0, "", "zig", .content);
+    const result = try grep(testing.allocator, ".", "pub fn", "src", 5, false, false, 0, "", "zig", .content, 0, 0, 0, 0);
     defer testing.allocator.free(result);
     try testing.expect(result.len > 0);
 }
 
 test "grep files_with_matches mode returns paths only" {
-    const result = try grep(testing.allocator, ".", "pub fn main", "src", 5, false, false, 0, "", "", .files_with_matches);
+    const result = try grep(testing.allocator, ".", "pub fn main", "src", 5, false, false, 0, "", "", .files_with_matches, 0, 0, 0, 0);
     defer testing.allocator.free(result);
     try testing.expect(result.len > 0);
     if (std.mem.indexOf(u8, result, "unavailable") == null and
@@ -103,7 +103,7 @@ test "grep files_with_matches mode returns paths only" {
 }
 
 test "grep count mode returns file:count pairs" {
-    const result = try grep(testing.allocator, ".", "pub fn", "src", 5, false, false, 0, "", "", .count);
+    const result = try grep(testing.allocator, ".", "pub fn", "src", 5, false, false, 0, "", "", .count, 0, 0, 0, 0);
     defer testing.allocator.free(result);
     try testing.expect(result.len > 0);
     if (std.mem.indexOf(u8, result, "unavailable") == null and
@@ -156,6 +156,10 @@ test "grep rejects a nonexistent absolute path with cwd-aware error" {
         "",
         "",
         .content,
+        0,
+        0,
+        0,
+        0,
     );
     defer testing.allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "path does not exist") != null);
@@ -190,6 +194,10 @@ test "grep accepts a regular file as search_path (unlike Glob)" {
         "",
         "",
         .content,
+        0,
+        0,
+        0,
+        0,
     );
     defer testing.allocator.free(result);
 
@@ -219,6 +227,10 @@ test "grep dot path short-circuits the validation check" {
         "",
         "",
         .content,
+        0,
+        0,
+        0,
+        0,
     );
     defer testing.allocator.free(result);
 
@@ -258,6 +270,15 @@ pub fn grep(
     glob: []const u8,
     type_filter: []const u8,
     output_mode: OutputMode,
+    // tools-20: asymmetric before/after context (rg -B/-A). 0 means "not set" --
+    // falls back to the symmetric `context_lines` (-C) when both are 0.
+    before_lines: usize,
+    after_lines: usize,
+    // tools-20: client-side pagination over the combined rg output, mirroring
+    // the reference's head_limit/offset. offset skips lines first; head_limit
+    // (0 = unlimited) then caps how many of the remaining lines are kept.
+    head_limit: usize,
+    offset: usize,
 ) ![]u8 {
     // Tilde expansion: `~/Projects` should map to `$HOME/Projects`
     // before rg ever sees it. Without this, rg walks a literal
@@ -349,12 +370,29 @@ pub fn grep(
         try argv.append("--type");
         try argv.append(type_filter);
     }
-    // Allocate at function scope so it survives until Child.run consumes argv
+    // Allocate at function scope so it survives until Child.run consumes argv.
+    // tools-20: -A/-B take priority when either is set (asymmetric context);
+    // otherwise fall back to the symmetric -C from `context_lines`.
+    var before_buf: [20]u8 = undefined;
+    var after_buf: [20]u8 = undefined;
     var ctx_buf: [20]u8 = undefined;
-    if (context_lines > 0 and output_mode == .content) {
-        const ctx_str = std.fmt.bufPrint(&ctx_buf, "{d}", .{context_lines}) catch "1";
-        try argv.append("-C");
-        try argv.append(ctx_str);
+    if (output_mode == .content) {
+        if (before_lines > 0 or after_lines > 0) {
+            if (before_lines > 0) {
+                const before_str = std.fmt.bufPrint(&before_buf, "{d}", .{before_lines}) catch "1";
+                try argv.append("-B");
+                try argv.append(before_str);
+            }
+            if (after_lines > 0) {
+                const after_str = std.fmt.bufPrint(&after_buf, "{d}", .{after_lines}) catch "1";
+                try argv.append("-A");
+                try argv.append(after_str);
+            }
+        } else if (context_lines > 0) {
+            const ctx_str = std.fmt.bufPrint(&ctx_buf, "{d}", .{context_lines}) catch "1";
+            try argv.append("-C");
+            try argv.append(ctx_str);
+        }
     }
     try argv.append(pattern);
     try argv.append(expanded_search_path);
@@ -380,5 +418,89 @@ pub fn grep(
         return msg;
     }
 
-    return result.stdout;
+    if (head_limit == 0 and offset == 0) return result.stdout;
+    defer allocator.free(result.stdout);
+    return paginateLines(allocator, result.stdout, offset, head_limit);
+}
+
+/// tools-20: skip `offset` lines, then keep at most `head_limit` of the
+/// remaining ones (0 = unlimited). Operates on the raw newline-delimited
+/// rg output regardless of output_mode -- each mode already emits one
+/// logical entry per line (a path, a "path:count", or a "path:line:text"
+/// match/context row).
+fn paginateLines(allocator: std.mem.Allocator, text: []const u8, offset: usize, head_limit: usize) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+
+    var idx: usize = 0;
+    var kept: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        // splitScalar yields a trailing empty segment when `text` ends with
+        // '\n' -- drop it so pagination counts real lines, not that artifact.
+        if (line.len == 0 and lines.peek() == null) break;
+        if (idx < offset) {
+            idx += 1;
+            continue;
+        }
+        if (head_limit > 0 and kept >= head_limit) break;
+        try out.appendSlice(line);
+        try out.append('\n');
+        idx += 1;
+        kept += 1;
+    }
+
+    return out.toOwnedSlice();
+}
+
+test "tools-20: head_limit and offset paginate the combined output" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "many.txt", .data = "match 1\nmatch 2\nmatch 3\nmatch 4\nmatch 5\n" });
+    const cwd = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    // No pagination: all 5 lines (content mode, -n prefixes each).
+    const all = try grep(testing.allocator, cwd, "match", "many.txt", 10, false, false, 0, "", "", .content, 0, 0, 0, 0);
+    defer testing.allocator.free(all);
+    if (std.mem.indexOf(u8, all, "unavailable") != null) return; // rg not installed
+
+    var all_lines: usize = 0;
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, all, "\n"), '\n');
+    while (it.next()) |_| all_lines += 1;
+    try testing.expectEqual(@as(usize, 5), all_lines);
+
+    // head_limit=2: only the first 2 lines survive.
+    const limited = try grep(testing.allocator, cwd, "match", "many.txt", 10, false, false, 0, "", "", .content, 0, 0, 2, 0);
+    defer testing.allocator.free(limited);
+    var limited_lines: usize = 0;
+    var it2 = std.mem.splitScalar(u8, std.mem.trimEnd(u8, limited, "\n"), '\n');
+    while (it2.next()) |_| limited_lines += 1;
+    try testing.expectEqual(@as(usize, 2), limited_lines);
+    try testing.expect(std.mem.indexOf(u8, limited, "match 1") != null);
+    try testing.expect(std.mem.indexOf(u8, limited, "match 5") == null);
+
+    // offset=3, head_limit=0: skips the first 3, keeps the rest (2 lines).
+    const skipped = try grep(testing.allocator, cwd, "match", "many.txt", 10, false, false, 0, "", "", .content, 0, 0, 0, 3);
+    defer testing.allocator.free(skipped);
+    try testing.expect(std.mem.indexOf(u8, skipped, "match 1") == null);
+    try testing.expect(std.mem.indexOf(u8, skipped, "match 4") != null);
+}
+
+test "tools-20: -B/-A produce asymmetric context distinct from -C" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "ctx.txt", .data = "line1\nline2\nMATCH\nline4\nline5\n" });
+    const cwd = try @import("../core/test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    // -B=0,-A=2: no lines before, two lines after.
+    const after_only = try grep(testing.allocator, cwd, "MATCH", "ctx.txt", 10, false, false, 0, "", "", .content, 0, 2, 0, 0);
+    defer testing.allocator.free(after_only);
+    if (std.mem.indexOf(u8, after_only, "unavailable") != null) return; // rg not installed
+    try testing.expect(std.mem.indexOf(u8, after_only, "line1") == null);
+    try testing.expect(std.mem.indexOf(u8, after_only, "line4") != null);
+    try testing.expect(std.mem.indexOf(u8, after_only, "line5") != null);
 }

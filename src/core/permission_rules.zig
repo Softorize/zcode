@@ -4,6 +4,14 @@ const rt = @import("zcode_runtime");
 const settings_sources = @import("settings_sources.zig");
 const env_mod = @import("env.zig");
 const mcp_name = @import("mcp_name.zig");
+const permission_rule_validation = @import("permission_rule_validation.zig");
+const path_utils = @import("path_utils.zig");
+// Note: permission_decision.zig imports THIS file (`rule.Action`), so this is
+// a deliberate circular @import -- Zig files are lazily-resolved namespaces,
+// not textual includes, so this is fine as long as neither side embeds the
+// other's type by value at comptime (we only reference `Mode`/`modeFromString`,
+// both free functions/enums, never a struct field of that type here).
+const permission_decision = @import("permission_decision.zig");
 
 pub const Action = enum {
     allow,
@@ -303,12 +311,30 @@ pub const Store = struct {
             .global => {},
             .workspace => |path| try validateField("workspace", path, false),
         }
+        // hooks-permissions-11: reject rule content the reference's
+        // customValidation map would reject (WebFetch URLs instead of
+        // `domain:`, WebSearch wildcards). Reuses the same
+        // `error.InvalidPermissionRule` every other malformed-rule path
+        // already uses, so settings.json loading (`addSettingsRule` /
+        // `loadFromFile`) silently skips the entry with a warning exactly
+        // like any other syntactically-invalid rule, and `/permissions add`
+        // (which pre-checks via `permission_rule_validation.validate` for a
+        // friendlier message) never even reaches this point for the rules it
+        // rejects.
+        if (permission_rule_validation.validate(tool, args_contains) != null) return error.InvalidPermissionRule;
 
         var rule = Rule{
             .action = action,
             .scope = try Scope.clone(self.allocator, scope),
             .tool = try self.allocator.dupe(u8, tool),
-            .args_contains = try self.allocator.dupe(u8, args_contains),
+            // hooks-permissions-12: expand a leading `~`/`~/` in file-pattern-
+            // tool rule content to the real home directory at add-time (not
+            // match-time) so `Read(~/.zshrc)` is stored as
+            // `Read(<home>/.zshrc)` and matches the tool's actual absolute
+            // path argument. This keeps `decide`/`match`/`argsMatch` untouched
+            // (no allocator threading through the hot dispatch path) since
+            // the stored content is already expanded.
+            .args_contains = try expandRuleTilde(self.allocator, tool, args_contains),
             .source_path = try self.allocator.dupe(u8, source_path),
             .source_line = source_line,
             .source_label = try self.allocator.dupe(u8, source_label),
@@ -549,6 +575,103 @@ pub const Store = struct {
         try self.addRule(action, scope, fields[2], fields[3], source_path, line_no, fields[4]);
     }
 };
+
+/// hooks-permissions-12: tools whose rule content is a file path (or glob over
+/// paths), mirroring the reference's `filePatternTools`. Content for any other
+/// tool is never tilde-expanded.
+const FILE_PATTERN_TOOLS = [_][]const u8{ "Read", "Write", "Edit", "Glob", "NotebookRead", "NotebookEdit", "Cd" };
+
+fn isFilePatternTool(tool: []const u8) bool {
+    for (FILE_PATTERN_TOOLS) |t| {
+        if (std.mem.eql(u8, t, tool)) return true;
+    }
+    return false;
+}
+
+/// Expand a leading `~`/`~/` in file-pattern-tool rule content to the real
+/// home directory. Every other case (a non-file-pattern tool, content that
+/// does not start with `~`, or an unhandled tilde variant like `~user`/`~+`/
+/// `~-` -- `path_utils.hasTildeVariant`'s domain, left literal to avoid a
+/// TOCTOU mismatch with what the shell would actually resolve) is returned as
+/// a plain dupe so the caller always owns the result uniformly. On a
+/// HOME-resolution failure (rare: HOME unset), the content is stored
+/// unexpanded rather than failing the whole `addRule` call.
+fn expandRuleTilde(allocator: std.mem.Allocator, tool: []const u8, content: []const u8) ![]u8 {
+    if (!isFilePatternTool(tool)) return allocator.dupe(u8, content);
+    if (content.len == 0 or content[0] != '~') return allocator.dupe(u8, content);
+    if (!(std.mem.eql(u8, content, "~") or std.mem.startsWith(u8, content, "~/"))) {
+        // ~user / ~+ / ~- and similar (path_utils.hasTildeVariant's domain).
+        return allocator.dupe(u8, content);
+    }
+    const home = path_utils.getHomeDir(allocator) catch return allocator.dupe(u8, content);
+    defer allocator.free(home);
+    if (std.mem.eql(u8, content, "~")) return allocator.dupe(u8, home);
+    return std.fs.path.join(allocator, &.{ home, content[2..] });
+}
+
+/// hooks-permissions-missed-148: resolve `.claude/settings.json`'s
+/// `permissions.defaultMode` scalar across all disk sources (last-source-wins,
+/// `settings_sources.sourceOrder()`), mapping the reference-documented values
+/// (`default`, `plan`, `acceptEdits`, `dontAsk`, `auto`) onto
+/// `permission_decision.Mode`. Deliberately excludes `bypassPermissions` --
+/// the reference schema does not offer it as a `defaultMode` value, only via
+/// `--dangerously-skip-permissions`/an explicit CLI flag. Returns null when no
+/// source sets a recognized value, so the caller's built-in default is
+/// unaffected. This is DISTINCT from `config.zig`'s `default_mode` (the
+/// AutoMode-dialog-persisted TOML key) -- the two must not clobber each other;
+/// callers combine them explicitly rather than this function reaching into
+/// config.zig itself.
+pub fn resolveDefaultMode(allocator: std.mem.Allocator, cwd: []const u8, flag_path: ?[]const u8) ?permission_decision.Mode {
+    var resolved: ?permission_decision.Mode = null;
+    for (settings_sources.sourceOrder()) |source| {
+        var parsed = (settings_sources.readSource(allocator, cwd, source, flag_path) catch null) orelse continue;
+        defer parsed.deinit();
+        const perms = settings_sources.getObject(parsed.value, "permissions") orelse continue;
+        const raw = settings_sources.getString(perms, "defaultMode") orelse continue;
+        if (std.mem.eql(u8, raw, "default") or
+            std.mem.eql(u8, raw, "plan") or
+            std.mem.eql(u8, raw, "acceptEdits") or
+            std.mem.eql(u8, raw, "dontAsk") or
+            std.mem.eql(u8, raw, "auto"))
+        {
+            resolved = permission_decision.modeFromString(raw);
+        }
+    }
+    return resolved;
+}
+
+/// config-layout-13: read `permissions.additionalDirectories` across every
+/// disk source (union, not override -- it is a permission-WIDENING list, so
+/// every source's entries apply, matching how the allow/deny/ask arrays are
+/// unioned across sources rather than last-wins). Returns an owned slice of
+/// owned path strings (possibly empty); caller frees each entry then the
+/// slice (mirrors `workspace_dirs.freeList`'s shape so a caller can merge the
+/// two lists uniformly). A source with no `permissions.additionalDirectories`
+/// key, or a malformed one, contributes nothing rather than failing the read.
+pub fn readAdditionalDirectoriesFromSettings(allocator: std.mem.Allocator, cwd: []const u8, flag_path: ?[]const u8) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    const disk_sources = [_]settings_sources.Source{ .policy, .flag, .user, .project, .local };
+    for (disk_sources) |source| {
+        var parsed = (settings_sources.readSource(allocator, cwd, source, flag_path) catch null) orelse continue;
+        defer parsed.deinit();
+        const perms = settings_sources.getObject(parsed.value, "permissions") orelse continue;
+        const arr = settings_sources.getArray(perms, "additionalDirectories") orelse continue;
+        for (arr) |item| {
+            const s = switch (item) {
+                .string => |v| v,
+                else => continue,
+            };
+            const trimmed = std.mem.trim(u8, s, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            try out.append(allocator, try allocator.dupe(u8, trimmed));
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 /// Shared predicate: does `rule` apply to `tool`/`args` in `cwd`?
 /// `args_contains.len == 0` is the tool-wide form (matches any args), mirroring
@@ -1348,4 +1471,236 @@ test "decideSkill: deny wins; name:* prefix allow; tool scope; benign miss" {
     defer store2.deinit();
     try store2.addRule(.deny, .global, "Bash", "foo", "rules.tsv", 1, "user");
     try testing.expect(store2.decideSkill("/repo", "foo") == null);
+}
+
+// ── hooks-permissions-11 / -12 / -missed-148 / config-layout-13 ──────────
+
+/// Point HOME (and clear XDG_CONFIG_HOME) at `home` for the duration of a
+/// test, restoring the prior values on `deinit`. Local, smaller cousin of the
+/// `HomeOverride` pattern already used above (`allowManagedPermissionRulesOnly
+/// drops non-policy rules`) -- factored here so the new tests below don't each
+/// repeat the ~30-line inline boilerplate.
+const TestHomeOverride = struct {
+    prev_home: ?[]u8,
+    prev_xdg: ?[]u8,
+
+    fn install(home: []const u8) !TestHomeOverride {
+        const prev_home = env_mod.getOwned(testing.allocator, "HOME") catch null;
+        const prev_xdg = env_mod.getOwned(testing.allocator, "XDG_CONFIG_HOME") catch null;
+        var home_z: [std.fs.max_path_bytes:0]u8 = undefined;
+        try testing.expect(home.len < home_z.len);
+        @memcpy(home_z[0..home.len], home);
+        home_z[home.len] = 0;
+        _ = setenv("HOME", &home_z, 1);
+        _ = unsetenv("XDG_CONFIG_HOME");
+        return .{ .prev_home = prev_home, .prev_xdg = prev_xdg };
+    }
+
+    fn deinit(self: *TestHomeOverride) void {
+        if (self.prev_home) |h| {
+            var hz: [std.fs.max_path_bytes:0]u8 = undefined;
+            if (h.len < hz.len) {
+                @memcpy(hz[0..h.len], h);
+                hz[h.len] = 0;
+                _ = setenv("HOME", &hz, 1);
+            }
+            testing.allocator.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+        if (self.prev_xdg) |x| {
+            var xz: [std.fs.max_path_bytes:0]u8 = undefined;
+            if (x.len < xz.len) {
+                @memcpy(xz[0..x.len], x);
+                xz[x.len] = 0;
+                _ = setenv("XDG_CONFIG_HOME", &xz, 1);
+            }
+            testing.allocator.free(x);
+        }
+    }
+};
+
+test "hooks-permissions-11: addRule rejects a WebFetch URL and a WebSearch wildcard" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    try testing.expectError(error.InvalidPermissionRule, store.addRule(.allow, .global, "WebFetch", "https://evil.com", "", 0, "user"));
+    try testing.expectError(error.InvalidPermissionRule, store.addRule(.allow, .global, "WebSearch", "claude*", "", 0, "user"));
+    // A well-formed rule for each still succeeds.
+    try store.addRule(.allow, .global, "WebFetch", "domain:example.com", "", 0, "user");
+    try store.addRule(.allow, .global, "WebSearch", "claude ai", "", 0, "user");
+    try testing.expectEqual(@as(usize, 2), store.rules.items.len);
+}
+
+test "hooks-permissions-11: settings.json load silently skips an invalid WebFetch rule" {
+    const test_helpers = @import("test_helpers.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"permissions\":{\"allow\":[\"WebFetch(https://evil.com)\",\"Bash(git *)\"]}}",
+    });
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try store.loadFromSettingsJson(testing.allocator, cwd, null);
+
+    // The malformed WebFetch rule is dropped; the valid Bash rule survives.
+    try testing.expectEqual(@as(usize, 1), store.rules.items.len);
+    try testing.expectEqualStrings("Bash", store.rules.items[0].tool);
+}
+
+test "hooks-permissions-12: Read(~/.zshrc) is stored pre-expanded and matches the real absolute path" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("test_helpers.zig");
+    const home = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(home);
+
+    var override = try TestHomeOverride.install(home);
+    defer override.deinit();
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try store.addRule(.allow, .global, "Read", "~/.zshrc", "", 0, "user");
+
+    const expected = try std.fs.path.join(testing.allocator, &.{ home, ".zshrc" });
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, store.rules.items[0].args_contains);
+
+    // The rule now matches a tool call carrying the real absolute path...
+    const args = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}\"}}", .{expected});
+    defer testing.allocator.free(args);
+    const decided = store.decide(home, "Read", args).?;
+    try testing.expectEqual(Action.allow, decided.action);
+
+    // ...but not some other unrelated path.
+    try testing.expect(store.decide(home, "Read", "{\"path\":\"/etc/passwd\"}") == null);
+}
+
+test "hooks-permissions-12: a bare ~ and non-file-pattern tools are handled correctly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("test_helpers.zig");
+    const home = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(home);
+
+    var override = try TestHomeOverride.install(home);
+    defer override.deinit();
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try store.addRule(.allow, .global, "Glob", "~", "", 0, "user");
+    try testing.expectEqualStrings(home, store.rules.items[0].args_contains);
+
+    // A non-file-pattern tool (Bash) keeps `~` literal -- it is not a path arg.
+    try store.addRule(.allow, .global, "Bash", "~/deploy.sh", "", 0, "user");
+    try testing.expectEqualStrings("~/deploy.sh", store.rules.items[1].args_contains);
+
+    // An unhandled tilde variant (~user) is left literal even for a
+    // file-pattern tool, to avoid a TOCTOU mismatch with shell expansion.
+    try store.addRule(.allow, .global, "Read", "~someuser/file", "", 0, "user");
+    try testing.expectEqualStrings("~someuser/file", store.rules.items[2].args_contains);
+}
+
+test "hooks-permissions-missed-148: resolveDefaultMode reads permissions.defaultMode, last-source-wins" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("test_helpers.zig");
+    const home = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(home);
+
+    var override = try TestHomeOverride.install(home);
+    defer override.deinit();
+
+    // No source sets it -> null (caller's built-in default applies).
+    try testing.expect(resolveDefaultMode(testing.allocator, home, null) == null);
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"permissions\":{\"defaultMode\":\"plan\"}}",
+    });
+    try testing.expectEqual(permission_decision.Mode.plan, resolveDefaultMode(testing.allocator, home, null).?);
+
+    // local (higher precedence than project) overrides it.
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.local.json",
+        .data = "{\"permissions\":{\"defaultMode\":\"acceptEdits\"}}",
+    });
+    try testing.expectEqual(permission_decision.Mode.acceptEdits, resolveDefaultMode(testing.allocator, home, null).?);
+
+    // auto round-trips too (hooks-permissions-05).
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.local.json",
+        .data = "{\"permissions\":{\"defaultMode\":\"auto\"}}",
+    });
+    try testing.expectEqual(permission_decision.Mode.auto, resolveDefaultMode(testing.allocator, home, null).?);
+}
+
+test "config-layout-13: readAdditionalDirectoriesFromSettings unions across sources" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A separate tmp dir for HOME, distinct from `cwd` below: config-layout-01
+    // made the `.user` source also read `~/.claude/settings.json`, so if HOME
+    // and cwd were the same directory (as they used to be safely reused in
+    // this test) the project-scope `.claude/settings.json` written below
+    // would ALSO be picked up as the user-scope file, double-counting its
+    // entries in the union. Keeping them distinct isolates this test to the
+    // project/local sources it actually means to exercise.
+    var home_tmp = testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const test_helpers = @import("test_helpers.zig");
+    const cwd = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+    const home = try test_helpers.tmpDirCwd(testing.allocator, &home_tmp);
+    defer testing.allocator.free(home);
+
+    var override = try TestHomeOverride.install(home);
+    defer override.deinit();
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data = "{\"permissions\":{\"additionalDirectories\":[\"/extra/dir\",\"/shared\"]}}",
+    });
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.local.json",
+        .data = "{\"permissions\":{\"additionalDirectories\":[\"/local/only\"]}}",
+    });
+
+    const dirs = try readAdditionalDirectoriesFromSettings(testing.allocator, cwd, null);
+    defer {
+        for (dirs) |d| testing.allocator.free(d);
+        testing.allocator.free(dirs);
+    }
+    try testing.expectEqual(@as(usize, 3), dirs.len);
+    var has_extra = false;
+    var has_shared = false;
+    var has_local = false;
+    for (dirs) |d| {
+        if (std.mem.eql(u8, d, "/extra/dir")) has_extra = true;
+        if (std.mem.eql(u8, d, "/shared")) has_shared = true;
+        if (std.mem.eql(u8, d, "/local/only")) has_local = true;
+    }
+    try testing.expect(has_extra and has_shared and has_local);
+}
+
+test "config-layout-13: readAdditionalDirectoriesFromSettings is empty with no configured sources" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_helpers = @import("test_helpers.zig");
+    const home = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(home);
+
+    var override = try TestHomeOverride.install(home);
+    defer override.deinit();
+
+    const dirs = try readAdditionalDirectoriesFromSettings(testing.allocator, home, null);
+    defer testing.allocator.free(dirs);
+    try testing.expectEqual(@as(usize, 0), dirs.len);
 }

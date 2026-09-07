@@ -55,9 +55,11 @@ pub fn parseArgs(args: []const u8) !AgentRunConfig {
     _ = try agent_isolation.classify(isolation, cwd_override);
     return .{
         .prompt = prompt,
-        // `agent` (specialist type) and `name` (team-addressable registry key)
-        // are distinct fields per the reference; do not conflate them (tools-14).
-        .agent = arg_parse.getArg(args, "agent"),
+        // tools-23: `subagent_type` is the reference-exact field name; `agent`
+        // stays an accepted synonym. `agent` (specialist type) and `name`
+        // (team-addressable registry key) are distinct fields per the
+        // reference; do not conflate them (tools-14).
+        .agent = arg_parse.getArg(args, "subagent_type") orelse arg_parse.getArg(args, "agent"),
         .model = arg_parse.getArg(args, "model"),
         .max_rounds = if (arg_parse.getArg(args, "max_rounds")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
@@ -165,6 +167,16 @@ test "parseArgs leaves multi-agent fields null when omitted" {
     try testing.expect(config.team_name == null);
     try testing.expect(config.mode == null);
     try testing.expect(config.description == null);
+}
+
+test "tools-23: parseArgs accepts subagent_type as the reference-exact synonym for agent" {
+    const config = try parseArgs("prompt=x,subagent_type=explore");
+    try testing.expectEqualStrings("explore", config.agent.?);
+}
+
+test "tools-23: subagent_type takes priority over agent when both are somehow present" {
+    const config = try parseArgs("prompt=x,subagent_type=explore,agent=verify");
+    try testing.expectEqualStrings("explore", config.agent.?);
 }
 
 test "parseArgs does not conflate agent and name" {

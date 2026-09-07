@@ -1,7 +1,7 @@
 # Project Instructions
 
 ## Toolchain
-**Zig 0.16.0 ("Juicy Main") required** (`minimum_zig_version = "0.16.0"` in `build.zig.zon`). The current working zig binary on this machine: `/Users/example/.local/zig/zig-aarch64-macos-0.16.0/zig`. Stock homebrew `zig` is still 0.15.x and will fail to compile.
+**Zig 0.16.0 ("Juicy Main") required** (`minimum_zig_version = "0.16.0"` in `build.zig.zon`). Homebrew `zig` (`/opt/homebrew/bin/zig`) is 0.16.0 and builds this repo; verify with `zig version` before assuming a toolchain problem. Full `zig build test` takes about 65s; `zig build -Doptimize=ReleaseFast` about 100s on Apple Silicon.
 
 ## Boot pattern (0.16)
 `src/main.zig` uses Juicy Main: `pub fn main(init: std.process.Init) !void`. `init.io`, `init.gpa`, `init.environ_map`, and `init.minimal.args.vector` are all available without re-deriving from the process.

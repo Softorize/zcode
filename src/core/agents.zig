@@ -6,12 +6,17 @@ const paths = @import("paths.zig");
 const helpers = @import("../tools/helpers.zig");
 const parse_helpers_mod = @import("parse_helpers.zig");
 const mcp_config = @import("mcp_config.zig");
+const frontmatter = @import("frontmatter.zig");
+const skill_types = @import("skill_types.zig");
 
 pub const AgentScope = enum {
     builtin,
     user,
     workspace,
     plugin,
+    /// cli-flags-05: defined inline via `--agents <json>` for this process
+    /// only (never read from or written to disk).
+    cli,
 };
 
 pub const AgentMode = enum {
@@ -61,6 +66,15 @@ pub const AgentSpec = struct {
     /// recursive value tree (swarm-tasks-12). Empty when absent; the hook
     /// registration parses this at spawn.
     hooks_json: []u8,
+    /// Declared display color (config-layout-04), one of `agent_color.
+    /// AGENT_COLORS`. Empty when absent. Parsed from a Markdown+frontmatter
+    /// agent's `color:` key (Claude Code subagent files carry this); JSON
+    /// agent definitions may also set it. Purely descriptive today (zcode's
+    /// prompt-bar renderer does not yet apply a per-agent accent, matching
+    /// the honest divergence already documented in `agent_color.zig`) -- it
+    /// is stored and surfaced so `agents show` round-trips what the file
+    /// declared.
+    color: []u8,
 
     pub fn deinit(self: *AgentSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -79,6 +93,7 @@ pub const AgentSpec = struct {
         allocator.free(self.permission_mode);
         allocator.free(self.memory);
         allocator.free(self.hooks_json);
+        allocator.free(self.color);
     }
 };
 
@@ -124,6 +139,8 @@ pub fn clone(allocator: std.mem.Allocator, spec: *const AgentSpec) !AgentSpec {
     errdefer allocator.free(memory);
     const hooks_json = try allocator.dupe(u8, spec.hooks_json);
     errdefer allocator.free(hooks_json);
+    const color = try allocator.dupe(u8, spec.color);
+    errdefer allocator.free(color);
 
     return .{
         .name = name,
@@ -142,6 +159,7 @@ pub fn clone(allocator: std.mem.Allocator, spec: *const AgentSpec) !AgentSpec {
         .max_turns = spec.max_turns,
         .memory = memory,
         .hooks_json = hooks_json,
+        .color = color,
     };
 }
 
@@ -181,6 +199,7 @@ pub fn scopeName(scope: AgentScope) []const u8 {
         .user => "user",
         .workspace => "workspace",
         .plugin => "plugin",
+        .cli => "cli",
     };
 }
 
@@ -189,6 +208,22 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]AgentSpec {
     errdefer freeList(allocator, out.items);
 
     try appendBuiltinAgents(allocator, &out);
+
+    // config-layout-03: also read Claude Code's agent locations (project
+    // `.claude/agents`, user `~/.claude/agents`) so a repo/machine already
+    // configured for Claude Code works with zcode unchanged. `appendFromDir`
+    // upserts by name (last write wins, see `upsert`), so these run BEFORE
+    // the zcode-native roots below: a same-named `.zcode`/`~/.zcode` agent
+    // overwrites its `.claude` counterpart, matching the repo convention
+    // that the zcode-native location wins on a name conflict.
+    const claude_project_dir = try std.fs.path.join(allocator, &.{ cwd, ".claude", "agents" });
+    defer allocator.free(claude_project_dir);
+    try appendFromDir(allocator, &out, claude_project_dir, .workspace);
+
+    if (paths.claudeHomePathAlloc(allocator, "agents")) |claude_user_dir| {
+        defer allocator.free(claude_user_dir);
+        try appendFromDir(allocator, &out, claude_user_dir, .user);
+    } else |_| {}
 
     const user_dir = try userAgentsDir(allocator);
     defer allocator.free(user_dir);
@@ -203,6 +238,11 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]AgentSpec {
     // builtin/user/workspace agent via the last-wins `upsert`, mirroring the
     // plugin-skills loader in skills.zig:appendPluginSkills.
     appendPluginAgents(allocator, &out, cwd) catch {};
+
+    // cli-flags-05: --agents <json> agents are appended (and take
+    // precedence via last-wins upsert) last, so a CLI-supplied definition
+    // always wins over a same-named file-defined one for this process.
+    appendCliAgents(allocator, &out) catch {};
 
     std.mem.sort(AgentSpec, out.items, {}, lessThan);
     return out.toOwnedSlice();
@@ -272,6 +312,9 @@ pub fn renderDetail(allocator: std.mem.Allocator, cwd: []const u8, raw_name: []c
     try out.writer().print("mode={s}\n", .{modeName(agent.mode)});
     try out.writer().print("model={s}\n", .{if (agent.model.len > 0) agent.model else "<inherit>"});
     try out.writer().print("source={s}\n", .{agent.source_path});
+    if (agent.color.len > 0) {
+        try out.writer().print("color={s}\n", .{agent.color});
+    }
     if (agent.tools.len == 0 or allowsAllTools(&agent)) {
         try out.writer().print("tools={s}\n", .{if (allowsAllTools(&agent)) "all" else "<inherit>"});
     } else {
@@ -335,13 +378,25 @@ fn appendFromDir(
     var it = dir.iterate();
     while (try it.next(rt.io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
         const path = try std.fs.path.join(allocator, &.{ root, entry.name });
         defer allocator.free(path);
 
-        const agent = try loadFile(allocator, path, scope);
-        try upsert(out, allocator, agent);
+        if (std.mem.endsWith(u8, entry.name, ".json")) {
+            const agent = try loadFile(allocator, path, scope);
+            try upsert(out, allocator, agent);
+            continue;
+        }
+        // config-layout-04: Claude Code subagents are Markdown files with
+        // YAML frontmatter, not JSON. Accept `.md` alongside the existing
+        // zcode-native `.json` format. Unlike the strict JSON branch above,
+        // a malformed/thin `.md` file degrades gracefully (frontmatter.zig's
+        // parser never errors) rather than aborting the whole listing.
+        if (std.mem.endsWith(u8, entry.name, ".md")) {
+            const agent = try loadMarkdownFile(allocator, path, entry.name, scope);
+            try upsert(out, allocator, agent);
+            continue;
+        }
     }
 }
 
@@ -368,6 +423,62 @@ fn appendPluginAgents(
     }
 }
 
+/// Env var `--agents <json>` is passed through as (set via `env.setOverride`
+/// from `main.zig`, the same "spawner sets env, reader reads it" pattern
+/// `SessionKind.fromEnv`/`ZCODE_SIMPLE` already use elsewhere). Kept as an
+/// env-equivalent rather than a new `list()` parameter so every existing
+/// call site keeps working unchanged.
+pub const ENV_CLI_AGENTS_JSON = "ZCODE_CLI_AGENTS_JSON";
+
+/// cli-flags-05: merge `--agents <json>` (`{"name":{"description":...,
+/// "prompt":...}}`) into `out`, taking precedence over any same-named
+/// file-defined agent (last-wins `upsert`, matching the plugin-agents
+/// precedence above). Never persisted to disk. A malformed or absent env
+/// value is a silent no-op -- `args.zig` already validated the JSON shape
+/// at parse time, so a failure here is either "flag never passed" (the
+/// common case) or an OOM, neither of which should block `agents list`.
+fn appendCliAgents(allocator: std.mem.Allocator, out: *std.array_list.Managed(AgentSpec)) !void {
+    const env_mod = @import("env.zig");
+    const raw = env_mod.getOwned(allocator, ENV_CLI_AGENTS_JSON) catch return;
+    defer allocator.free(raw);
+    if (raw.len == 0) return;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (!helpers.isSafeIdentifier(entry.key_ptr.*)) continue;
+        if (entry.value_ptr.* != .object) continue;
+        const def = entry.value_ptr.*.object;
+        // "prompt" is Claude's own --agents field name; "system_prompt" is
+        // accepted too so a file-derived JSON blob round-trips unchanged.
+        const system_prompt = getString(def, "system_prompt") orelse getString(def, "prompt") orelse "";
+
+        const spec = AgentSpec{
+            .name = allocator.dupe(u8, entry.key_ptr.*) catch continue,
+            .description = allocator.dupe(u8, getString(def, "description") orelse "") catch continue,
+            .system_prompt = allocator.dupe(u8, system_prompt) catch continue,
+            .model = allocator.dupe(u8, getString(def, "model") orelse "") catch continue,
+            .mode = parseMode(getString(def, "mode") orelse ""),
+            .tools = parseTools(allocator, def.get("tools")) catch continue,
+            .scope = .cli,
+            .source_path = allocator.dupe(u8, "--agents") catch continue,
+            .mcp_servers = &.{},
+            .disallowed_tools = parseTools(allocator, def.get("disallowedTools")) catch continue,
+            .skills = parseTools(allocator, def.get("skills")) catch continue,
+            .effort = allocator.dupe(u8, "") catch continue,
+            .permission_mode = allocator.dupe(u8, "") catch continue,
+            .max_turns = null,
+            .memory = allocator.dupe(u8, "") catch continue,
+            .hooks_json = allocator.dupe(u8, "") catch continue,
+            .color = allocator.dupe(u8, "") catch continue,
+        };
+        upsert(out, allocator, spec) catch continue;
+    }
+}
+
 const BuiltinAgentTemplate = struct {
     name: []const u8,
     description: []const u8,
@@ -379,7 +490,14 @@ const BuiltinAgentTemplate = struct {
 
 const builtin_agent_templates = [_]BuiltinAgentTemplate{
     .{
-        .name = "explore",
+        // tools-23: reference-exact casing (cc_system_prompt_2.1.261.md
+        // "### Agent": "Built-in agent types: claude (catch-all),
+        // claude-code-guide, Explore (read-only search agent),
+        // general-purpose, Plan (software architect), statusline-setup.").
+        // findByName/upsert compare case-insensitively, so a model (or a
+        // user's existing scripts/tests) spelling this "explore" still
+        // resolves to the same entry.
+        .name = "Explore",
         .description = "Read-only codebase investigation. Use for: finding patterns across files, tracing call chains, gathering evidence. Do NOT use for: making changes, running tests, or tasks requiring mutation.",
         .system_prompt =
         \\You are the explore specialist.
@@ -391,7 +509,8 @@ const builtin_agent_templates = [_]BuiltinAgentTemplate{
         .tools = &.{ "Read", "file_read", "Glob", "Grep", "GitDiff", "GitLog", "git_status", "WebFetch", "WebSearch", "JsonQuery", "TodoRead" },
     },
     .{
-        .name = "plan",
+        // tools-23: reference-exact casing, see the "Explore" note above.
+        .name = "Plan",
         .description = "Planning specialist for design and implementation strategy. Use for: breaking tasks into steps, identifying risks, creating checklists. Do NOT use for: executing code changes or running tests.",
         .system_prompt =
         \\You are the plan specialist.
@@ -403,6 +522,56 @@ const builtin_agent_templates = [_]BuiltinAgentTemplate{
         .tools = &.{ "Read", "file_read", "Glob", "Grep", "GitDiff", "GitLog", "git_status", "TodoRead", "TodoWrite" },
     },
     .{
+        // tools-23: the reference's default agent, used whenever
+        // subagent_type is omitted or set to an unrecognized custom name is
+        // NOT what happens here (an unrecognized name is still reported as
+        // "agent not found" -- see agent_history.activateAgentByNameImpl);
+        // this entry only covers the *explicit* `subagent_type:
+        // "general-purpose"` spelling and gives it an unrestricted tool
+        // allowlist (the reference's general-purpose agent has full tool
+        // access, matching the omitted-subagent_type default of "no agent
+        // restriction applied" already implemented at the AgentRun call
+        // site).
+        .name = "general-purpose",
+        .description = "General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. When you are searching for a keyword or file and are not confident that you will find the right match in the first few tries, use this agent to perform the search for you.",
+        .system_prompt =
+        \\You are a general-purpose agent. You have the full tool set available.
+        \\Investigate thoroughly, then take whatever concrete action the task calls for -- read, search, edit, run commands, or verify -- rather than stopping at a plan.
+        \\Report back with grounded findings and, when you changed anything, exactly what changed.
+        ,
+        .mode = .inherit,
+        .tools = &.{"*"},
+    },
+    .{
+        // tools-23: reference description verbatim except the product name
+        // (zcode never claims to be Claude Code -- see repo-wide rule).
+        .name = "statusline-setup",
+        .description = "Use this agent to configure the user's zcode status line setting.",
+        .system_prompt =
+        \\You are the statusline-setup specialist.
+        \\Configure the user's zcode status line: read their shell prompt/PS1 configuration if referenced, then write the equivalent `statusline` setting into `.zcode/settings.json` (or `~/.zcode/settings.json` for a user-wide default).
+        \\At the end of your response, tell the user that the "statusline-setup" agent must be used for further status line changes, and that they can ask again any time.
+        ,
+        .mode = .execution,
+        .tools = &.{ "Read", "file_read", "Write", "file_write", "Edit", "file_edit", "Bash", "shell", "Config" },
+    },
+    .{
+        // tools-23: claude-code-guide -> renamed zcode-guide per package
+        // notes (zcode must never claim to be Claude Code/Anthropic).
+        // Reference description trimmed to zcode's own surface (no Claude
+        // Agent SDK / Claude API / Claude Tag / claude-tag equivalents to
+        // point at).
+        .name = "zcode-guide",
+        .description = "Use this agent when the user asks questions (\"Can zcode...\", \"Does zcode...\", \"How do I...\") about zcode itself: CLI flags, slash commands, hooks, permissions, MCP servers, settings, config-directory layout, or keyboard shortcuts.",
+        .system_prompt =
+        \\You are the zcode guide agent. Your primary responsibility is helping users understand and use zcode effectively.
+        \\Ground every answer in this repository's actual behavior: read the relevant source (src/cli/args.zig for flags, src/repl_commands.zig for slash commands, src/core/config.zig for settings) or run `zcode --help` / `zcode <subcommand> --help` rather than guessing.
+        \\Prefer read-only tools. Do not mutate files or propose speculative answers.
+        ,
+        .mode = .execution,
+        .tools = &.{ "Read", "file_read", "Glob", "Grep", "GitDiff", "GitLog", "git_status", "WebFetch", "Bash", "shell" },
+    },
+    .{
         .name = "verify",
         .description = "Verification specialist for tests and validation. Use for: running tests, checking build status, confirming changes work. Do NOT use for: exploration or making additional code changes.",
         .system_prompt =
@@ -412,7 +581,7 @@ const builtin_agent_templates = [_]BuiltinAgentTemplate{
         \\Do not make unrelated code changes.
         ,
         .mode = .execution,
-        .tools = &.{ "RunTests", "GitDiff", "git_status", "Read", "Grep", "Glob", "Bash", "shell", "TaskPoll", "TaskOutput", "TodoRead", "TodoWrite" },
+        .tools = &.{ "RunTests", "GitDiff", "git_status", "Read", "Grep", "Glob", "Bash", "shell", "TaskGet", "TaskOutput", "TodoRead", "TodoWrite" },
     },
     .{
         .name = "reviewer",
@@ -478,6 +647,7 @@ fn buildBuiltinAgent(allocator: std.mem.Allocator, template: BuiltinAgentTemplat
         .max_turns = null,
         .memory = try allocator.dupe(u8, ""),
         .hooks_json = try allocator.dupe(u8, ""),
+        .color = try allocator.dupe(u8, ""),
     };
 }
 
@@ -548,7 +718,78 @@ fn loadFile(allocator: std.mem.Allocator, path: []const u8, scope: AgentScope) !
         .max_turns = parseMaxTurns(obj.get("maxTurns")),
         .memory = try allocator.dupe(u8, getString(obj, "memory") orelse ""),
         .hooks_json = try parseHooksJson(allocator, obj.get("hooks")),
+        .color = try allocator.dupe(u8, getString(obj, "color") orelse ""),
     };
+}
+
+/// Load a Markdown+YAML-frontmatter subagent definition (config-layout-04).
+/// Claude Code subagents are authored this way: a `---`-fenced frontmatter
+/// block (`name`, `description`, `tools`, `model`, `color`, `permissionMode`,
+/// `hooks`, `disallowedTools`) followed by the system-prompt body -- the same
+/// convention `commands.zig` and `skill_types.zig` already parse via
+/// `frontmatter.zig`. Reused here rather than a bespoke YAML reader.
+///
+/// Unlike the strict JSON loader above (`loadFile`, which rejects a
+/// definition missing `name`/`system_prompt`), this stays lenient: a missing
+/// `name:` falls back to the file's stem and a missing/empty body yields an
+/// empty (but present) system prompt. Markdown agent files are user-authored
+/// prose edited directly per the reference's own `/agents` guidance ("edit
+/// the files directly"), not machine-generated JSON, so one thin file should
+/// not abort the whole agents list.
+fn loadMarkdownFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    file_name: []const u8,
+    scope: AgentScope,
+) !AgentSpec {
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, path, allocator, .limited(256 * 1024));
+    defer allocator.free(data);
+    const clean = parse_helpers_mod.stripBom(data);
+
+    const stem = if (std.mem.lastIndexOfScalar(u8, file_name, '.')) |idx| file_name[0..idx] else file_name;
+
+    const block = frontmatter.extract(clean);
+    const fm = if (block) |b| b.body else "";
+    const body = if (block) |b| b.rest else clean;
+
+    const fm_name = frontmatter.getValue(fm, "name");
+    const eff_name = if (fm_name) |n| (if (n.len > 0) n else stem) else stem;
+
+    return .{
+        .name = try allocator.dupe(u8, eff_name),
+        .description = try allocator.dupe(u8, frontmatter.getValue(fm, "description") orelse ""),
+        .system_prompt = try allocator.dupe(u8, body),
+        .model = try allocator.dupe(u8, frontmatter.getValue(fm, "model") orelse ""),
+        .mode = .inherit,
+        .tools = try skill_types.parseCommaList(allocator, frontmatter.getValue(fm, "tools") orelse ""),
+        .scope = scope,
+        .source_path = try allocator.dupe(u8, path),
+        .mcp_servers = &.{},
+        .disallowed_tools = try skill_types.parseCommaList(allocator, getEitherFm(fm, "disallowedTools", "disallowed-tools") orelse ""),
+        .skills = try skill_types.parseCommaList(allocator, frontmatter.getValue(fm, "skills") orelse ""),
+        .effort = try allocator.dupe(u8, frontmatter.getValue(fm, "effort") orelse ""),
+        .permission_mode = try allocator.dupe(u8, getEitherFm(fm, "permissionMode", "permission-mode") orelse ""),
+        .max_turns = parseMaxTurnsStr(getEitherFm(fm, "maxTurns", "max-turns")),
+        .memory = try allocator.dupe(u8, frontmatter.getValue(fm, "memory") orelse ""),
+        .hooks_json = try allocator.dupe(u8, skill_types.jsonObjectFrom(fm, "hooks")),
+        .color = try allocator.dupe(u8, frontmatter.getValue(fm, "color") orelse ""),
+    };
+}
+
+/// Frontmatter lookup trying two spellings of the same key (camelCase and
+/// kebab-case), mirroring the same convenience `skill_types.zig` provides
+/// privately as `getEither`.
+fn getEitherFm(fm: []const u8, key_a: []const u8, key_b: []const u8) ?[]const u8 {
+    return frontmatter.getValue(fm, key_a) orelse frontmatter.getValue(fm, key_b);
+}
+
+/// String-valued `maxTurns`/`max-turns` frontmatter parse (the JSON loader's
+/// `parseMaxTurns` takes a `std.json.Value`; frontmatter values are always
+/// raw strings). Non-numeric or non-positive yields null (inherit).
+fn parseMaxTurnsStr(value: ?[]const u8) ?usize {
+    const v = value orelse return null;
+    const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch return null;
+    return if (n > 0) n else null;
 }
 
 /// Parse the `effort` field, which the reference accepts as either a string
@@ -669,6 +910,89 @@ const eqlIgnoreCase = @import("parse_helpers.zig").eqlIgnoreCase;
 
 const testing = std.testing;
 
+test "cli-flags-05: --agents json merges into list(), taking precedence over a file-defined agent" {
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers_mod.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    // A file-defined "reviewer" agent that --agents should override.
+    const agents_dir = try std.fs.path.join(testing.allocator, &.{ cwd, ".zcode", "agents" });
+    defer testing.allocator.free(agents_dir);
+    try std.Io.Dir.cwd().createDirPath(rt.io, agents_dir);
+    const file_path = try std.fs.path.join(testing.allocator, &.{ agents_dir, "reviewer.json" });
+    defer testing.allocator.free(file_path);
+    try std.Io.Dir.cwd().writeFile(rt.io, .{
+        .sub_path = file_path,
+        .data =
+        \\{"name":"reviewer","description":"file version","system_prompt":"You are the file reviewer."}
+        ,
+    });
+
+    try env_mod.setOverride(ENV_CLI_AGENTS_JSON,
+        \\{"reviewer":{"description":"Reviews code","prompt":"You are a CLI reviewer"},"helper":{"prompt":"You help"}}
+    );
+
+    const agents = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, agents);
+
+    var found_reviewer = false;
+    var found_helper = false;
+    for (agents) |a| {
+        if (eqlIgnoreCase(a.name, "reviewer")) {
+            found_reviewer = true;
+            try testing.expectEqual(AgentScope.cli, a.scope);
+            try testing.expectEqualStrings("You are a CLI reviewer", a.system_prompt);
+            try testing.expectEqualStrings("Reviews code", a.description);
+        }
+        if (eqlIgnoreCase(a.name, "helper")) found_helper = true;
+    }
+    try testing.expect(found_reviewer);
+    try testing.expect(found_helper);
+}
+
+test "cli-flags-05: findByName resolves a --agents-defined agent with no file on disk" {
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers_mod.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    try env_mod.setOverride(ENV_CLI_AGENTS_JSON,
+        \\{"reviewer":{"description":"d","prompt":"You are a reviewer"}}
+    );
+
+    const found = try findByName(testing.allocator, cwd, "reviewer");
+    try testing.expect(found != null);
+    var f = found.?;
+    defer f.deinit(testing.allocator);
+    try testing.expectEqualStrings("You are a reviewer", f.system_prompt);
+}
+
+test "cli-flags-05: a malformed --agents value is a silent no-op" {
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers_mod.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    try env_mod.setOverride(ENV_CLI_AGENTS_JSON, "not json");
+
+    const agents = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, agents);
+    // No crash, and the builtin agents are still present.
+    try testing.expect(agents.len > 0);
+}
+
+const test_helpers_mod = @import("test_helpers.zig");
+
 test "loadFile parses agent json" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -698,6 +1022,120 @@ test "loadFile parses agent json" {
     try testing.expectEqualStrings("Focus on regressions and missing tests.", agent.system_prompt);
     try testing.expect(agent.mode == .review);
     try testing.expectEqual(@as(usize, 3), agent.tools.len);
+}
+
+// config-layout-04: Markdown+YAML-frontmatter subagent definitions (Claude
+// Code's native format) load into a fully populated AgentSpec.
+test "loadMarkdownFile parses a Claude Code style Markdown+frontmatter agent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "reviewer.md",
+        .data =
+        \\---
+        \\name: reviewer
+        \\description: Reviews diffs
+        \\tools: Read, Grep
+        \\color: blue
+        \\---
+        \\You review code.
+        ,
+    });
+
+    const path = try @import("test_helpers.zig").tmpDirPath(testing.allocator, &tmp, "reviewer.md");
+    defer testing.allocator.free(path);
+
+    var agent = try loadMarkdownFile(testing.allocator, path, "reviewer.md", .workspace);
+    defer agent.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("reviewer", agent.name);
+    try testing.expectEqualStrings("Reviews diffs", agent.description);
+    try testing.expectEqualStrings("blue", agent.color);
+    try testing.expectEqual(@as(usize, 2), agent.tools.len);
+    try testing.expectEqualStrings("Read", agent.tools[0]);
+    try testing.expectEqualStrings("Grep", agent.tools[1]);
+    try testing.expect(std.mem.indexOf(u8, agent.system_prompt, "You review code.") != null);
+}
+
+test "loadMarkdownFile falls back to the file stem when frontmatter has no name" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "helper.md",
+        .data = "---\ndescription: nameless\n---\nBody.\n",
+    });
+
+    const path = try @import("test_helpers.zig").tmpDirPath(testing.allocator, &tmp, "helper.md");
+    defer testing.allocator.free(path);
+
+    var agent = try loadMarkdownFile(testing.allocator, path, "helper.md", .workspace);
+    defer agent.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("helper", agent.name);
+}
+
+// config-layout-03: `.claude/agents` (project) and `~/.claude/agents` (user)
+// are read alongside the zcode-native roots.
+test "list finds a project .claude/agents/*.md entry with no .zcode counterpart" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(rt.io, ".claude/agents");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/agents/reviewer.md",
+        .data = "---\nname: reviewer\ndescription: Reviews diffs\ntools: Read, Grep\ncolor: blue\n---\nYou review code.\n",
+    });
+
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const agents = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, agents);
+
+    var found: ?AgentSpec = null;
+    for (agents) |a| {
+        if (std.mem.eql(u8, a.name, "reviewer")) found = a;
+    }
+    const reviewer = found orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(AgentScope.workspace, reviewer.scope);
+    try testing.expectEqualStrings("blue", reviewer.color);
+    try testing.expectEqual(@as(usize, 2), reviewer.tools.len);
+}
+
+test "list finds a user ~/.claude/agents entry with no .zcode counterpart" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude/agents");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/agents/note-taker.md",
+        .data = "---\nname: note-taker\ndescription: Takes notes\n---\nTake notes.\n",
+    });
+
+    var cwd_tmp = testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &cwd_tmp);
+    defer testing.allocator.free(cwd);
+
+    const agents = try list(testing.allocator, cwd);
+    defer freeList(testing.allocator, agents);
+
+    var found: ?AgentSpec = null;
+    for (agents) |a| {
+        if (std.mem.eql(u8, a.name, "note-taker")) found = a;
+    }
+    const note_taker = found orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(AgentScope.user, note_taker.scope);
 }
 
 test "Task 10: agent definition mcpServers surfaces ServerConfigs" {
@@ -883,6 +1321,7 @@ test "allowsTool honors explicit allow list" {
         .max_turns = null,
         .memory = try testing.allocator.dupe(u8, ""),
         .hooks_json = try testing.allocator.dupe(u8, ""),
+        .color = try testing.allocator.dupe(u8, ""),
     };
     defer agent.deinit(testing.allocator);
 
@@ -904,6 +1343,70 @@ test "findByName resolves builtin agents" {
     try testing.expectEqual(agent.mode, .execution);
     try testing.expect(allowsTool(&agent, "Read"));
     try testing.expect(!allowsTool(&agent, "Write"));
+}
+
+test "tools-23: reference built-in agent types resolve case-insensitively" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    // "Explore"/"Plan" are the reference-exact display names; lowercase
+    // spellings (what a model or an old zcode transcript might send) still
+    // resolve to the same entry via case-insensitive lookup.
+    {
+        var agent = (try findByName(testing.allocator, cwd, "Explore")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expectEqualStrings("Explore", agent.name);
+    }
+    {
+        var agent = (try findByName(testing.allocator, cwd, "explore")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expectEqualStrings("Explore", agent.name);
+    }
+    {
+        var agent = (try findByName(testing.allocator, cwd, "plan")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expectEqualStrings("Plan", agent.name);
+    }
+}
+
+test "tools-23: general-purpose builtin has an unrestricted tool allowlist" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    var agent = (try findByName(testing.allocator, cwd, "general-purpose")) orelse return error.MissingBuiltinAgent;
+    defer agent.deinit(testing.allocator);
+
+    try testing.expectEqual(agent.scope, .builtin);
+    try testing.expect(allowsTool(&agent, "Read"));
+    try testing.expect(allowsTool(&agent, "Write"));
+    try testing.expect(allowsTool(&agent, "Bash"));
+}
+
+test "tools-23: statusline-setup and zcode-guide builtins resolve" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try @import("test_helpers.zig").tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    {
+        var agent = (try findByName(testing.allocator, cwd, "statusline-setup")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expect(allowsTool(&agent, "Write"));
+        try testing.expect(!allowsTool(&agent, "GitCommit"));
+    }
+    {
+        // Renamed from the reference's "claude-code-guide" -- zcode never
+        // claims to be Claude Code.
+        var agent = (try findByName(testing.allocator, cwd, "zcode-guide")) orelse return error.MissingBuiltinAgent;
+        defer agent.deinit(testing.allocator);
+        try testing.expect(allowsTool(&agent, "Read"));
+        try testing.expect(!allowsTool(&agent, "Write"));
+        try testing.expect((try findByName(testing.allocator, cwd, "claude-code-guide")) == null);
+    }
 }
 
 // ── Task 17.4: plugin-provided agents (plugins-04) ────────────────
@@ -1006,6 +1509,23 @@ test "Task 17.4: disabled plugin agents are absent from list" {
     // (trust_default = false), so its agents must not appear. The plugin ships
     // an agents/ dir to prove it is the disabled gate, not a missing dir, that
     // suppresses it.
+    //
+    // Pin HOME to a private tmp dir before touching the tmp workspace: trust
+    // status walks up via `git -C <cwd> rev-parse --show-toplevel`, which
+    // resolves this tmp dir (created under the real repo's .zig-cache/tmp) to
+    // THIS repo's own root -- and on a machine where the real
+    // ~/.zcode/trust/repos.json has already trusted this repo (e.g. a
+    // developer's checkout), that would make the "untrusted tmp" assumption
+    // false and the plugin load enabled. Pinning HOME points the trust-store
+    // lookup at an empty, private store so the test's trust_default=false
+    // premise holds regardless of the real machine's trust state.
+    var home_tmp = testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const fake_home = try @import("test_helpers.zig").tmpDirCwd(allocator, &home_tmp);
+    defer allocator.free(fake_home);
+    const home_restore = try pinPluginAgentsHome(allocator, fake_home);
+    defer home_restore.deinit(allocator);
+
     try tmp.dir.createDirPath(rt.io, ".zcode/plugins/plugb/agents");
     try tmp.dir.writeFile(rt.io, .{
         .sub_path = ".zcode/plugins/plugb/plugin.json",

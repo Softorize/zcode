@@ -20,6 +20,22 @@ pub const Event = enum {
     post_compact,
     subagent_start,
     subagent_stop,
+    /// hooks-permissions-03: parsed, dispatchable (`hooks.processDef` matches
+    /// and runs a `TeammateIdle` def exactly like any other lifecycle event --
+    /// see `hooks.zig`'s `.teammate_idle` branch), but DELIBERATELY DEFERRED
+    /// rather than wired to a fabricated trigger: firing it requires a live
+    /// in-process teammate idle/active run loop, which does not exist in
+    /// production code today. `core/teammate.zig`'s `Teammate.setActive`/
+    /// `setIdle` are the pure state-machine transitions such a loop would
+    /// call, but nothing outside that module's own tests constructs a
+    /// `Teammate` or calls them (`swarm-tasks-13`, cited in
+    /// `tools/team.zig`'s `signalTeammateAbort` doc comment, is the tracked,
+    /// not-yet-landed work that would add that loop -- today's teammates are
+    /// mailbox-file-addressed, not live in-process threads with observable
+    /// idle/active state). Wiring a real `TeammateIdle` firing point belongs
+    /// with that loop, not with hook dispatch: when it lands, call
+    /// `hooks.runEvent(alloc, .{.event = .teammate_idle, .cwd = ..., .teammate_name = tm.name, .team_name = tm.team})`
+    /// from the point the loop calls `tm.setIdle()`.
     teammate_idle,
     task_created,
     task_completed,
@@ -33,6 +49,19 @@ pub const Event = enum {
     notification,
     elicitation,
     elicitation_result,
+    // hooks-permissions-04: six more reference events that were missing from
+    // the enum entirely (not merely unwired). `post_tool_batch` fires once
+    // after a turn's full batch of parallel tool calls has resolved, before
+    // the next model request (distinct from `post_tool_use`, which fires per
+    // tool and may run concurrently). The other five round out the reference's
+    // canonical `Coe` event list so a settings.json hook configured under any
+    // of these keys is parsed rather than silently dropped by `fromName`.
+    post_tool_batch,
+    user_prompt_expansion,
+    pre_model_switch,
+    post_model_switch,
+    directory_added,
+    message_display,
 };
 
 /// Reference-exact PascalCase event name as used in settings.json keys.
@@ -65,6 +94,12 @@ pub fn canonicalName(e: Event) []const u8 {
         .notification => "Notification",
         .elicitation => "Elicitation",
         .elicitation_result => "ElicitationResult",
+        .post_tool_batch => "PostToolBatch",
+        .user_prompt_expansion => "UserPromptExpansion",
+        .pre_model_switch => "PreModelSwitch",
+        .post_model_switch => "PostModelSwitch",
+        .directory_added => "DirectoryAdded",
+        .message_display => "MessageDisplay",
     };
 }
 

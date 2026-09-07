@@ -9,13 +9,20 @@
 const std = @import("std");
 const hook_event = @import("hook_event.zig");
 
-pub const HookType = enum { command, prompt, http, agent };
+/// hooks-permissions-06 / -missed-163: `mcp_tool` invokes an already-configured
+/// MCP server's tool; `script` runs a named script file (like `command` but
+/// resolving a file rather than a shell string). The reference's `callback`/
+/// `function` variants are internal/programmatic-only (not among the five
+/// documented zod schema names: BashCommand/Prompt/Http/Agent/McpTool) and are
+/// not settings.json-expressible, so they are intentionally not modeled here.
+pub const HookType = enum { command, prompt, http, agent, mcp_tool, script };
 
 pub const HookDef = struct {
     event: hook_event.Event,
     matcher: []const u8 = "*",
     hook_type: HookType,
-    /// command (command type), prompt text (prompt/agent), or url (http).
+    /// command (command type), prompt text (prompt/agent), url (http), or
+    /// script file path (script type).
     body: []const u8 = "",
     model: []const u8 = "",
     timeout_s: ?u32 = null,
@@ -37,19 +44,54 @@ pub const HookDef = struct {
     /// http `allowedEnvVars`: names allowed for header interpolation. Each entry
     /// borrows from Parsed.
     allowed_env_vars: []const []const u8 = &.{},
+    /// hooks-permissions-07: command exec-form argument list. When non-empty,
+    /// `body` is resolved as an executable and spawned directly with these
+    /// arguments -- no shell -- so path placeholders substituted per-element as
+    /// plain strings never reach a shell parser (defeats shell-injection via
+    /// untrusted arg content). Each entry borrows from Parsed; the outer slice
+    /// is owned by `Parsed.arg_storage`.
+    args: []const []const u8 = &.{},
+    /// hooks-permissions-08: for `prompt` hooks, the `continue` value for the
+    /// `decision:"block"` outcome produced when the verifier returns `ok:false`.
+    /// Default false (the turn ends); `true` lets the turn proceed with the
+    /// hook's reason surfaced as additional context instead of stopping it.
+    continue_on_block: bool = false,
+    /// `mcp_tool` type only: the already-configured MCP server to invoke.
+    /// Borrows from Parsed.
+    mcp_server: []const u8 = "",
+    /// `mcp_tool` type only: the tool name on that server to call. Borrows from
+    /// Parsed.
+    mcp_tool: []const u8 = "",
+    /// `mcp_tool` type only: raw JSON object for the tool's input (supports
+    /// `${path}`-style interpolation from the hook's stdin payload at exec
+    /// time). Re-serialized; owned by `Parsed.headers_storage` (shared with the
+    /// http `headers` re-serialization -- both are "capture an object verbatim"
+    /// concerns keyed on the same storage list).
+    mcp_input_json: []const u8 = "",
+    /// `script` type only: true when this def came from the inline `script`
+    /// key (no `file`), meaning `body` holds raw script SOURCE TEXT rather
+    /// than a path to an existing file. The executor (hooks.zig) writes this
+    /// content to a fresh, executable temp file before spawning -- see
+    /// `hooks.writeInlineScriptTempFile`. False for every other type/form,
+    /// including a `file`-based script (where `body` already is a real path).
+    script_inline: bool = false,
 };
 
 pub const Parsed = struct {
     value: ?std.json.Parsed(std.json.Value) = null,
     defs: []HookDef = &.{},
-    /// Re-serialized http `headers` JSON objects. The `std.json.Value` does not
-    /// preserve source spans, so each http hook's headers object is re-emitted
-    /// here and `HookDef.headers_json` borrows from these allocations.
+    /// Re-serialized http `headers` / `mcp_tool` `input` JSON objects. The
+    /// `std.json.Value` does not preserve source spans, so each such object is
+    /// re-emitted here and `HookDef.headers_json`/`mcp_input_json` borrow from
+    /// these allocations.
     headers_storage: std.ArrayList([]u8) = .empty,
     /// Owned outer slices backing each `HookDef.allowed_env_vars`. The string
     /// elements themselves borrow from `value`; only the `[][]const u8` arrays
     /// are owned here.
     env_var_storage: std.ArrayList([][]const u8) = .empty,
+    /// Owned outer slices backing each `HookDef.args` (hooks-permissions-07).
+    /// The string elements themselves borrow from `value`.
+    arg_storage: std.ArrayList([][]const u8) = .empty,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Parsed) void {
@@ -58,6 +100,8 @@ pub const Parsed = struct {
         self.headers_storage.deinit(self.allocator);
         for (self.env_var_storage.items) |e| self.allocator.free(e);
         self.env_var_storage.deinit(self.allocator);
+        for (self.arg_storage.items) |a| self.allocator.free(a);
+        self.arg_storage.deinit(self.allocator);
         if (self.value) |*v| v.deinit();
         self.value = null;
         self.defs = &.{};
@@ -69,6 +113,8 @@ fn typeFromString(s: []const u8) ?HookType {
     if (std.mem.eql(u8, s, "prompt")) return .prompt;
     if (std.mem.eql(u8, s, "http")) return .http;
     if (std.mem.eql(u8, s, "agent")) return .agent;
+    if (std.mem.eql(u8, s, "mcp_tool")) return .mcp_tool;
+    if (std.mem.eql(u8, s, "script")) return .script;
     return null;
 }
 
@@ -134,6 +180,14 @@ fn captureEnvVars(allocator: std.mem.Allocator, storage: *std.ArrayList([][]cons
     return owned;
 }
 
+/// hooks-permissions-07: capture the string elements of a command hook's exec-
+/// form `args` array the same way `captureEnvVars` does. Non-string entries
+/// are skipped (a malformed array entry degrades gracefully rather than
+/// failing the whole hook def).
+fn captureArgs(allocator: std.mem.Allocator, storage: *std.ArrayList([][]const u8), v: std.json.Value) ![]const []const u8 {
+    return captureEnvVars(allocator, storage, v);
+}
+
 /// Parse settings JSON (the full settings object) into hook defs. Missing/empty
 /// `hooks` yields an empty list. Malformed entries are skipped, not errors.
 pub fn parse(allocator: std.mem.Allocator, settings_json: []const u8) !Parsed {
@@ -168,6 +222,11 @@ pub fn parse(allocator: std.mem.Allocator, settings_json: []const u8) !Parsed {
         for (env_var_storage.items) |e| allocator.free(e);
         env_var_storage.deinit(allocator);
     }
+    var arg_storage: std.ArrayList([][]const u8) = .empty;
+    errdefer {
+        for (arg_storage.items) |a| allocator.free(a);
+        arg_storage.deinit(allocator);
+    }
 
     var it = hooks_val.object.iterator();
     while (it.next()) |entry| {
@@ -186,6 +245,20 @@ pub fn parse(allocator: std.mem.Allocator, settings_json: []const u8) !Parsed {
                     .command => str(h.object.get("command"), ""),
                     .http => str(h.object.get("url"), ""),
                     .prompt, .agent => str(h.object.get("prompt"), ""),
+                    // hooks-permissions-missed-163: `file` is the primary form
+                    // (a script file path); fall back to inline `script`
+                    // content when `file` is absent -- `script_inline` below
+                    // tells the executor which case it is so it knows to
+                    // write `body` to a temp file before spawning (see
+                    // hooks.writeInlineScriptTempFile) rather than treating
+                    // it as an already-existing path.
+                    .script => if (h.object.get("file") != null)
+                        str(h.object.get("file"), "")
+                    else
+                        str(h.object.get("script"), ""),
+                    // hooks-permissions-06: mcp_tool has no shell/prompt body;
+                    // `mcp_server`/`mcp_tool` carry its identity instead.
+                    .mcp_tool => "",
                 };
                 // `asyncRewake` implies `async` per schemas/hooks.ts:63.
                 const async_rewake = boolOr(h.object.get("asyncRewake"), false);
@@ -194,8 +267,18 @@ pub fn parse(allocator: std.mem.Allocator, settings_json: []const u8) !Parsed {
                     try captureHeaders(allocator, &headers_storage, h.object.get("headers").?)
                 else
                     "";
+                const mcp_input_json = if (ht == .mcp_tool and h.object.get("input") != null)
+                    try captureHeaders(allocator, &headers_storage, h.object.get("input").?)
+                else
+                    "";
                 const allowed_env_vars = if (ht == .http and h.object.get("allowedEnvVars") != null)
                     try captureEnvVars(allocator, &env_var_storage, h.object.get("allowedEnvVars").?)
+                else
+                    &.{};
+                // hooks-permissions-07: exec-form `args`, currently documented
+                // for the `command` type only.
+                const hook_args = if (ht == .command and h.object.get("args") != null)
+                    try captureArgs(allocator, &arg_storage, h.object.get("args").?)
                 else
                     &.{};
                 try defs.append(allocator, .{
@@ -213,6 +296,14 @@ pub fn parse(allocator: std.mem.Allocator, settings_json: []const u8) !Parsed {
                     .async_rewake = async_rewake,
                     .headers_json = headers_json,
                     .allowed_env_vars = allowed_env_vars,
+                    .args = hook_args,
+                    // hooks-permissions-08: continueOnBlock is documented for
+                    // prompt hooks (the "decision:block" outcome producer).
+                    .continue_on_block = if (ht == .prompt) boolOr(h.object.get("continueOnBlock"), false) else false,
+                    .mcp_server = if (ht == .mcp_tool) str(h.object.get("server"), "") else "",
+                    .mcp_tool = if (ht == .mcp_tool) str(h.object.get("tool"), "") else "",
+                    .mcp_input_json = mcp_input_json,
+                    .script_inline = ht == .script and h.object.get("file") == null,
                 });
             }
         }
@@ -223,6 +314,7 @@ pub fn parse(allocator: std.mem.Allocator, settings_json: []const u8) !Parsed {
         .defs = try defs.toOwnedSlice(allocator),
         .headers_storage = headers_storage,
         .env_var_storage = env_var_storage,
+        .arg_storage = arg_storage,
         .allocator = allocator,
     };
 }
@@ -330,6 +422,36 @@ test "parse reads if, shell, statusMessage, async, asyncRewake, model, headers, 
     // allowedEnvVars captured as a single-element slice.
     try testing.expectEqual(@as(usize, 1), ht.allowed_env_vars.len);
     try testing.expectEqualStrings("TOKEN", ht.allowed_env_vars[0]);
+}
+
+test "hooks-permissions-07: parse captures a command hook's exec-form args verbatim, with no shell interpretation" {
+    const json =
+        \\{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/usr/bin/prettier","args":["a b","$(whoami)","--write"]}]}]}}
+    ;
+    var p = try parse(testing.allocator, json);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 1), p.defs.len);
+    const d = p.defs[0];
+    try testing.expectEqualStrings("/usr/bin/prettier", d.body);
+    try testing.expectEqual(@as(usize, 3), d.args.len);
+    // Captured byte-for-byte: no shell metacharacter interpretation at parse
+    // time -- `$(whoami)` is an opaque string, not a substitution to expand.
+    try testing.expectEqualStrings("a b", d.args[0]);
+    try testing.expectEqualStrings("$(whoami)", d.args[1]);
+    try testing.expectEqualStrings("--write", d.args[2]);
+}
+
+test "hooks-permissions-07: args is empty when absent, and is only read for the command type" {
+    const json =
+        \\{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"./x.sh"}]},{"matcher":"*","hooks":[{"type":"prompt","prompt":"check","args":["ignored"]}]}]}}
+    ;
+    var p = try parse(testing.allocator, json);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 2), p.defs.len);
+    try testing.expectEqual(@as(usize, 0), p.defs[0].args.len);
+    // A `prompt` hook has no exec form; a stray `args` key on it is ignored
+    // rather than misapplied.
+    try testing.expectEqual(@as(usize, 0), p.defs[1].args.len);
 }
 
 test "parse defaults new fields and implies async from asyncRewake" {

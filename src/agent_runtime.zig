@@ -59,6 +59,7 @@ const budget_control_mod = @import("core/budget_control.zig");
 const structured_output_mod = @import("tools/structured_output.zig");
 const model_usage_mod = @import("core/model_usage.zig");
 const hooks_mod = @import("core/hooks.zig");
+const hook_io_mod = @import("core/hook_io.zig");
 const plugins_mod = @import("core/plugins.zig");
 const async_hook_registry = @import("core/async_hook_registry.zig");
 const agent_registry_mod = @import("core/agent_registry.zig");
@@ -157,6 +158,61 @@ pub const ToolTrace = struct {
     }
 };
 
+/// bundled-skills-03/17: an owned snapshot of a skill's `allowed_tools`/
+/// `disallowed_tools` frontmatter, held on the runtime for as long as that
+/// skill is "active" (see `AgentRuntime.active_skill_restriction`'s doc
+/// comment for the exact lifetime rule). Owned separately from the
+/// originating `SkillSpec` because the spec is `deinit`'d as soon as the skill
+/// finishes rendering/forking, well before later tool calls need to consult
+/// the restriction.
+const ActiveSkillRestriction = struct {
+    skill_name: []u8 = &.{},
+    allowed_tools: [][]u8 = &.{},
+    disallowed_tools: [][]u8 = &.{},
+
+    fn deinit(self: *ActiveSkillRestriction, allocator: std.mem.Allocator) void {
+        if (self.skill_name.len > 0) allocator.free(self.skill_name);
+        freeOwnedStrList(allocator, self.allowed_tools);
+        freeOwnedStrList(allocator, self.disallowed_tools);
+        self.* = .{};
+    }
+};
+
+fn freeOwnedStrList(allocator: std.mem.Allocator, list: [][]u8) void {
+    for (list) |s| allocator.free(s);
+    if (list.len > 0) allocator.free(list);
+}
+
+fn dupeOwnedStrList(allocator: std.mem.Allocator, list: [][]u8) ![][]u8 {
+    if (list.len == 0) return &.{};
+    const out = try allocator.alloc([]u8, list.len);
+    var filled: usize = 0;
+    errdefer {
+        // Free each already-dup'd string individually, then the backing
+        // array at its FULL allocated length -- `allocator.free` requires the
+        // exact slice it handed out, so freeing `out[0..filled]` here (a
+        // shorter sub-slice) would be wrong.
+        for (out[0..filled]) |s| allocator.free(s);
+        allocator.free(out);
+    }
+    for (list, 0..) |item, i| {
+        out[i] = try allocator.dupe(u8, item);
+        filled += 1;
+    }
+    return out;
+}
+
+fn buildActiveSkillRestriction(allocator: std.mem.Allocator, spec: *const skills_types.SkillSpec) !ActiveSkillRestriction {
+    if (spec.allowed_tools.len == 0 and spec.disallowed_tools.len == 0) return .{};
+    const name = try allocator.dupe(u8, spec.name);
+    errdefer allocator.free(name);
+    const allowed = try dupeOwnedStrList(allocator, spec.allowed_tools);
+    errdefer freeOwnedStrList(allocator, allowed);
+    const disallowed = try dupeOwnedStrList(allocator, spec.disallowed_tools);
+    errdefer freeOwnedStrList(allocator, disallowed);
+    return .{ .skill_name = name, .allowed_tools = allowed, .disallowed_tools = disallowed };
+}
+
 /// Phase 22 (agent-loop-deep-11): machine-readable discriminator for why a turn
 /// ended. `final_text` continues to carry the human-readable message a CLI user
 /// reads; this enum is the structured signal a JSON consumer (ci_output.zig)
@@ -182,10 +238,20 @@ pub const TurnResult = struct {
     /// Why the turn ended. Defaults to `.completed` so existing struct
     /// literals that omit it keep the prior (normal-completion) meaning.
     terminal_reason: TerminalReason = .completed,
+    /// headless-sdk-missed-184: the extended-thinking text for the round
+    /// that produced `final_text`, when the model returned one and
+    /// `cfg.ui_thinking_summary` is on. Null on every early-return path
+    /// above (interrupted/cancelled/hook-blocked turns never had a model
+    /// round at all) and whenever the final round's history entry doesn't
+    /// exactly match `final_text` (a later synthetic message replaced it) --
+    /// never a fabricated/guessed thinking block, only ever the real
+    /// `response.reasoning_text` already captured in `self.history`.
+    final_thinking: ?[]u8 = null,
 
     pub fn deinit(self: *TurnResult, allocator: std.mem.Allocator) void {
         allocator.free(self.final_text);
         allocator.free(self.preprocessor_summary);
+        if (self.final_thinking) |t| allocator.free(t);
         for (self.tool_traces) |*t| t.deinit(allocator);
         allocator.free(self.tool_traces);
     }
@@ -194,6 +260,13 @@ pub const TurnResult = struct {
 pub const OneShotOutput = struct {
     body: []u8,
     strict_violation: bool,
+    /// headless-sdk-02: the session id the turn actually ran under, duped out
+    /// before the owning `AgentRuntime` is torn down (which frees its own
+    /// copy). Lets a caller honor `--no-session-persistence` on the LEGACY
+    /// (non-SDK-transport) `--print`/`run`/`exec` path, where no `RunContext`
+    /// is ever built -- see `sdk_headless.removeSessionArtifacts`. Callers
+    /// that don't need it still own it and must free it like `body`.
+    session_id: []u8,
 };
 
 pub const TokenStatus = struct {
@@ -219,6 +292,12 @@ pub const AskUserPromptFn = *const fn (ctx: *anyopaque, allocator: std.mem.Alloc
 pub const ApprovalHandler = struct {
     ctx: *anyopaque,
     prompt: ApprovalPromptFn,
+    /// headless-sdk-01: optional hook a host-driven (`sdk_relay`) handler uses
+    /// to receive the REAL tool_name/input/tool_use_id for the tool call about
+    /// to be gated, since `prompt` itself only ever receives a human-readable
+    /// message. Called once per dispatched tool call, before `prompt` may run.
+    /// `null` for every non-relay handler (REPL, stdin) -- they are unaffected.
+    setPending: ?*const fn (ctx: *anyopaque, tool_name: []const u8, input_json: []const u8, tool_use_id: []const u8) void = null,
 };
 
 /// Minimum turn duration (seconds) at which we emit a terminal
@@ -360,11 +439,83 @@ const McpInstructionDelta = struct {
     removed_count: usize = 0,
 };
 
+/// config-layout-missed-148: the CLI-flag-vs-settings.json precedence for
+/// `AgentRuntime.permission_mode_override`'s initial value, factored out as a
+/// pure function (no IO) so the precedence itself is unit-testable without a
+/// full `AgentRuntime` (whose settings.json reads are unconditionally skipped
+/// under the test binary -- see the `is_test` guard at the one call site).
+///
+/// `cfg_approval_mode` is `cfg.approval_mode` (`Config.approval_mode`): it
+/// only ever holds a reference mode spelling (acceptEdits/plan/
+/// bypassPermissions/dontAsk/auto/default) when the user passed
+/// `--approval-mode`/`--permission-mode` with a reference value (see
+/// `core/config_parse.applyCliOverrides` -- CLI-absent leaves it at
+/// `Config.init`'s "tiered-auto" default, one of zcode's own legacy names).
+/// So "does cfg_approval_mode name a reference mode" doubles, without extra
+/// plumbing, as "did the user explicitly ask for one via the CLI" -- an
+/// explicit CLI flag always wins over `from_settings`. `from_settings` is the
+/// pre-resolved `permission_rules.resolveDefaultMode` result (null when no
+/// settings.json source sets `permissions.defaultMode`, or under test).
+///
+/// Known, accepted approximation: a user who explicitly types a LEGACY name
+/// (e.g. `--approval-mode manual`) is indistinguishable here from one who
+/// never passed the flag at all, so a configured `defaultMode` still wins in
+/// that specific case. Getting that exactly right needs a dedicated "was this
+/// explicit" bit threaded through `Config`, out of scope for this fix.
+fn resolveInitialPermissionMode(cfg_approval_mode: []const u8, from_settings: ?permission_decision_mod.Mode) ?permission_decision_mod.Mode {
+    if (permission_decision_mod.isReferenceModeName(cfg_approval_mode)) {
+        return permission_decision_mod.modeFromString(cfg_approval_mode);
+    }
+    return from_settings;
+}
+
 fn resolvePermissionRulesPath(allocator: std.mem.Allocator) ![]u8 {
     if (@import("builtin").is_test) return allocator.dupe(u8, "");
     var path_set = try paths_mod.resolve(allocator);
     defer path_set.deinit(allocator);
     return allocator.dupe(u8, path_set.permission_rules_path);
+}
+
+/// config-layout-13: union `cfg.additional_directories` -- the wp4 CLI
+/// carrier for repeated `--add-dir <path>` flags, comma-joined by
+/// `cli.args.appendCommaJoined` -- into `base` (already the persisted
+/// `/add-dir` list unioned with settings.json's `permissions
+/// .additionalDirectories`, per `workspace_dirs.loadWithSettings`).
+/// Consumes (frees) `base` and returns a new owned slice; on error `base`
+/// is left untouched so the caller's `catch base` fallback stays valid.
+/// Empty entries (an empty `cfg.additional_directories`, or a stray comma)
+/// contribute nothing. Deduplicated against `base` and against itself.
+fn unionCliAdditionalDirectories(allocator: std.mem.Allocator, base: [][]u8, cli_joined: []const u8) ![][]u8 {
+    if (cli_joined.len == 0) return base;
+
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    try out.ensureUnusedCapacity(allocator, base.len);
+    for (base) |p| out.appendAssumeCapacity(try allocator.dupe(u8, p));
+
+    var it = std.mem.splitScalar(u8, cli_joined, ',');
+    while (it.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var dup = false;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, trimmed)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try out.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+    // Take ownership of the new slice BEFORE freeing `base` so a failure in
+    // `toOwnedSlice` (the only fallible step left) leaves `base` intact for
+    // the caller's `catch base` fallback -- freeing it first then failing
+    // would hand the caller a dangling slice.
+    const owned = try out.toOwnedSlice(allocator);
+    workspace_dirs_mod.freeList(allocator, base);
+    return owned;
 }
 
 /// True for WebFetch / WebSearch / HttpRequest. agent_tools classifies
@@ -536,6 +687,33 @@ pub const AgentRuntime = struct {
     strict: bool,
     yolo_mode: bool,
     session_id: []u8,
+    /// hooks-permissions-09: the session's on-disk transcript path (reference
+    /// `transcript_path` base hook field), computed once from `session_id` at
+    /// construction. `store.sessionPath` only fails on a malformed
+    /// `session_id`, which `store.createSessionId()`'s own output never is --
+    /// see the `catch` at the one construction site for the (unreachable in
+    /// practice) fallback.
+    transcript_path: []u8,
+    /// hooks-permissions-09: a per-user-turn correlator (reference `Se` base
+    /// schema's optional `prompt_id`), synthesized once at the top of the
+    /// root runtime's `handlePromptDetailed*` (mirroring how `tool_use_id` is
+    /// synthesized once per tool call in agent_tools.zig) and copied by value
+    /// into any sub-agent `AgentRuntime` spawned during that turn, so every
+    /// hook fired anywhere in the turn's tree shares one id. Fixed-size
+    /// buffer (not heap-allocated) so a sub-agent can inherit it by a plain
+    /// struct-field copy with no allocation or ownership to manage. See
+    /// `promptId()`.
+    prompt_id_buf: [24]u8 = undefined,
+    prompt_id_len: usize = 0,
+    /// hooks-permissions-09: the reference `Se` base schema's optional
+    /// `agent_id`. Empty for the root runtime (no data source distinguishes
+    /// "the" main agent from itself); synthesized once when a sub-agent is
+    /// spawned (`spawnChildAgent`) and set on the CHILD runtime before it
+    /// runs, so the child's own tool-call hooks and the parent's
+    /// SubagentStart/SubagentStop hooks about it all carry the same id. See
+    /// `agentId()`.
+    agent_id_buf: [24]u8 = undefined,
+    agent_id_len: usize = 0,
     history: agent_history.History,
     snapshot: types.SessionSnapshot,
     approval_handler: ?ApprovalHandler,
@@ -572,6 +750,16 @@ pub const AgentRuntime = struct {
     /// plan instead of guessing from heuristic text matching.
     pending_plan_markdown: ?[]u8 = null,
     current_reporter: ?repl.ProgressReporter = null,
+    /// bundled-skills-03/17: the tool-surface restriction (`allowed-tools`/
+    /// `disallowed-tools` frontmatter) of the most recently run skill, enforced
+    /// by `blockedBySkillRestriction` at every `executeToolCallDispatch` call.
+    /// Empty (the default) means no restriction is active. Set by
+    /// `setActiveSkillRestriction` on every inline skill run (replacing any
+    /// prior restriction, so a later unrestricted skill lifts an earlier one --
+    /// there is no other "skill ended" signal for an inline run, mirroring the
+    /// reference's session-wide tool-permission-context union) and on a forked
+    /// skill's child runtime (scoped to that child's lifetime by construction).
+    active_skill_restriction: ActiveSkillRestriction = .{},
     session_approved_tools: std.StringHashMap(void),
     /// Skill names invoked this session. A runtime field (not history), so it
     /// survives compaction; re-surfaced in the awareness listing each turn so
@@ -691,7 +879,7 @@ pub const AgentRuntime = struct {
     /// runtime is a background agent bound to a task, the round loop checks
     /// `summary_cadence.shouldSummarize` at each round boundary and, when it
     /// fires, writes a cheap progress summary into the bound task's record so
-    /// TaskPoll/TaskOutput surface it to the parent. `bg_summary_task_id` and
+    /// TaskGet/TaskOutput surface it to the parent. `bg_summary_task_id` and
     /// `bg_summary_cwd` are borrowed (owned by the spawning BackgroundCtx and
     /// live as long as the run); both null on the main agent so the hook is a
     /// no-op there. `bg_summary_last_round` and `bg_summary_started_at` track
@@ -765,7 +953,22 @@ pub const AgentRuntime = struct {
     ///   - session_end_fired: SessionEnd fires once at deinit; guards a double
     ///     fire if deinit is reached twice.
     session_start_fired: bool = false,
+    /// hooks-permissions-02: Setup fires alongside SessionStart (the
+    /// reference's `ALWAYS_EMITTED_HOOK_EVENTS` groups them as the two
+    /// always-on lifecycle events); this guards its own once-only firing so
+    /// the two stay independently idempotent even if a future caller fires
+    /// them from different points.
+    setup_fired: bool = false,
     session_end_fired: bool = false,
+    /// hooks-permissions-03: true once InstructionsLoaded has fired at least
+    /// once this session. The FIRST genuine instruction-discovery miss (see
+    /// the `prompt_engine.build` call site) reports `load_reason:
+    /// "session_start"`; every subsequent miss (caused by /clear, /compact,
+    /// or an axis-epoch bump) reports "compact" -- the closest fit in the
+    /// reference's five-value enum for "something forced a re-discovery
+    /// mid-session" (zcode has no finer-grained distinction between those
+    /// triggers at this call site).
+    instructions_loaded_fired: bool = false,
 
     /// Phase 11 Task 6 (sessions-06): set once we have attempted AI-title
     /// generation for this session so the best-effort generator never re-runs
@@ -888,7 +1091,19 @@ pub const AgentRuntime = struct {
         errdefer workspace_dirs_mod.freeList(allocator, additional_directories);
         if (!@import("builtin").is_test) {
             const empty: [][]u8 = &.{};
-            additional_directories = workspace_dirs_mod.load(allocator) catch empty;
+            // config-layout-13: also union in settings.json's
+            // `permissions.additionalDirectories` so a checked-in team
+            // declaration widens the workspace without a `/add-dir` ever
+            // having been run.
+            const from_settings = workspace_dirs_mod.loadWithSettings(allocator, cwd, null) catch empty;
+            // config-layout-13: consume the wp4 CLI carrier `cfg.additional_directories`
+            // (a comma-joined list built from repeated `--add-dir <path>` flags,
+            // src/main.zig / src/cli/args.zig) directly now that it exists,
+            // unioning single-invocation `--add-dir` roots in alongside the
+            // persisted `/add-dir` list and settings.json's array. Deduplicated
+            // against `from_settings` (which is itself already deduplicated
+            // against the persisted list).
+            additional_directories = unionCliAdditionalDirectories(allocator, from_settings, cfg.additional_directories) catch from_settings;
         }
 
         // bash-shell-02: source the user's rc once at session start and
@@ -904,6 +1119,16 @@ pub const AgentRuntime = struct {
         if (!@import("builtin").is_test) {
             shell_snapshot_path = shell_snapshot_mod.createForSession(allocator) catch null;
         }
+
+        // hooks-permissions-09: session_id is computed as a local so
+        // transcript_path (its derived on-disk path) can be built from it
+        // before the struct literal below. `store.sessionPath` only fails on
+        // a malformed session_id, which our own freshly-minted one never is;
+        // the empty-string fallback keeps `AgentRuntime.init` infallible on
+        // this account rather than surfacing an unreachable-in-practice error.
+        const session_id = try store.createSessionId();
+        errdefer allocator.free(session_id);
+        const transcript_path = store.sessionPath(session_id) catch try allocator.dupe(u8, "");
 
         return .{
             .allocator = allocator,
@@ -921,20 +1146,29 @@ pub const AgentRuntime = struct {
             .auto_approve_high = auto_approve_high,
             .strict = strict,
             .yolo_mode = yolo_mode,
-            .session_id = try store.createSessionId(),
+            .session_id = session_id,
+            .transcript_path = transcript_path,
             .history = agent_history.History.init(allocator, store),
             .snapshot = try allocEmptySnapshot(allocator),
             .approval_handler = null,
             .ask_user_ctx = null,
             .ask_user_fn = null,
-            // Seed the live permission mode from cfg.approval_mode only when the
-            // config carries a Claude Code reference mode name. Legacy modes
-            // (tiered-auto/manual/strict) leave this null so the gate keeps
-            // using cfg.approval_mode byte-for-byte (no regression).
-            .permission_mode_override = if (permission_decision_mod.isReferenceModeName(cfg.approval_mode))
-                permission_decision_mod.modeFromString(cfg.approval_mode)
-            else
-                null,
+            // Seed the live permission mode: an explicit reference-mode CLI
+            // flag wins; otherwise config-layout-missed-148's
+            // `.claude/settings.json` `permissions.defaultMode`; otherwise
+            // null (the gate keeps using cfg.approval_mode's legacy
+            // tiered-auto/manual/strict engine byte-for-byte -- no
+            // regression). See `resolveInitialPermissionMode`'s doc comment
+            // for why this precedence is correct without threading an extra
+            // "was this explicit" bit through Config, and why it is distinct
+            // from (and never reads) `cfg.default_mode`, the unrelated
+            // AutoMode-dialog TOML key. The settings.json read itself is
+            // behind the is_test guard like every other disk read in this
+            // constructor so unit tests stay hermetic.
+            .permission_mode_override = resolveInitialPermissionMode(
+                cfg.approval_mode,
+                if (!@import("builtin").is_test) permission_rules_mod.resolveDefaultMode(allocator, cwd, null) else null,
+            ),
             .requested_mode = null,
             .pending_plan_markdown = null,
             .session_approved_tools = std.StringHashMap(void).init(allocator),
@@ -1085,6 +1319,7 @@ pub const AgentRuntime = struct {
             self.allocator.free(p);
         }
         self.allocator.free(self.session_id);
+        self.allocator.free(self.transcript_path);
         self.allocator.free(self.active_provider);
         self.allocator.free(self.active_model);
         self.allocator.free(self.preprocessor_provider);
@@ -1099,6 +1334,7 @@ pub const AgentRuntime = struct {
         if (self.pending_plan_markdown) |plan| self.allocator.free(plan);
         self.history.deinit();
         freeSnapshot(self.allocator, self.snapshot);
+        self.active_skill_restriction.deinit(self.allocator);
         self.clearSessionApprovedTools();
         self.session_approved_tools.deinit();
         self.clearInvokedSkills();
@@ -1353,9 +1589,42 @@ pub const AgentRuntime = struct {
         const self: *AgentRuntime = @ptrCast(@alignCast(ctx));
         if (std.mem.eql(u8, method, "sampling/createMessage"))
             return try agent_history.handleMcpSamplingRequest(self.buildMcpContext(), params_json);
-        if (std.mem.eql(u8, method, "elicitation/create"))
-            return try agent_history.handleMcpElicitationRequest(self.buildMcpContext(), params_json);
+        if (std.mem.eql(u8, method, "elicitation/create")) {
+            // hooks-permissions-03: fire Elicitation immediately before the
+            // actual prompt (agent_history.handleMcpElicitationRequest owns
+            // the real approve/deny UX -- this wrapper is the one owned
+            // "hook emission point" call site around it, per this package's
+            // agent_runtime.zig ownership scope) and ElicitationResult right
+            // after it resolves, carrying the request/response JSON as the
+            // lifecycle `message` field (the closest existing generic
+            // carrier; Elicitation has no reference-documented matcher
+            // target to wire a dedicated discriminator against).
+            self.fireElicitationHook(.elicitation, params_json);
+            const result = try agent_history.handleMcpElicitationRequest(self.buildMcpContext(), params_json);
+            self.fireElicitationHook(.elicitation_result, result);
+            return result;
+        }
         return null;
+    }
+
+    /// See `mcpBridgeHandleRequest`'s elicitation/create branch. Best-effort
+    /// and non-blocking: elicitation already has its own real approve/deny
+    /// UX via the MCP protocol itself, so a hook here observes rather than
+    /// gates (matching `fireNotificationHook`/`firePostToolBatchHook`).
+    fn fireElicitationHook(self: *AgentRuntime, event: hooks_mod.HookEvent, payload_json: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = event,
+            .cwd = self.cwd,
+            .message = payload_json,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
     }
 
     fn mcpBridgeHandleNotification(ctx: *anyopaque, allocator: std.mem.Allocator, server_name: []const u8, method: []const u8, params_json: []const u8) anyerror!void {
@@ -1451,6 +1720,13 @@ pub const AgentRuntime = struct {
         // the parent would never see it.
         if (self.depth == 0) {
             common.beginNewRequest();
+            // hooks-permissions-09: synthesize this turn's `prompt_id`
+            // (mirrors `tool_use_id`'s per-call synthesis in agent_tools.zig)
+            // so every hook fired anywhere during this turn -- including any
+            // sub-agent spawned from it, which inherits the value by copy in
+            // `spawnChildAgent` -- carries the same correlator.
+            const pid = std.fmt.bufPrint(&self.prompt_id_buf, "prompt_{x}", .{clock.nowNanos()}) catch "";
+            self.prompt_id_len = pid.len;
             // sdk-headless-06: clear any stale SDK interrupt from a prior turn so
             // a new turn does not abort immediately. Same root-only ownership
             // rule as the cancel flag above.
@@ -1469,6 +1745,7 @@ pub const AgentRuntime = struct {
         // the last turn so their additionalContext lands before this prompt.
         if (self.depth == 0) {
             self.maybeFireSessionStart();
+            self.maybeFireSetup();
             self.drainAsyncHooks();
         }
 
@@ -1726,6 +2003,20 @@ pub const AgentRuntime = struct {
         // skips Stop hooks when the last turn is an API error). Set true in the
         // error-break path below; consulted at the turn-end Stop-hook gate.
         var api_error_break = false;
+        // hooks-permissions-02 (corrected semantics): StopFailure fires
+        // INSTEAD OF Stop when this turn ends because the model/API call
+        // itself errored -- see `fireStopFailureHook`'s doc comment for the
+        // correction from the original gap guess. `stop_failure_error`/
+        // `stop_failure_error_details` are static strings (error-name /
+        // describeProviderError switch arms), so borrowing them past the
+        // catch block below is safe with no allocation. `last_assistant`
+        // borrows the prior assistant turn's content straight out of
+        // `self.history` (captured before the error turn is appended, so it
+        // still points at the PRECEDING turn) -- best-effort and optional,
+        // matching the reference schema.
+        var stop_failure_error: []const u8 = "";
+        var stop_failure_details: []const u8 = "";
+        var stop_failure_last_assistant: ?[]const u8 = null;
         stop_retry: while (true) {
             while (!skip_model_loop and rounds < round_budget) : (rounds += 1) {
                 // sdk-headless-06: an SDK `interrupt` control_request sets a
@@ -1851,6 +2142,16 @@ pub const AgentRuntime = struct {
                             tool_schemas = filtered;
                         }
                     }
+
+                    // cli-flags-04: --allowedTools/--disallowedTools/--tools
+                    // restrict the primary session's own advertised/dispatchable
+                    // tool set, on top of any agent-scoped restriction above.
+                    if (agent_tools.hasCliToolFilters(self.cfg)) {
+                        const filtered = try agent_tools.filterByCliToolFlags(self.allocator, tool_schemas, self.cfg);
+                        if (owned_tool_schemas) |schemas| tool_registry.freeSchemas(self.allocator, schemas);
+                        owned_tool_schemas = filtered;
+                        tool_schemas = filtered;
+                    }
                 }
 
                 const mcp_instruction_delta = try self.collectMcpInstructionDeltas(tool_schemas, true);
@@ -1948,6 +2249,16 @@ pub const AgentRuntime = struct {
                 // visible. Best-effort -- a skills-dir scan error must not break the
                 // turn.
                 self.updateActivatedConditionalSkills() catch {};
+                // hooks-permissions-03: InstructionsLoaded fires exactly when
+                // `prompt_engine.build` below performs a genuine
+                // CLAUDE.md/ZCODE.md/rules re-discovery, not on every round --
+                // `instructions_mod.DiscoveryCache.misses` only increments on
+                // an actual filesystem re-walk (a cache hit leaves it
+                // untouched; see `core/instructions.zig`'s `discover`), which
+                // happens at session start and again whenever the prompt
+                // engine's instructions axis epoch bumps (/clear, /compact,
+                // an explicit reload).
+                const instructions_misses_before = self.instruction_cache.misses;
                 var built = try prompt_engine.build(
                     self.allocator,
                     self.cfg,
@@ -1969,8 +2280,19 @@ pub const AgentRuntime = struct {
                     &self.git_capture_cache,
                     working_context,
                     prompt_mode,
+                    !self.interactive,
                 );
                 defer built.envelope.deinit();
+
+                // hooks-permissions-03: a genuine miss just refreshed
+                // `self.instruction_cache.entries` (`cacheStore` runs on
+                // every miss, `discover`'s early-return-on-hit path never
+                // touches `entries`) -- fire one InstructionsLoaded per
+                // loaded memory file. Best-effort: never blocks the turn.
+                if (self.instruction_cache.misses != instructions_misses_before) {
+                    self.fireInstructionsLoadedHooks(!self.instructions_loaded_fired);
+                    self.instructions_loaded_fired = true;
+                }
 
                 const next_summary_text = try self.allocator.dupe(u8, built.conversation_summary);
                 self.allocator.free(summary_text);
@@ -2088,6 +2410,25 @@ pub const AgentRuntime = struct {
                         break;
                     }
                     const description = common.describeProviderError(err);
+                    // hooks-permissions-02 (corrected): capture StopFailure's
+                    // fields BEFORE this error becomes the newest history
+                    // turn, so `last_assistant_message` still reflects what
+                    // the assistant said before the API error (null on the
+                    // very first turn). Both `@errorName(err)` and
+                    // `description` are static strings (comptime literals in
+                    // `describeProviderError`'s switch), so no allocation is
+                    // needed to keep them alive past this catch block.
+                    stop_failure_error = @errorName(err);
+                    stop_failure_details = description;
+                    stop_failure_last_assistant = blk: {
+                        const turns = self.history.view();
+                        var idx = turns.len;
+                        while (idx > 0) {
+                            idx -= 1;
+                            if (turns[idx].role == .assistant) break :blk turns[idx].content;
+                        }
+                        break :blk null;
+                    };
                     const err_msg = try std.fmt.allocPrint(self.allocator, "Model error: {s} (provider={s}, model={s})\n\n{s}", .{ @errorName(err), self.active_provider, self.active_model, description });
                     try self.appendHistoryTurn(.assistant, err_msg);
                     self.allocator.free(final_text);
@@ -2638,7 +2979,7 @@ pub const AgentRuntime = struct {
                         emitProgressFmt(reporter, "polling background task progress ({d}/{d})", .{ auto_continuations, max_auto_continuations });
                         try self.appendHistoryTurn(
                             .system,
-                            "A background task was started in the previous round. Do not stop after launching it. Continue autonomously: call TaskPoll or TaskOutput now to inspect the task state before claiming completion. If the task is still running, keep polling until it completes or report the concrete blocker.",
+                            "A background task was started in the previous round. Do not stop after launching it. Continue autonomously: call TaskGet or TaskOutput now to inspect the task state before claiming completion. If the task is still running, keep polling until it completes or report the concrete blocker.",
                         );
                         continue;
                     }
@@ -2659,7 +3000,7 @@ pub const AgentRuntime = struct {
                         emitProgressFmt(reporter, "requesting verification before completion ({d}/2)", .{verification_reprompt_attempts});
                         try self.appendHistoryTurn(
                             .system,
-                            "Verification is still required before completion. Run an appropriate verification tool now, such as RunTests, GitDiff, git_status, TaskPoll, TaskOutput, or a read-only shell status/build/test command. If verification is impossible, return a concrete blocker explaining exactly why it could not be run.",
+                            "Verification is still required before completion. Run an appropriate verification tool now, such as RunTests, GitDiff, git_status, TaskGet, TaskOutput, or a read-only shell status/build/test command. If verification is impossible, return a concrete blocker explaining exactly why it could not be run.",
                         );
                         continue;
                     }
@@ -2726,6 +3067,13 @@ pub const AgentRuntime = struct {
                 var round_had_action_tool_attempt = false;
                 var round_had_failed_action_tool = false;
                 var round_had_successful_action_tool = false;
+                // hooks-permissions-04: `traces` accumulates across the WHOLE
+                // turn (every round), so mark where this round's entries
+                // begin now -- both the parallel batch pass below and the
+                // sequential loop append into the same list -- and fire
+                // PostToolBatch once after both have finished, covering
+                // every call this round regardless of which pass ran it.
+                const round_trace_start = traces.items.len;
 
                 // Parallel execution pass: batch read-only tools and run concurrently.
                 // Track which call indices were executed in parallel to skip them
@@ -2947,6 +3295,17 @@ pub const AgentRuntime = struct {
                     }
                 }
 
+                // hooks-permissions-04: PostToolBatch fires exactly once here,
+                // after every tool call this round (parallel batch + sequential
+                // alike) has resolved and its own PostToolUse/PostToolUseFailure
+                // hook has already run, and BEFORE any round-level continue/
+                // break decision below sends the turn back to the model. Only
+                // fires when the round actually ran at least one tool (matching
+                // the reference: an empty batch is not a batch).
+                if (traces.items.len > round_trace_start) {
+                    self.firePostToolBatchHook(traces.items[round_trace_start..]);
+                }
+
                 if (strict_violation_any) {
                     try self.appendHistoryTurn(.assistant, "Strict mode violation: one or more tool invocations were denied or blocked.");
                     break;
@@ -3105,6 +3464,13 @@ pub const AgentRuntime = struct {
                     continue :stop_retry;
                 }
                 if (stop_outcome.reason) |r| self.allocator.free(r);
+            } else if (self.depth == 0 and self.pending_plan_markdown == null and api_error_break) {
+                // hooks-permissions-02 (corrected semantics): StopFailure
+                // fires exactly where Stop was skipped for the death-spiral
+                // guard above -- the turn ended because the model/API call
+                // itself errored, so there is no force-continue semantic
+                // (fire-and-forget, like Notification/PostToolBatch).
+                self.fireStopFailureHook(stop_failure_error, stop_failure_details, stop_failure_last_assistant);
             }
             break :stop_retry;
         }
@@ -3129,6 +3495,11 @@ pub const AgentRuntime = struct {
         emitProgress(reporter, "saving session state");
         // Record the working directory as the session's origin breadcrumb
         // (sessions-04) so a picker can later show "(from <dir>)".
+        // sessions-storage-missed-199: mark this snapshot as a post-compaction
+        // summary (compact_boundary marker + isCompactSummary:true) exactly
+        // when THIS turn actually ran compaction -- every other turn's
+        // periodic snapshot save stays a plain "summary" record.
+        if (compaction_applied_any) self.store.markNextSnapshotAsCompact();
         try self.store.appendSnapshot(self.session_id, &self.snapshot, summary_text, self.cwd);
 
         // Check if automatic dream consolidation should run
@@ -3247,7 +3618,32 @@ pub const AgentRuntime = struct {
             .strict_violation = strict_violation_any,
             .preprocessor_summary = pp_summary,
             .terminal_reason = terminal_reason,
+            .final_thinking = self.thinkingForFinalText(final_text),
         };
+    }
+
+    /// headless-sdk-missed-184: recover the extended-thinking text behind
+    /// `final_text`, if any. `appendHistoryTurnWithThinking` records the
+    /// model's `reasoning_text` alongside its answer turn-by-turn as the
+    /// round loop runs (ui-render-04), so the most recent assistant turn
+    /// whose `content` matches `final_text` byte-for-byte carries the exact
+    /// thinking block that produced it -- not a guess, and not present at
+    /// all on the many early-return paths above (hook-blocked, interrupted,
+    /// cancelled) that never appended a matching turn to begin with.
+    fn thinkingForFinalText(self: *AgentRuntime, final_text: []const u8) ?[]u8 {
+        const view = self.history.view();
+        var i: usize = view.len;
+        while (i > 0) {
+            i -= 1;
+            if (view[i].role != .assistant) continue;
+            if (view[i].thinking) |th| {
+                if (std.mem.eql(u8, view[i].content, final_text)) {
+                    return self.allocator.dupe(u8, th) catch null;
+                }
+            }
+            break;
+        }
+        return null;
     }
 
     // --- Delegating methods to sub-modules ---
@@ -3268,6 +3664,22 @@ pub const AgentRuntime = struct {
     }
 
     fn executeToolCallDispatch(self: *AgentRuntime, name: []const u8, args: []const u8) !ToolTrace {
+        // headless-sdk-01: a host-driven session's can_use_tool relay needs the
+        // REAL tool_name/input for the upcoming dispatch (previously hardcoded
+        // to ""/"{}" -- see sdk/structured_io.zig's RelayApprover). This is the
+        // single call site that knows `name`/`args` for every dispatched tool
+        // call, so it is the one place we stamp them onto the relay before the
+        // gate runs; the gate itself (agent_tools.effectiveApproval) is
+        // unchanged and still only ever sees `ctx`/`prompt`.
+        if (self.sdk_relay) |relay| {
+            if (relay.setPending) |setFn| setFn(relay.ctx, name, args, "");
+        }
+        // bundled-skills-03/17: refuse a call outside the active skill's
+        // declared tool surface BEFORE it reaches the Skill-run intercept or
+        // the generic dispatcher -- this is the run-path enforcement of
+        // `allowed-tools`/`disallowed-tools`, not merely the permission
+        // auto-allow grant a few lines below already provides.
+        if (try self.blockedBySkillRestriction(name, args)) |trace| return trace;
         // Intercept Skill action=run so we can apply the skill's autonomy
         // directives the generic dispatch can't see: session-scoped
         // allowed-tools auto-allow and context: fork (isolated child runtime).
@@ -3276,6 +3688,48 @@ pub const AgentRuntime = struct {
             if (try self.tryExecuteSkillRun(name, args)) |trace| return trace;
         }
         return agent_tools.executeToolCall(self.buildToolExecContext(), name, args);
+    }
+
+    /// bundled-skills-03/17: true (and a finished, executed=false denial
+    /// trace) when `name` is outside the active skill's declared tool
+    /// surface. `allowed_tools` narrows the surface to EXACTLY that list when
+    /// non-empty; otherwise a non-empty `disallowed_tools` blocks exactly
+    /// those names (mirrors the precedence documented on `SkillSpec.
+    /// disallowed_tools`: ignored once `allowed_tools` is set). No active
+    /// restriction (the common case) always returns null.
+    fn blockedBySkillRestriction(self: *AgentRuntime, name: []const u8, args: []const u8) !?ToolTrace {
+        const restriction = self.active_skill_restriction;
+        if (restriction.allowed_tools.len == 0 and restriction.disallowed_tools.len == 0) return null;
+        if (!skills_types.isToolBlockedBySkillRestriction(restriction.allowed_tools, restriction.disallowed_tools, name)) return null;
+
+        return ToolTrace{
+            .name = try self.allocator.dupe(u8, name),
+            .args = try self.allocator.dupe(u8, args),
+            .risk = .LOW,
+            .approval_state = .denied,
+            .executed = false,
+            .duration_ms = 0,
+            .output = try std.fmt.allocPrint(
+                self.allocator,
+                "tool '{s}' is not available: skill '{s}' restricts the active tool set to its {s}",
+                .{
+                    name,
+                    restriction.skill_name,
+                    if (restriction.allowed_tools.len > 0) "allowed-tools" else "disallowed-tools",
+                },
+            ),
+        };
+    }
+
+    /// bundled-skills-03/17: replace the active skill tool-surface restriction
+    /// with `spec`'s (an empty spec clears it). See `active_skill_restriction`'s
+    /// doc comment for the lifetime rule. Best-effort: an allocation failure
+    /// leaves the previous restriction in place rather than propagating an
+    /// error out of the skill-run path.
+    fn setActiveSkillRestriction(self: *AgentRuntime, spec: *const skills_types.SkillSpec) void {
+        const built = buildActiveSkillRestriction(self.allocator, spec) catch return;
+        self.active_skill_restriction.deinit(self.allocator);
+        self.active_skill_restriction = built;
     }
 
     fn tryExecuteSkillRun(self: *AgentRuntime, name: []const u8, args: []const u8) !?ToolTrace {
@@ -3358,6 +3812,11 @@ pub const AgentRuntime = struct {
             // skill they persist for the rest of the session (the body lives in
             // history), so the mark is discarded.
             _ = self.registerSkillHooks(&spec);
+            // bundled-skills-03/17: same "persists for the rest of the
+            // session" reasoning applies to the skill's declared tool-surface
+            // restriction -- replace whatever was active before (an
+            // unrestricted skill correctly lifts an earlier restriction).
+            self.setActiveSkillRestriction(&spec);
         }
 
         const output: []u8 = if (fork)
@@ -3477,6 +3936,12 @@ pub const AgentRuntime = struct {
         child.depth = self.depth + 1;
         child.max_tool_rounds_override = 15;
         defer child.deinit();
+        // bundled-skills-03/17: the forked skill's tool-surface restriction is
+        // naturally scoped to the child runtime's lifetime (it is torn down
+        // via `defer child.deinit()` once this fork's turn loop returns), so
+        // no separate restore step is needed the way `registerSkillHooks`
+        // above needs one for the shared session-hook registry.
+        child.setActiveSkillRestriction(spec);
 
         if (spec.agent.len > 0) {
             if (child.activateAgentByNameStrict(spec.agent)) |act| self.allocator.free(act) else |_| {}
@@ -3764,6 +4229,20 @@ pub const AgentRuntime = struct {
         return agent_tools.handleAgentRunTool(self.allocator, self.audit, self.cfg.cloud_telemetry_opt_in, self.cfg.control_plane_url, self.cfg.control_plane_token, name, args, self.depth, self.current_reporter, spawnChildAgent, @ptrCast(self));
     }
 
+    /// commands-25 (`/subtask`): spawn a background sub-agent from a slash
+    /// command rather than a model-invoked AgentRun tool call. Reuses the
+    /// EXACT same spawn path (`spawnChildAgent`) the AgentRun/Task tool uses so
+    /// isolation, worktree handling, and task-registry bookkeeping all match --
+    /// this just bypasses the tool-args string format since the caller already
+    /// has a structured `AgentRunConfig` (there is no model turn to parse args
+    /// out of). Depth/MAX_DEPTH is intentionally NOT re-checked here: `/subtask`
+    /// is refused up front by the caller when `self.depth > 0` (this runtime is
+    /// itself a spawned sub-agent), matching the reference's `isEnabled:()=>!Ci()`
+    /// nesting guard one level earlier than the tool-dispatch depth counter.
+    pub fn spawnSubtaskAgent(self: *AgentRuntime, config: @import("tools/agent.zig").AgentRunConfig) ![]u8 {
+        return spawnChildAgent(@ptrCast(self), config);
+    }
+
     /// swarm-tasks-11: the resolved working directory (and bookkeeping) for a
     /// spawned child agent. `cwd` is always an owned slice the caller frees.
     /// `worktree_path`, when set, is an owned slice the caller removes + frees.
@@ -3815,11 +4294,13 @@ pub const AgentRuntime = struct {
                 // From here the worktree exists on disk; tear it down (and free
                 // its path) if building the notice / cwd dup fails.
                 errdefer {
+                    self.fireWorktreeRemoveHook(wt_path);
                     agent_isolation.removeWorktree(self.allocator, self.cwd, wt_path);
                     self.allocator.free(wt_path);
                 }
                 const notice = try agent_isolation.buildWorktreeNotice(self.allocator, wt_path);
                 errdefer self.allocator.free(notice);
+                self.fireWorktreeCreateHook(wt_path);
                 return .{
                     .cwd = try self.allocator.dupe(u8, wt_path),
                     .worktree_path = wt_path,
@@ -3841,6 +4322,18 @@ pub const AgentRuntime = struct {
             if (self.permission_rules.isAgentDenied(self.cwd, requested)) {
                 return std.fmt.allocPrint(self.allocator, "agent type '{s}' is denied by a permission rule", .{requested});
             }
+            // tools-23: `subagent_type: "fork"` is a spawn MODE, not a
+            // registered agent spec -- reference: "\"fork\" forks yourself
+            // (the fork inherits your full conversation context and always
+            // runs on your model -- a `model` override is ignored); any
+            // other type -- or omitting it -- starts a fresh agent
+            // (general-purpose by default)." Intercept it here, before the
+            // normal foreground/background branch below, since a fork is
+            // unconditionally a background spawn regardless of
+            // `run_in_background`.
+            if (parse_helpers.eqlIgnoreCase(requested, "fork")) {
+                return spawnForkAgent(self, config);
+            }
         }
 
         // Background mode: spawn a thread that runs the child agent
@@ -3859,6 +4352,7 @@ pub const AgentRuntime = struct {
         };
         defer self.allocator.free(iso.cwd);
         defer if (iso.worktree_path) |wp| {
+            self.fireWorktreeRemoveHook(wp);
             agent_isolation.removeWorktree(self.allocator, self.cwd, wp);
             self.allocator.free(wp);
         };
@@ -3881,6 +4375,19 @@ pub const AgentRuntime = struct {
         if (config.model) |model_ref| {
             try child.applyModelOverride(model_ref);
         }
+        // hooks-permissions-09: the child inherits this turn's `prompt_id` by
+        // value (same user prompt, same correlator) and gets its own fresh
+        // `agent_id` (the reference `Se` base schema's optional per-agent
+        // identity, which the single root runtime has no data source for --
+        // see the field doc comment -- but a spawned sub-agent clearly does).
+        // Both are plain fixed-size-array copies: no allocation, no ownership
+        // to hand back on `child.deinit()`.
+        child.prompt_id_buf = self.prompt_id_buf;
+        child.prompt_id_len = self.prompt_id_len;
+        {
+            const aid = std.fmt.bufPrint(&child.agent_id_buf, "agent_{x}", .{clock.nowNanos()}) catch "";
+            child.agent_id_len = aid.len;
+        }
 
         // Phase 5 (hooks-01): SubagentStart fires before the child agent runs,
         // SubagentStop after it completes (reference: subagent lifecycle hooks).
@@ -3889,6 +4396,9 @@ pub const AgentRuntime = struct {
             const sub_start = self.fireLifecycleHook(.{
                 .event = .subagent_start,
                 .cwd = self.cwd,
+                .prompt_id = self.promptId(),
+                .agent_id = child.agentId(),
+                .mcp_ctx = @ptrCast(self.mcp),
             });
             if (sub_start.reason) |r| self.allocator.free(r);
         }
@@ -3916,6 +4426,9 @@ pub const AgentRuntime = struct {
             const sub_stop = self.fireLifecycleHook(.{
                 .event = .subagent_stop,
                 .cwd = self.cwd,
+                .prompt_id = self.promptId(),
+                .agent_id = child.agentId(),
+                .mcp_ctx = @ptrCast(self.mcp),
             });
             if (sub_stop.reason) |r| self.allocator.free(r);
         }
@@ -3997,6 +4510,18 @@ pub const AgentRuntime = struct {
             return permission_decision_mod.modeToString(mode);
         }
         return "default";
+    }
+
+    /// hooks-permissions-09: the effective `permission_mode` string threaded
+    /// onto every hook's stdin payload (reference `Se` base schema). Mirrors
+    /// `agent_tools.effectiveApprovalMode`'s precedence (a live reference-mode
+    /// override wins, else the persisted config mode byte-for-byte, which may
+    /// be a zcode legacy name like "tiered-auto") -- kept as a small, separate
+    /// helper here (rather than exported from agent_tools.zig) since lifecycle
+    /// hooks fire from this file, not through a ToolExecContext.
+    fn effectiveLivePermissionModeString(self: *const AgentRuntime) []const u8 {
+        if (self.permission_mode_override) |mode| return permission_decision_mod.modeToString(mode);
+        return self.cfg.approval_mode;
     }
 
     fn mergeFileFocus(self: *AgentRuntime, new_paths: []const []const u8) !void {
@@ -4375,6 +4900,7 @@ pub const AgentRuntime = struct {
                 const decision = shouldResetCwd(canonical, self.original_cwd, self.additional_directories, maintain);
                 if (decision.reset) {
                     const restored = self.allocator.dupe(u8, self.original_cwd) catch return;
+                    self.fireCwdChangedHook(self.shell_cwd, restored);
                     self.allocator.free(self.shell_cwd);
                     self.shell_cwd = restored;
                     if (decision.note) self.pending_cwd_reset_note = true;
@@ -4382,10 +4908,35 @@ pub const AgentRuntime = struct {
                 }
 
                 const next = self.allocator.dupe(u8, canonical) catch return;
+                self.fireCwdChangedHook(self.shell_cwd, next);
                 self.allocator.free(self.shell_cwd);
                 self.shell_cwd = next;
             } else |_| {}
         }
+    }
+
+    /// hooks-permissions-03: fire `CwdChanged` whenever `shell_cwd` actually
+    /// mutates -- both real trigger points: a Bash `cd` detected by
+    /// `updateShellCwd` above (including the bash-shell-12 out-of-project
+    /// reset back to `original_cwd`), and the `/cd` REPL command (called from
+    /// repl_commands.zig, which has no direct access to hooks_mod). Public so
+    /// the REPL command layer can call it. Fire-and-forget like
+    /// `fireNotificationHook`: CwdChanged is observability-only.
+    pub fn fireCwdChangedHook(self: *AgentRuntime, old_cwd: []const u8, new_cwd: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        if (std.mem.eql(u8, old_cwd, new_cwd)) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .cwd_changed,
+            .cwd = new_cwd,
+            .old_cwd = old_cwd,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
     }
 
     /// Resolve `path` to a canonical absolute path (symlinks, `.`, and `..`
@@ -4688,7 +5239,7 @@ pub const AgentRuntime = struct {
     /// enough rounds/time have elapsed since the last summary; when it fires,
     /// writes a cheap progress line (round count + the latest activity preview
     /// drawn from this agent's own history) into the bound task record's
-    /// `summary` so TaskPoll/TaskOutput surface it to the parent.
+    /// `summary` so TaskGet/TaskOutput surface it to the parent.
     ///
     /// Best-effort and cheap by design: it does NOT fork an LLM turn (which
     /// would cost an API call and could block the agent's real work); the
@@ -4953,6 +5504,19 @@ pub const AgentRuntime = struct {
         return path;
     }
 
+    /// hooks-permissions-09: the current turn's synthesized `prompt_id`, or
+    /// "" before the root runtime's first `handlePromptDetailed*` call (and
+    /// for a sub-agent that never had it copied onto it).
+    pub fn promptId(self: *const AgentRuntime) []const u8 {
+        return self.prompt_id_buf[0..self.prompt_id_len];
+    }
+
+    /// hooks-permissions-09: the current runtime's synthesized `agent_id`,
+    /// or "" for the root runtime (see the field doc comment).
+    pub fn agentId(self: *const AgentRuntime) []const u8 {
+        return self.agent_id_buf[0..self.agent_id_len];
+    }
+
     fn buildToolExecContext(self: *AgentRuntime) agent_tools.ToolExecContext {
         return .{
             .allocator = self.allocator,
@@ -4983,6 +5547,10 @@ pub const AgentRuntime = struct {
             .web_fetch_ctx = self.buildWebFetchContext(),
             .auto_mem_dir = self.auto_mem_dir_restriction,
             .session_mem_file = self.session_mem_file_restriction,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
         };
     }
 
@@ -5290,6 +5858,20 @@ pub const AgentRuntime = struct {
         if (outcome.reason) |r| self.allocator.free(r);
     }
 
+    /// hooks-permissions-02: fire Setup exactly once, lazily, alongside
+    /// SessionStart (the reference documents both as
+    /// `ALWAYS_EMITTED_HOOK_EVENTS` -- always-on, once-per-session lifecycle
+    /// events). Setup carries no event-specific discriminating field (unlike
+    /// SessionStart's `source`); its stdout is still injected as additional
+    /// context via `fireLifecycleHook`, matching every other lifecycle event.
+    pub fn maybeFireSetup(self: *AgentRuntime) void {
+        if (!hooksLiveEnabled()) return;
+        if (self.setup_fired) return;
+        self.setup_fired = true;
+        const outcome = self.fireLifecycleHook(.{ .event = .setup, .cwd = self.cwd });
+        if (outcome.reason) |r| self.allocator.free(r);
+    }
+
     /// Fire SessionEnd once at teardown. Reason "exit". Best-effort: a block has
     /// no meaning at teardown, so the outcome is discarded.
     fn fireSessionEnd(self: *AgentRuntime) void {
@@ -5326,8 +5908,245 @@ pub const AgentRuntime = struct {
             .cwd = self.cwd,
             .message = message,
             .title = title,
+            // hooks-permissions-10: this is the only fireNotificationHook call
+            // site today, and it fires exactly when a long turn has just
+            // finished and the assistant is waiting on the user again -- the
+            // reference's "idle" notification_type category. A settings.json
+            // Notification hook's matcher now tests against this, not the
+            // free-text message (see hooks.matchFieldFor).
+            .notification_type = "idle",
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
+            .permission_mode = self.effectiveLivePermissionModeString(),
         }) catch return;
         result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-02 (CORRECTED from the original gap guess): fires
+    /// `StopFailure` in place of `Stop` when this turn ended because the
+    /// model/API call itself errored. The original gap description guessed
+    /// this event meant "a configured Stop *hook's* own execution failed
+    /// (spawn error / timeout)" -- verified against the live 2.1.261 bundle
+    /// (cc_strings.txt: the `Boe` zod schema `{hook_event_name:"StopFailure",
+    /// error, error_details?, last_assistant_message?}`, the bundled hooks
+    /// doc's "Fires instead of Stop when an API error (rate limit, auth
+    /// failure, etc.) ended the turn. Fire-and-forget -- hook output and exit
+    /// code [are ignored]", and the reference's `executeStopFailureHooks`
+    /// trigger site, which fires on a model-call error object, not a hook
+    /// execution failure) this guess was WRONG: StopFailure is the reference's
+    /// death-spiral-guard sibling to Stop, firing exactly where zcode's own
+    /// `api_error_break` guard above already skips Stop. `error_msg`/
+    /// `error_details` are zcode's `@errorName`/`describeProviderError` for
+    /// the model-call error; `last_assistant_message` is the assistant's last
+    /// real reply before the error, when there was one. Fire-and-forget like
+    /// `fireNotificationHook`: StopFailure is not blocking-capable
+    /// (`hook_event.isBlockingCapable`), and the turn has already ended by
+    /// the time this runs.
+    fn fireStopFailureHook(self: *AgentRuntime, error_msg: []const u8, error_details: []const u8, last_assistant_message: ?[]const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .stop_failure,
+            .cwd = self.cwd,
+            .error_message = error_msg,
+            .error_details = error_details,
+            .last_assistant_message = last_assistant_message orelse "",
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-03: fire one `InstructionsLoaded` per memory file
+    /// `self.instruction_cache` just (re-)discovered (called immediately
+    /// after a genuine cache miss -- see the `prompt_engine.build` call
+    /// site). `first` selects `load_reason: "session_start"` for the very
+    /// first discovery this session, `"compact"` for every later one
+    /// (/clear, /compact, or any other axis-epoch bump -- see
+    /// `instructions_loaded_fired`'s doc comment for why zcode cannot
+    /// distinguish those triggers more finely here). `memory_type` is
+    /// best-effort classified from the entry's own absolute path:
+    /// `.local.`-suffixed candidates are "Local" (reference: highest
+    /// precedence, VCS-ignored), a path under $HOME is "User", everything
+    /// else is "Project" -- zcode has no distinct enterprise-managed
+    /// instructions path to map to "Managed". Fire-and-forget.
+    fn fireInstructionsLoadedHooks(self: *AgentRuntime, first: bool) void {
+        if (!hooksLiveEnabled()) return;
+        const load_reason = if (first) "session_start" else "compact";
+        const home = env_mod.getOwned(self.allocator, "HOME") catch null;
+        defer if (home) |h| self.allocator.free(h);
+        for (self.instruction_cache.entries) |entry| {
+            const memory_type = classifyMemoryType(entry.source, home);
+            var result = hooks_mod.runEvent(self.allocator, .{
+                .event = .instructions_loaded,
+                .cwd = self.cwd,
+                .file_path = entry.source,
+                .memory_type = memory_type,
+                .load_reason = load_reason,
+                .session_id = self.session_id,
+                .transcript_path = self.transcript_path,
+                .prompt_id = self.promptId(),
+                .agent_id = self.agentId(),
+                .mcp_ctx = @ptrCast(self.mcp),
+                .permission_mode = self.effectiveLivePermissionModeString(),
+            }) catch continue;
+            result.deinit(self.allocator);
+        }
+    }
+
+    /// hooks-permissions-03: see `fireInstructionsLoadedHooks`'s doc comment.
+    /// A free function (no `self`) so it is independently unit-testable.
+    fn classifyMemoryType(source: []const u8, home: ?[]const u8) []const u8 {
+        if (std.mem.indexOf(u8, source, ".local.") != null) return "Local";
+        if (home) |h| {
+            if (h.len > 0 and std.mem.startsWith(u8, source, h)) return "User";
+        }
+        return "Project";
+    }
+
+    /// hooks-permissions-03: fire `ConfigChange` when settings actually
+    /// change mid-session. `source` is the reference's enum ("user_settings"
+    /// | "project_settings" | "local_settings" | "policy_settings" |
+    /// "skills"); `file_path` is optional (the reference schema marks it
+    /// `.optional()` -- zcode's own trigger points, `/config set` and
+    /// `/reload-skills`, are both in-memory/rescan operations that never
+    /// write a settings.json, so both pass null). Called from
+    /// repl_commands.zig (not owned by this package), which has no direct
+    /// access to hooks_mod. Fire-and-forget, like `fireCwdChangedHook`.
+    pub fn fireConfigChangeHook(self: *AgentRuntime, source: []const u8, file_path: ?[]const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .config_change,
+            .cwd = self.cwd,
+            .source = source,
+            .file_path = file_path orelse "",
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-03: fire `WorktreeCreate` after a fresh per-agent
+    /// worktree is created for an AgentRun with `isolation:"worktree"`
+    /// (`resolveChildCwd` above). `name` is the worktree's basename (e.g.
+    /// "agent-<suffix>") -- the reference schema is `{name: string}`. Also
+    /// covered: the model-facing EnterWorktree tool
+    /// (tools/tool_dispatch.zig's own `fireWorktreeCreateHook`, a plain
+    /// cwd-only firing since that dispatch layer has no session/runtime
+    /// context). Fire-and-forget, like `fireNotificationHook`.
+    fn fireWorktreeCreateHook(self: *AgentRuntime, worktree_path: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .worktree_create,
+            .cwd = self.cwd,
+            .worktree_name = std.fs.path.basename(worktree_path),
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-03: fire `WorktreeRemove` wherever an AgentRun's
+    /// isolated worktree is torn down (both the synchronous `spawnChildAgent`
+    /// path and `resolveChildCwd`'s own post-create failure cleanup). Not
+    /// wired into the DETACHED background-agent cleanup path
+    /// (`BackgroundCtx.run` further below), which has no `*AgentRuntime` to
+    /// call this on -- a real remaining gap, documented rather than faked.
+    /// Fire-and-forget.
+    fn fireWorktreeRemoveHook(self: *AgentRuntime, worktree_path: []const u8) void {
+        if (!hooksLiveEnabled()) return;
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .worktree_remove,
+            .cwd = self.cwd,
+            .worktree_path = worktree_path,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// hooks-permissions-04: fire `PostToolBatch` once for a resolved round of
+    /// tool calls (`round_traces` is this round's slice of `traces`, both the
+    /// parallel-batch and sequential entries -- see the call site). Best-
+    /// effort and non-blocking by construction: PostToolBatch is
+    /// observability-only in the reference (its own per-tool PostToolUse/
+    /// PostToolUseFailure hooks already had the chance to gate/rewrite each
+    /// call; this event exists purely so a hook can see the whole batch shape
+    /// at once), so a block/error outcome here is discarded, matching
+    /// `fireNotificationHook`. `tool_use_id` is left empty on every element:
+    /// zcode's tool-call parsing (`core.parse_helpers.ToolCall`) does not
+    /// carry a per-call id today, unlike the reference's native tool_use
+    /// blocks -- a real gap, but a separate, much larger one (threading an id
+    /// through the whole parse/dispatch/trace pipeline) than this event's
+    /// wiring.
+    fn firePostToolBatchHook(self: *AgentRuntime, round_traces: []const ToolTrace) void {
+        if (!hooksLiveEnabled()) return;
+        const tool_calls_json = self.buildPostToolBatchJson(round_traces) catch return;
+        defer self.allocator.free(tool_calls_json);
+        var result = hooks_mod.runEvent(self.allocator, .{
+            .event = .post_tool_batch,
+            .cwd = self.cwd,
+            .tool_calls_json = tool_calls_json,
+            .session_id = self.session_id,
+            .transcript_path = self.transcript_path,
+            .prompt_id = self.promptId(),
+            .agent_id = self.agentId(),
+            .mcp_ctx = @ptrCast(self.mcp),
+            .permission_mode = self.effectiveLivePermissionModeString(),
+        }) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// Assemble `round_traces` into the `tool_calls` JSON array
+    /// `hook_io.buildPostToolBatchPayload` expects. Each element embeds
+    /// `tool_input`/`tool_response` as a nested object when the trace's
+    /// `args`/`output` already parse as JSON (matching every other tool-event
+    /// payload builder's raw-vs-string rule), else as a JSON string. Caller
+    /// owns the returned slice.
+    fn buildPostToolBatchJson(self: *AgentRuntime, round_traces: []const ToolTrace) ![]u8 {
+        var out = std_io.StringBuilder.init(self.allocator);
+        errdefer out.deinit();
+        const w = out.writer();
+        try w.writeAll("[");
+        for (round_traces, 0..) |t, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.print("{{\"tool_name\":{f},\"tool_input\":", .{std.json.fmt(t.name, .{})});
+            if (hook_io_mod.isValidJson(self.allocator, t.args)) {
+                try w.writeAll(t.args);
+            } else {
+                try w.print("{f}", .{std.json.fmt(t.args, .{})});
+            }
+            try w.writeAll(",\"tool_use_id\":\"\"");
+            if (t.executed) {
+                try w.writeAll(",\"tool_response\":");
+                if (hook_io_mod.isValidJson(self.allocator, t.output)) {
+                    try w.writeAll(t.output);
+                } else {
+                    try w.print("{f}", .{std.json.fmt(t.output, .{})});
+                }
+            }
+            try w.writeAll("}");
+        }
+        try w.writeAll("]");
+        return out.toOwnedSlice();
     }
 
     /// Drain any finished background (async / asyncRewake) hooks and deliver
@@ -5632,6 +6451,58 @@ pub const AgentRuntime = struct {
         self.suppress_compact_warning = true;
     }
 
+    /// tools-23: `subagent_type: "fork"`. Reference: "\"fork\" forks
+    /// yourself (the fork inherits your full conversation context and
+    /// always runs on your model -- a `model` override is ignored)." zcode
+    /// has no in-process conversation-context clone (the background spawn
+    /// path always constructs a brand-new `AgentRuntime` on its own thread),
+    /// so the fork's "full conversation context" is reproduced by rendering
+    /// the caller's own turn-by-turn transcript into a text block and
+    /// seeding the child's prompt with it -- the child genuinely sees every
+    /// prior turn, just as plain text context rather than replayed
+    /// structured history entries.
+    fn spawnForkAgent(self: *AgentRuntime, config: @import("tools/agent.zig").AgentRunConfig) anyerror![]u8 {
+        const seeded_prompt = try buildForkSeededPrompt(self.allocator, self.history.view(), config.prompt);
+        defer self.allocator.free(seeded_prompt);
+
+        // "always runs on your model -- a model override is ignored": pin to
+        // the CALLER's current active provider/model regardless of any
+        // `model` argument the tool call carried alongside subagent_type.
+        const pinned_model = try pinnedForkModel(self.allocator, self.active_provider, self.active_model);
+        defer self.allocator.free(pinned_model);
+
+        var forked = config;
+        forked.prompt = seeded_prompt;
+        forked.agent = null; // "fork" is a spawn mode, not a registered agent spec
+        forked.model = pinned_model;
+        forked.run_in_background = true; // a fork always runs in the background
+
+        return self.spawnBackgroundAgent(forked);
+    }
+
+    /// Render `history` as a flat `role: content` transcript and seed it
+    /// ahead of `original_prompt`, for `spawnForkAgent`. Pure/allocator-only
+    /// so it is unit-testable without spinning up a real AgentRuntime or
+    /// background thread.
+    fn buildForkSeededPrompt(allocator: std.mem.Allocator, history: []const types.HistoryTurn, original_prompt: []const u8) ![]u8 {
+        var out = std_io.StringBuilder.init(allocator);
+        errdefer out.deinit();
+        try out.writer().writeAll("[forked from parent session -- full conversation context below]\n");
+        for (history) |turn| {
+            try out.writer().print("{s}: {s}\n", .{ @tagName(turn.role), turn.content });
+        }
+        try out.writer().writeAll("[end of forked context]\n\n[/forked context -- your new instruction from the parent follows]\n");
+        try out.writer().writeAll(original_prompt);
+        return out.toOwnedSlice();
+    }
+
+    /// `provider/model` pin string for `spawnForkAgent`'s AgentRunConfig.model
+    /// override -- the slash form `applyModelOverride`/the background-thread
+    /// spawn path already understand.
+    fn pinnedForkModel(allocator: std.mem.Allocator, provider: []const u8, model: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ provider, model });
+    }
+
     fn spawnBackgroundAgent(self: *AgentRuntime, config: @import("tools/agent.zig").AgentRunConfig) ![]u8 {
         // swarm-tasks-11: resolve the background agent's working directory from
         // its isolation/cwd before duping the prompt, so a worktree notice can
@@ -5876,7 +6747,7 @@ pub const AgentRuntime = struct {
 
         return std.fmt.allocPrint(
             self.allocator,
-            "Agent spawned in background.\nbackground_agent_id={s}\nUse `/tasks`, TaskPoll, or TaskOutput to inspect it.",
+            "Agent spawned in background.\nbackground_agent_id={s}\nUse `/tasks`, TaskGet, or TaskOutput to inspect it.",
             .{task_id_for_return},
         );
     }
@@ -5983,6 +6854,16 @@ pub const AgentRuntime = struct {
             }
         }
 
+        // cli-flags-04: keep `prompt inspect --json` (the acceptance-test
+        // oracle for this flag family) honest about what a real turn would
+        // actually advertise.
+        if (agent_tools.hasCliToolFilters(self.cfg)) {
+            const filtered = try agent_tools.filterByCliToolFlags(self.allocator, tool_schemas, self.cfg);
+            if (owned_tool_schemas) |schemas| tool_registry.freeSchemas(self.allocator, schemas);
+            owned_tool_schemas = filtered;
+            tool_schemas = filtered;
+        }
+
         const working_context = try self.buildWorkingContext(user_turn, .{
             .round = 1,
             .mode = effective_mode,
@@ -6020,6 +6901,7 @@ pub const AgentRuntime = struct {
             &self.git_capture_cache,
             working_context,
             @enumFromInt(@intFromEnum(effective_mode)),
+            !self.interactive,
         );
         defer built.envelope.deinit();
 
@@ -6116,6 +6998,105 @@ test "background agent task field parser extracts task id" {
         "status=pending\n";
     try testing.expectEqualStrings("task-123", AgentRuntime.extractTaskField(text, "id").?);
     try testing.expect(AgentRuntime.extractTaskField(text, "missing") == null);
+}
+
+test "tools-23: fork seeds the child's prompt with the parent's full transcript" {
+    const alloc = testing.allocator;
+    const history = [_]types.HistoryTurn{
+        .{ .role = .user, .content = "investigate the auth bug", .timestamp = 0 },
+        .{ .role = .assistant, .content = "found it in login.zig:42", .timestamp = 0 },
+    };
+    const seeded = try AgentRuntime.buildForkSeededPrompt(alloc, &history, "now fix it");
+    defer alloc.free(seeded);
+
+    // Every prior turn is visible to the fork, in order, with its role.
+    const user_idx = std.mem.indexOf(u8, seeded, "user: investigate the auth bug").?;
+    const assistant_idx = std.mem.indexOf(u8, seeded, "assistant: found it in login.zig:42").?;
+    try testing.expect(user_idx < assistant_idx);
+    // The parent's new instruction is appended after the forked context.
+    const prompt_idx = std.mem.indexOf(u8, seeded, "now fix it").?;
+    try testing.expect(assistant_idx < prompt_idx);
+}
+
+test "tools-23: fork pins to the caller's own provider/model" {
+    const alloc = testing.allocator;
+    const pinned = try AgentRuntime.pinnedForkModel(alloc, "anthropic", "claude-opus-4-6");
+    defer alloc.free(pinned);
+    try testing.expectEqualStrings("anthropic/claude-opus-4-6", pinned);
+}
+
+test "tools-23: AgentRun subagent_type=fork always spawns in background even when run_in_background is unset" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit(); // joins the background thread this test spawns before tearing down
+
+    // Pin the parent onto the network-free mock provider so the spawned
+    // fork's real handlePrompt round-trip in its background thread cannot
+    // reach out to a real model API during `zig build test`.
+    try h.runtime.applyModelOverride("mock/mock-agent");
+    try testing.expectEqualStrings("mock", h.runtime.active_provider);
+
+    const config = @import("tools/agent.zig").AgentRunConfig{
+        .prompt = "continue the investigation",
+        .agent = "fork",
+        // A model override alongside subagent_type="fork" must be ignored --
+        // reference: "always runs on your model -- a model override is
+        // ignored". If this leaked through, the child would try to talk to
+        // a real (non-mock) provider/model and the background thread would
+        // report failure instead of a clean spawn.
+        .model = "anthropic/claude-not-a-real-model",
+        .run_in_background = false,
+    };
+
+    const result = try AgentRuntime.spawnChildAgent(@ptrCast(&h.runtime), config);
+    defer alloc.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "background_agent_id=") != null);
+}
+
+test "headless-sdk-missed-184: thinkingForFinalText recovers the real reasoning_text behind the final answer" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    try h.runtime.appendHistoryTurnWithThinking(.assistant, "42 is the answer", "the user asked for the answer; I recalled it directly");
+
+    // Matches the turn that produced it -> the exact reasoning_text comes back.
+    {
+        const got = h.runtime.thinkingForFinalText("42 is the answer");
+        try testing.expect(got != null);
+        defer alloc.free(got.?);
+        try testing.expectEqualStrings("the user asked for the answer; I recalled it directly", got.?);
+    }
+
+    // A later synthetic message ("Interrupted by user.") that never went
+    // through appendHistoryTurnWithThinking must NOT borrow the previous
+    // round's thinking block -- no match, no fabrication.
+    {
+        const got = h.runtime.thinkingForFinalText("Interrupted by user.");
+        try testing.expect(got == null);
+    }
+
+    // A turn appended with no thinking (the common case: extended thinking
+    // off, or cfg.ui_thinking_summary disabled) yields no block either.
+    try h.runtime.appendHistoryTurn(.assistant, "a plain answer with no thinking");
+    {
+        const got = h.runtime.thinkingForFinalText("a plain answer with no thinking");
+        try testing.expect(got == null);
+    }
 }
 
 test "denialOutcomeFor maps trace outcomes to denial tracking actions" {
@@ -6440,6 +7421,31 @@ const SkillGuardHarness = struct {
         self.allocator.destroy(self);
     }
 };
+
+test "hooks-permissions-03: classifyMemoryType distinguishes Local/User/Project" {
+    try testing.expectEqualStrings("Local", AgentRuntime.classifyMemoryType("/repo/ZCODE.local.md", "/home/user"));
+    try testing.expectEqualStrings("User", AgentRuntime.classifyMemoryType("/home/user/.claude/CLAUDE.md", "/home/user"));
+    try testing.expectEqualStrings("Project", AgentRuntime.classifyMemoryType("/repo/ZCODE.md", "/home/user"));
+    // No HOME available -> never misclassify as User.
+    try testing.expectEqualStrings("Project", AgentRuntime.classifyMemoryType("/repo/ZCODE.md", null));
+}
+
+test "hooks-permissions-09: transcript_path is derived from session_id at construction" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    try testing.expect(h.runtime.transcript_path.len > 0);
+    try testing.expect(std.mem.indexOf(u8, h.runtime.transcript_path, h.runtime.session_id) != null);
+    try testing.expect(std.mem.endsWith(u8, h.runtime.transcript_path, ".jsonl"));
+}
 
 test "sdk-headless-06: live-control mutators change runtime state through the dispatcher" {
     const test_helpers = @import("core/test_helpers.zig");
@@ -6914,6 +7920,421 @@ test "skills-11: inline skill registers its frontmatter hooks on invocation" {
     try testing.expectEqual(hook_event_mod.Event.pre_tool_use, registered[0].event);
     try testing.expectEqualStrings("Bash(*)", registered[0].matcher);
     try testing.expectEqualStrings("echo SKILL_HOOK_SENTINEL", registered[0].body);
+}
+
+// bundled-skills-03/17: allowed-tools/disallowed-tools are enforced by the run
+// path, not merely used as a permission auto-allow grant. Runs a real skill
+// through `tryExecuteSkillRun`, then dispatches subsequent tool calls through
+// the SAME `executeToolCallDispatch` entry point the round loop uses, so this
+// exercises the actual production gate rather than the pure classifier alone.
+test "bundled-skills-03/17: an active skill's allowed-tools/disallowed-tools restrict later tool calls" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |hh| {
+            if (alloc.dupeZ(u8, hh)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(hh);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    try skillGuardWriteFile(tmp.dir, ".zcode/skills/readers-only/SKILL.md",
+        \\---
+        \\name: readers-only
+        \\description: only reads
+        \\allowed-tools: Read, Grep, Glob
+        \\---
+        \\Only look, do not touch.
+        \\
+    );
+    try skillGuardWriteFile(tmp.dir, ".zcode/skills/no-editing/SKILL.md",
+        \\---
+        \\name: no-editing
+        \\description: never write or edit
+        \\disallowed-tools: Write, Edit
+        \\---
+        \\Investigate, but never modify a file.
+        \\
+    );
+    try skillGuardWriteFile(tmp.dir, ".zcode/skills/unrestricted/SKILL.md",
+        \\---
+        \\name: unrestricted
+        \\description: no tool restriction at all
+        \\---
+        \\Anything goes.
+        \\
+    );
+    try skillGuardWriteFile(tmp.dir, "note.txt", "hello\n");
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    // allowed-tools/disallowed-tools both make a skill non-safe-only (skills-02
+    // gating), so seed a blanket allow rule to let each run proceed --
+    // matching the skills-02/10/11 harness convention.
+    try h.runtime.permission_rules.addRule(.allow, .global, "Skill", "*", "test", 1, "test");
+
+    // (a) allowed-tools: Read/Grep/Glob only -- a Bash call is refused, a Read
+    // call proceeds. Tool args here use the same `key=value;key2=value2`
+    // shape `core/parse_helpers.zig` builds from a real model tool call
+    // (NOT raw `{"k":"v"}` JSON -- `tool_dispatch.getArg` is a lightweight
+    // kv-text parser, not a JSON parser) so this exercises the exact string
+    // shape the production round loop hands to `executeToolCallDispatch`.
+    {
+        var run_trace = (try h.runtime.tryExecuteSkillRun("Skill", "{\"action\":\"run\",\"name\":\"readers-only\"}")).?;
+        defer run_trace.deinit(alloc);
+        try testing.expect(run_trace.executed);
+
+        var bash_trace = try h.runtime.executeToolCallDispatch("Bash", "command=echo hi");
+        defer bash_trace.deinit(alloc);
+        try testing.expect(!bash_trace.executed);
+        try testing.expect(std.mem.indexOf(u8, bash_trace.output, "readers-only") != null);
+        try testing.expect(std.mem.indexOf(u8, bash_trace.output, "allowed-tools") != null);
+
+        var read_trace = try h.runtime.executeToolCallDispatch("Read", "file_path=note.txt");
+        defer read_trace.deinit(alloc);
+        try testing.expect(read_trace.executed);
+    }
+
+    // (b) disallowed-tools: Write, Edit -- a Write call is refused while
+    // no-editing is active.
+    {
+        var run_trace = (try h.runtime.tryExecuteSkillRun("Skill", "{\"action\":\"run\",\"name\":\"no-editing\"}")).?;
+        defer run_trace.deinit(alloc);
+        try testing.expect(run_trace.executed);
+
+        var write_trace = try h.runtime.executeToolCallDispatch("Write", "file_path=note.txt;content=nope");
+        defer write_trace.deinit(alloc);
+        try testing.expect(!write_trace.executed);
+        try testing.expect(std.mem.indexOf(u8, write_trace.output, "no-editing") != null);
+        try testing.expect(std.mem.indexOf(u8, write_trace.output, "disallowed-tools") != null);
+
+        var edit_trace = try h.runtime.executeToolCallDispatch("Edit", "file_path=note.txt;old_string=hello;new_string=bye");
+        defer edit_trace.deinit(alloc);
+        try testing.expect(!edit_trace.executed);
+    }
+
+    // The on-disk file was genuinely never touched by either refused call.
+    {
+        const contents = try tmp.dir.readFileAlloc(core_rt.io, "note.txt", alloc, .limited(64));
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("hello\n", contents);
+    }
+
+    // (c) running an unrestricted skill afterward lifts the earlier
+    // restriction -- Write is available again.
+    {
+        var run_trace = (try h.runtime.tryExecuteSkillRun("Skill", "{\"action\":\"run\",\"name\":\"unrestricted\"}")).?;
+        defer run_trace.deinit(alloc);
+        try testing.expect(run_trace.executed);
+
+        var write_trace = try h.runtime.executeToolCallDispatch("Write", "file_path=note.txt;content=now ok");
+        defer write_trace.deinit(alloc);
+        try testing.expect(write_trace.executed);
+    }
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode -- explicit CLI reference mode wins over settings.json" {
+    // cfg.approval_mode == "plan" only happens when the user explicitly typed
+    // --approval-mode/--permission-mode plan; a configured settings.json
+    // defaultMode of acceptEdits must NOT override it.
+    const result = resolveInitialPermissionMode("plan", permission_decision_mod.Mode.acceptEdits);
+    try testing.expectEqual(permission_decision_mod.Mode.plan, result.?);
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode falls back to settings.json when approval_mode is a legacy name" {
+    // cfg.approval_mode == "tiered-auto" (zcode's built-in default, or an
+    // explicit legacy-mode CLI flag) means no reference-mode CLI flag was
+    // given -- settings.json's defaultMode applies.
+    const result = resolveInitialPermissionMode("tiered-auto", permission_decision_mod.Mode.bypassPermissions);
+    try testing.expectEqual(permission_decision_mod.Mode.bypassPermissions, result.?);
+
+    const manual_result = resolveInitialPermissionMode("manual", permission_decision_mod.Mode.dontAsk);
+    try testing.expectEqual(permission_decision_mod.Mode.dontAsk, manual_result.?);
+}
+
+test "config-layout-missed-148: resolveInitialPermissionMode is null when neither source sets it" {
+    try testing.expect(resolveInitialPermissionMode("tiered-auto", null) == null);
+    try testing.expect(resolveInitialPermissionMode("strict", null) == null);
+}
+
+test "hooks-permissions-04: PostToolBatch fires exactly once for a resolved round with both tool_calls present" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |h| {
+            if (alloc.dupeZ(u8, h)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "post_tool_batch.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PostToolBatch\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer alloc.free(settings);
+    try skillGuardWriteFile(tmp.dir, ".zcode/settings.json", settings);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+
+    hooks_test_override = true;
+    defer hooks_test_override = false;
+
+    // A round with two parallel-eligible tool calls, mirroring what the
+    // parallel-batch pass would have appended into `traces` this round.
+    var round_traces = [_]ToolTrace{
+        .{
+            .name = try alloc.dupe(u8, "Read"),
+            .args = try alloc.dupe(u8, "{\"path\":\"a.txt\"}"),
+            .risk = .LOW,
+            .approval_state = .auto_approved,
+            .executed = true,
+            .duration_ms = 5,
+            .output = try alloc.dupe(u8, "file contents"),
+        },
+        .{
+            .name = try alloc.dupe(u8, "Glob"),
+            .args = try alloc.dupe(u8, "{\"pattern\":\"*.zig\"}"),
+            .risk = .LOW,
+            .approval_state = .auto_approved,
+            .executed = true,
+            .duration_ms = 3,
+            .output = try alloc.dupe(u8, "src/main.zig"),
+        },
+    };
+    defer for (&round_traces) |*t| t.deinit(alloc);
+
+    h.runtime.firePostToolBatchHook(&round_traces);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, sentinel, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("PostToolBatch hook did not fire: {s} ({any})\n", .{ sentinel, err });
+        return error.PostToolBatchHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("PostToolBatch", parsed.value.object.get("hook_event_name").?.string);
+    const calls = parsed.value.object.get("tool_calls").?.array;
+    try testing.expectEqual(@as(usize, 2), calls.items.len);
+    try testing.expectEqualStrings("Read", calls.items[0].object.get("tool_name").?.string);
+    try testing.expectEqualStrings("Glob", calls.items[1].object.get("tool_name").?.string);
+    // The parallel Read call's tool_input round-trips as a nested object (it
+    // was valid JSON), not a re-escaped string.
+    try testing.expectEqualStrings("a.txt", calls.items[0].object.get("tool_input").?.object.get("path").?.string);
+
+    // Exactly once: the hook wrote the payload exactly one time (a stray
+    // second firing would double the file's line count / duplicate content,
+    // which the single parseFromSlice call above would already have failed
+    // on if the file held two concatenated JSON objects).
+}
+
+test "hooks-permissions-09: SubagentStart/SubagentStop carry a synthesized agent_id and the parent's prompt_id" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |h| {
+            if (alloc.dupeZ(u8, h)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    const start_sentinel = try std.fs.path.join(alloc, &.{ root, "subagent_start.json" });
+    defer alloc.free(start_sentinel);
+    const stop_sentinel = try std.fs.path.join(alloc, &.{ root, "subagent_stop.json" });
+    defer alloc.free(stop_sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"SubagentStart\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"SubagentStop\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ start_sentinel, stop_sentinel },
+    );
+    defer alloc.free(settings);
+    try skillGuardWriteFile(tmp.dir, ".zcode/settings.json", settings);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+    hooks_test_override = true;
+    defer hooks_test_override = false;
+
+    // Simulate being mid-turn: a real root call sets this in
+    // handlePromptDetailedWithModeAndReporter before ever reaching a tool
+    // dispatch that could spawn a sub-agent. Set it directly here so this
+    // test can call spawnChildAgent in isolation, the same way the
+    // pre-existing "tools-23" fork test above does.
+    const pid = std.fmt.bufPrint(&h.runtime.prompt_id_buf, "prompt_parent-1", .{}) catch unreachable;
+    h.runtime.prompt_id_len = pid.len;
+
+    const config = @import("tools/agent.zig").AgentRunConfig{
+        .prompt = "say hi",
+        .model = "mock/mock-agent",
+        .run_in_background = false,
+        .max_rounds = 1,
+    };
+    const result = try AgentRuntime.spawnChildAgent(@ptrCast(&h.runtime), config);
+    defer alloc.free(result);
+
+    const start_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, start_sentinel, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("SubagentStart hook did not fire: {s} ({any})\n", .{ start_sentinel, err });
+        return error.SubagentStartHookDidNotRun;
+    };
+    defer alloc.free(start_bytes);
+    var start_parsed = try std.json.parseFromSlice(std.json.Value, alloc, start_bytes, .{});
+    defer start_parsed.deinit();
+    try testing.expectEqualStrings("prompt_parent-1", start_parsed.value.object.get("prompt_id").?.string);
+    const agent_id = start_parsed.value.object.get("agent_id").?.string;
+    try testing.expect(agent_id.len > 0);
+    try testing.expect(std.mem.startsWith(u8, agent_id, "agent_"));
+
+    const stop_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, stop_sentinel, alloc, .limited(64 * 1024)) catch |err| {
+        std.debug.print("SubagentStop hook did not fire: {s} ({any})\n", .{ stop_sentinel, err });
+        return error.SubagentStopHookDidNotRun;
+    };
+    defer alloc.free(stop_bytes);
+    var stop_parsed = try std.json.parseFromSlice(std.json.Value, alloc, stop_bytes, .{});
+    defer stop_parsed.deinit();
+    try testing.expectEqualStrings("prompt_parent-1", stop_parsed.value.object.get("prompt_id").?.string);
+    // Same sub-agent spawn -> same agent_id on both hooks.
+    try testing.expectEqualStrings(agent_id, stop_parsed.value.object.get("agent_id").?.string);
+}
+
+fn hooksPermissions03DummyAskUser(ctx: *anyopaque, allocator: std.mem.Allocator, question: []const u8, choices: []const []const u8) anyerror![]u8 {
+    _ = ctx;
+    _ = question;
+    _ = choices;
+    return allocator.dupe(u8, "accept");
+}
+
+test "hooks-permissions-03: Elicitation fires before the MCP prompt and ElicitationResult fires after" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    const prev_home = env_mod.getOwned(alloc, "HOME") catch null;
+    defer {
+        if (prev_home) |h| {
+            if (alloc.dupeZ(u8, h)) |z| {
+                _ = setenv("HOME", z, 1);
+                alloc.free(z);
+            } else |_| {
+                _ = unsetenv("HOME");
+            }
+            alloc.free(h);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const zcode_home = try std.fs.path.join(alloc, &.{ root, ".zcode" });
+    defer alloc.free(zcode_home);
+    skills10PinHome(alloc, root, zcode_home);
+
+    const elicit_sentinel = try std.fs.path.join(alloc, &.{ root, "elicitation.json" });
+    defer alloc.free(elicit_sentinel);
+    const result_sentinel = try std.fs.path.join(alloc, &.{ root, "elicitation_result.json" });
+    defer alloc.free(result_sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"Elicitation\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}],\"ElicitationResult\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"cat > '{s}'\"}}]}}]}}}}",
+        .{ elicit_sentinel, result_sentinel },
+    );
+    defer alloc.free(settings);
+    try skillGuardWriteFile(tmp.dir, ".zcode/settings.json", settings);
+
+    var h = try SkillGuardHarness.init(alloc, root, root);
+    defer h.deinit();
+    hooks_test_override = true;
+    defer hooks_test_override = false;
+
+    // Interactive with a working (unused, since this schema-less request
+    // short-circuits to "accept" before ever prompting) ask_user_fn so
+    // handleMcpElicitationRequest's access-check passes.
+    h.runtime.interactive = true;
+    var dummy_ctx: u8 = 0;
+    h.runtime.ask_user_fn = hooksPermissions03DummyAskUser;
+    h.runtime.ask_user_ctx = @ptrCast(&dummy_ctx);
+
+    const params_json = "{\"message\":\"need info\"}";
+    const result = try AgentRuntime.mcpBridgeHandleRequest(@ptrCast(&h.runtime), alloc, "elicitation/create", params_json);
+    defer if (result) |r| alloc.free(r);
+    try testing.expect(result != null);
+
+    const elicit_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, elicit_sentinel, alloc, .limited(4096)) catch |err| {
+        std.debug.print("Elicitation hook did not fire: {any}\n", .{err});
+        return error.ElicitationHookDidNotRun;
+    };
+    defer alloc.free(elicit_bytes);
+    var elicit_parsed = try std.json.parseFromSlice(std.json.Value, alloc, elicit_bytes, .{});
+    defer elicit_parsed.deinit();
+    try testing.expectEqualStrings("Elicitation", elicit_parsed.value.object.get("hook_event_name").?.string);
+    try testing.expect(std.mem.indexOf(u8, elicit_parsed.value.object.get("message").?.string, "need info") != null);
+
+    const result_bytes = std.Io.Dir.cwd().readFileAlloc(core_rt.io, result_sentinel, alloc, .limited(4096)) catch |err| {
+        std.debug.print("ElicitationResult hook did not fire: {any}\n", .{err});
+        return error.ElicitationResultHookDidNotRun;
+    };
+    defer alloc.free(result_bytes);
+    var result_parsed = try std.json.parseFromSlice(std.json.Value, alloc, result_bytes, .{});
+    defer result_parsed.deinit();
+    try testing.expectEqualStrings("ElicitationResult", result_parsed.value.object.get("hook_event_name").?.string);
+    try testing.expect(std.mem.indexOf(u8, result_parsed.value.object.get("message").?.string, "accept") != null);
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

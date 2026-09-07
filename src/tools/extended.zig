@@ -45,6 +45,7 @@ pub const unassignTeammateTasks = task_mod.unassignTeammateTasks;
 
 // -- Team management --
 pub const teamCreate = team_mod.teamCreate;
+pub const teamCreateWithOptions = team_mod.teamCreateWithOptions; // tools-24
 pub const teamDelete = team_mod.teamDelete;
 pub const sendMessage = team_mod.sendMessage;
 

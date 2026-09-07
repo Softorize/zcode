@@ -21,8 +21,11 @@ pub const Mode = permission_decision.Mode;
 ///   bypassPermissions  -> default
 ///   dontAsk            -> default
 ///
-/// The ant-only `auto` branch and the canCycleToAuto / TRANSCRIPT_CLASSIFIER
-/// gate are out of scope for zcode (auto mode is feature-gated and ant-only).
+/// The reference's `canCycleToAuto` / `TRANSCRIPT_CLASSIFIER` gate (which lets
+/// Shift+Tab land on `auto` in specific ant-internal configurations) is out of
+/// scope for zcode: `auto` is reachable via settings.json `defaultMode`/CLI
+/// (hooks-permissions-05) but not via the normal cycle, so it falls back to
+/// `default` like `dontAsk` does.
 pub fn getNext(current: Mode, bypass_available: bool) Mode {
     return switch (current) {
         .default => .acceptEdits,
@@ -30,6 +33,7 @@ pub fn getNext(current: Mode, bypass_available: bool) Mode {
         .plan => if (bypass_available) .bypassPermissions else .default,
         .bypassPermissions => .default,
         .dontAsk => .default,
+        .auto => .default,
     };
 }
 
@@ -41,6 +45,7 @@ pub fn label(mode: Mode) []const u8 {
         .plan => "Plan Mode",
         .bypassPermissions => "Bypass Permissions",
         .dontAsk => "Don't Ask",
+        .auto => "Auto",
     };
 }
 
@@ -52,6 +57,7 @@ pub fn shortLabel(mode: Mode) []const u8 {
         .plan => "Plan",
         .bypassPermissions => "Bypass",
         .dontAsk => "DontAsk",
+        .auto => "Auto",
     };
 }
 
@@ -79,4 +85,13 @@ test "label and shortLabel match reference titles" {
     try testing.expectEqualStrings("Plan", shortLabel(.plan));
     try testing.expectEqualStrings("Bypass", shortLabel(.bypassPermissions));
     try testing.expectEqualStrings("DontAsk", shortLabel(.dontAsk));
+    try testing.expectEqualStrings("Auto", shortLabel(.auto));
+}
+
+test "hooks-permissions-05: auto is a stable label and falls back to default on cycle" {
+    try testing.expectEqualStrings("Auto", label(.auto));
+    // auto is not part of the normal Shift+Tab cycle (no ant-internal
+    // classifier gate in zcode); it degrades to default like dontAsk.
+    try testing.expectEqual(Mode.default, getNext(.auto, false));
+    try testing.expectEqual(Mode.default, getNext(.auto, true));
 }

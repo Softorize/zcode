@@ -94,13 +94,26 @@ pub fn loadAllWithWorkspace(allocator: std.mem.Allocator, workspace_cwd: ?[]cons
         entries.deinit();
     }
 
-    // Load global memories
+    // Load global memories (the legacy flat ~/.zcode/memory directory,
+    // shared by every project -- kept for backward compatibility with
+    // existing installs; see the per-project read below).
     const global_dir = try memoryDirPath(allocator);
     defer allocator.free(global_dir);
     try loadFromDir(allocator, &entries, global_dir, .global);
 
-    // Load workspace memories if a cwd was provided
     if (workspace_cwd) |cwd| {
+        // config-layout-11: also load the reference's per-project auto-memory
+        // directory (`{zcode_home}/projects/<sanitized-cwd>/memory`, mirroring
+        // Claude Code's `~/.claude/projects/<slug>/memory/`) so memories
+        // written for THIS project do not leak into every other project's
+        // context, while a pre-existing flat `~/.zcode/memory` entry (above)
+        // keeps working unchanged. Tagged `.global` -- it is still "auto"
+        // memory, not the workspace/repo-committed tier below.
+        const project_dir = try memoryDirPathForCwd(allocator, cwd);
+        defer allocator.free(project_dir);
+        try loadFromDir(allocator, &entries, project_dir, .global);
+
+        // Load workspace memories.
         const ws_dir = try std.fs.path.join(allocator, &.{ cwd, ".zcode", "memory" });
         defer allocator.free(ws_dir);
         try loadFromDir(allocator, &entries, ws_dir, .workspace);
@@ -430,6 +443,21 @@ fn formatIsoUtc(buf: []u8, mtime_ns: i128) []const u8 {
 pub fn save(allocator: std.mem.Allocator, name: []const u8, category: []const u8, content: []const u8) ![]u8 {
     const memory_dir = try memoryDirPath(allocator);
     defer allocator.free(memory_dir);
+    return saveToDir(allocator, memory_dir, name, category, content);
+}
+
+/// config-layout-11: like `save`, but writes into the per-project auto-memory
+/// directory for `cwd` (`memoryDirPathForCwd`) instead of the legacy flat
+/// global directory. New callers that have a project cwd in hand should
+/// prefer this over `save` so newly captured memories are isolated per
+/// project, matching the reference layout.
+pub fn saveForCwd(allocator: std.mem.Allocator, cwd: []const u8, name: []const u8, category: []const u8, content: []const u8) ![]u8 {
+    const memory_dir = try memoryDirPathForCwd(allocator, cwd);
+    defer allocator.free(memory_dir);
+    return saveToDir(allocator, memory_dir, name, category, content);
+}
+
+fn saveToDir(allocator: std.mem.Allocator, memory_dir: []const u8, name: []const u8, category: []const u8, content: []const u8) ![]u8 {
     try paths.ensureDir(memory_dir);
 
     // Sanitize name for filename.
@@ -675,6 +703,34 @@ pub fn memoryDirPathPub(allocator: std.mem.Allocator) ![]u8 {
     var resolved = try paths.resolve(allocator);
     defer resolved.deinit(allocator);
     return std.fs.path.join(allocator, &.{ resolved.zcode_home, "memory" });
+}
+
+/// config-layout-11: the per-project auto-memory directory, mirroring the
+/// reference's default `~/.claude/projects/<sanitized-cwd>/memory/` (rather
+/// than zcode's historical single flat directory shared by every project).
+/// Kept under zcode's OWN home (`{zcode_home}/projects/<slug>/memory`, not
+/// literally `~/.claude/...`) -- only the per-project ISOLATION behavior is
+/// being matched, not the literal path; `settings_sources`/config-layout-01
+/// style ".claude" fallbacks are for reading Claude Code's OWN files, which
+/// per-project memory directories are not (they are zcode-authored content).
+/// Caller owns the returned slice.
+pub fn memoryDirPathForCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
+    var resolved = try paths.resolve(allocator);
+    defer resolved.deinit(allocator);
+    const slug = try slugifyCwd(allocator, cwd);
+    defer allocator.free(slug);
+    return std.fs.path.join(allocator, &.{ resolved.zcode_home, "projects", slug, "memory" });
+}
+
+/// Sanitize an absolute cwd into the reference's per-project directory slug:
+/// every path separator becomes `-` (e.g. `/a/proj1` -> `-a-proj1`, matching
+/// `<home>/projects/<cwd-slug>/memory/`). Caller owns the returned slice.
+fn slugifyCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
+    const out = try allocator.dupe(u8, cwd);
+    for (out) |*c| {
+        if (c.* == '/' or c.* == '\\') c.* = '-';
+    }
+    return out;
 }
 
 fn parseMemoryFile(allocator: std.mem.Allocator, filename: []const u8, raw_content: []const u8) !MemoryEntry {
@@ -1056,4 +1112,74 @@ test "appendUserMemory rejects an empty line" {
     const ws = try test_helpers.tmpDirCwd(a, &tmp);
     defer a.free(ws);
     try testing.expectError(error.EmptyMemoryLine, appendUserMemory(a, ws, "   "));
+}
+
+// config-layout-11: auto-memory is per-project (`{zcode_home}/projects/
+// <slug>/memory`), not one flat directory shared by every project.
+test "memoryDirPathForCwd produces distinct, slug-keyed paths per project" {
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(a, &tmp);
+    defer a.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    const dir1 = try memoryDirPathForCwd(a, "/a/proj1");
+    defer a.free(dir1);
+    const dir2 = try memoryDirPathForCwd(a, "/a/proj2");
+    defer a.free(dir2);
+
+    try testing.expect(!std.mem.eql(u8, dir1, dir2));
+    try testing.expect(std.mem.indexOf(u8, dir1, "-a-proj1") != null);
+    try testing.expect(std.mem.indexOf(u8, dir2, "-a-proj2") != null);
+    try testing.expect(std.mem.endsWith(u8, dir1, "memory"));
+}
+
+test "saveForCwd + loadAllWithWorkspace isolate memories per project" {
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(a, &tmp);
+    defer a.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    const msg1 = try saveForCwd(a, "/a/proj1", "proj1-fact", "project", "proj1 detail");
+    defer a.free(msg1);
+    const msg2 = try saveForCwd(a, "/a/proj2", "proj2-fact", "project", "proj2 detail");
+    defer a.free(msg2);
+
+    const proj1_entries = try loadAllWithWorkspace(a, "/a/proj1");
+    defer freeEntries(a, proj1_entries);
+    var found_own = false;
+    var found_other = false;
+    for (proj1_entries) |e| {
+        if (std.mem.eql(u8, e.name, "proj1-fact")) found_own = true;
+        if (std.mem.eql(u8, e.name, "proj2-fact")) found_other = true;
+    }
+    try testing.expect(found_own);
+    try testing.expect(!found_other);
+
+    const proj2_entries = try loadAllWithWorkspace(a, "/a/proj2");
+    defer freeEntries(a, proj2_entries);
+    var proj2_has_own = false;
+    var proj2_has_other = false;
+    for (proj2_entries) |e| {
+        if (std.mem.eql(u8, e.name, "proj2-fact")) proj2_has_own = true;
+        if (std.mem.eql(u8, e.name, "proj1-fact")) proj2_has_other = true;
+    }
+    try testing.expect(proj2_has_own);
+    try testing.expect(!proj2_has_other);
+}
+
+fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
+    for (entries) |*e| e.deinit(allocator);
+    allocator.free(entries);
 }

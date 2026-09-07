@@ -50,11 +50,50 @@ pub const Result = struct {
     }
 };
 
+/// hooks-permissions-09: base fields the reference's shared `Se` zod schema
+/// puts on EVERY hook invocation, tool or lifecycle alike -- `session_id`,
+/// `transcript_path`, `permission_mode`, `agent_id`, `prompt_id` (the
+/// reference also carries `agent_type`/`effort`, not modeled here: zcode has
+/// no reference-shaped agent-type/effort-tag to surface at the hook layer
+/// yet). An empty string means "the caller had nothing to report" and the
+/// field is omitted entirely, not emitted as `""`, so a hook script's
+/// `.session_id // empty` idiom sees an absent key rather than a blank one.
+pub const HookBaseFields = struct {
+    session_id: []const u8 = "",
+    transcript_path: []const u8 = "",
+    permission_mode: []const u8 = "",
+    agent_id: []const u8 = "",
+    prompt_id: []const u8 = "",
+};
+
+fn writeBaseFields(w: anytype, base: HookBaseFields) !void {
+    if (base.session_id.len > 0) try w.print(",\"session_id\":{f}", .{std.json.fmt(base.session_id, .{})});
+    if (base.transcript_path.len > 0) try w.print(",\"transcript_path\":{f}", .{std.json.fmt(base.transcript_path, .{})});
+    if (base.prompt_id.len > 0) try w.print(",\"prompt_id\":{f}", .{std.json.fmt(base.prompt_id, .{})});
+    if (base.permission_mode.len > 0) try w.print(",\"permission_mode\":{f}", .{std.json.fmt(base.permission_mode, .{})});
+    if (base.agent_id.len > 0) try w.print(",\"agent_id\":{f}", .{std.json.fmt(base.agent_id, .{})});
+}
+
+/// hooks-permissions-09: per-event extensions layered on top of the tool-event
+/// base shape. `tool_use_id` is documented on PreToolUse/PostToolUse/
+/// PostToolUseFailure/PermissionRequest/PermissionDenied; `duration_ms` on
+/// PostToolUse/PostToolUseFailure ("Tool execution time in milliseconds");
+/// `reason` on PermissionDenied (and doubles, harmlessly, for any other tool
+/// event a caller chooses to attach one to -- extra JSON keys are inert to a
+/// hook that does not look for them).
+pub const ToolEventExtra = struct {
+    tool_use_id: []const u8 = "",
+    reason: []const u8 = "",
+    duration_ms: ?u64 = null,
+};
+
 /// Build the stdin JSON for a tool event. `tool_input_raw` is embedded as a JSON
 /// value when it is itself valid JSON, otherwise as a JSON string.
 ///
-/// Backward-compatible 5-arg form: emits only `tool_input` (no `tool_response`).
-/// Use `buildToolEventPayloadFull` to also embed the PostToolUse response.
+/// Backward-compatible 5-arg form: emits only `tool_input` (no `tool_response`,
+/// no base/extra fields).
+/// Use `buildToolEventPayloadFull` to also embed the PostToolUse response and
+/// the reference's base/per-event fields.
 pub fn buildToolEventPayload(
     allocator: std.mem.Allocator,
     event_name: []const u8,
@@ -62,7 +101,7 @@ pub fn buildToolEventPayload(
     tool_input_raw: []const u8,
     cwd: []const u8,
 ) ![]u8 {
-    return buildToolEventPayloadFull(allocator, event_name, tool_name, tool_input_raw, cwd, null, true);
+    return buildToolEventPayloadFull(allocator, event_name, tool_name, tool_input_raw, cwd, null, true, .{}, .{});
 }
 
 /// Build the stdin JSON for a tool event, optionally embedding the tool response.
@@ -73,6 +112,13 @@ pub fn buildToolEventPayload(
 /// `"is_interrupt"`/`"is_timeout"` flags are emitted (`success == false` implies
 /// the call failed; interrupt/timeout are not separately tracked here so both
 /// default to false).
+///
+/// `base` (hooks-permissions-09) carries the reference's always-present
+/// session_id/transcript_path/permission_mode/agent_id/prompt_id fields; `extra`
+/// carries the tool-event-specific tool_use_id/reason/duration_ms. Both are
+/// emitted only when non-empty/non-null so a caller with nothing to report
+/// (e.g. a test building a bare payload) produces the same JSON shape as before
+/// this field set was added.
 pub fn buildToolEventPayloadFull(
     allocator: std.mem.Allocator,
     event_name: []const u8,
@@ -81,6 +127,8 @@ pub fn buildToolEventPayloadFull(
     cwd: []const u8,
     tool_response: ?[]const u8,
     success: bool,
+    base: HookBaseFields,
+    extra: ToolEventExtra,
 ) ![]u8 {
     var builder = sb.StringBuilder.init(allocator);
     defer builder.deinit();
@@ -117,6 +165,11 @@ pub fn buildToolEventPayloadFull(
     }
     _ = success;
 
+    try writeBaseFields(w, base);
+    if (extra.tool_use_id.len > 0) try w.print(",\"tool_use_id\":{f}", .{std.json.fmt(extra.tool_use_id, .{})});
+    if (extra.reason.len > 0) try w.print(",\"reason\":{f}", .{std.json.fmt(extra.reason, .{})});
+    if (extra.duration_ms) |d| try w.print(",\"duration_ms\":{d}", .{d});
+
     try w.writeAll("}");
     return allocator.dupe(u8, builder.items());
 }
@@ -135,17 +188,74 @@ pub const LifecycleFields = struct {
     // the task it is gating (swarm-tasks-15). Emitted as `task_id`/`task_subject`.
     task_id: ?[]const u8 = null,
     task_subject: ?[]const u8 = null,
+    // hooks-permissions-10: Notification's required, separate category field
+    // (reference `xoe` schema: `{hook_event_name:"Notification", message,
+    // title?, notification_type}`). Distinct from the free-text `message` --
+    // this is what a `"matcher":"idle"`-style Notification hook actually
+    // matches against.
+    notification_type: ?[]const u8 = null,
+    // hooks-permissions-03: the remaining lifecycle events' discriminating
+    // fields, verified against the reference's zod schemas (cc_strings.txt
+    // offsets ~13291777-13292436). `source` is shared with SessionStart's
+    // field of the same JSON name (ConfigChange's `source` enum --
+    // user_settings/project_settings/local_settings/policy_settings/skills --
+    // is a different value space, but the same wire key). `file_path` is
+    // shared by ConfigChange (optional), InstructionsLoaded, and FileChanged.
+    file_path: ?[]const u8 = null,
+    // InstructionsLoaded: `memory_type` (User/Project/Local/Managed),
+    // `load_reason` (session_start/nested_traversal/path_glob_match/include/
+    // compact).
+    memory_type: ?[]const u8 = null,
+    load_reason: ?[]const u8 = null,
+    // CwdChanged: `old_cwd`/`new_cwd`.
+    old_cwd: ?[]const u8 = null,
+    new_cwd: ?[]const u8 = null,
+    // FileChanged: `event` (change/add/unlink). Named `change_event` on the
+    // Zig side since `event` collides with nothing but reads oddly as a bare
+    // field name next to the struct's own semantics; emitted under the
+    // reference's literal `"event"` JSON key.
+    change_event: ?[]const u8 = null,
+    // TeammateIdle: `teammate_name` (required), `team_name` (reference marks
+    // `@deprecated` but still documents it; zcode has a single implicit team
+    // per session so this is carried for wire-compat only).
+    teammate_name: ?[]const u8 = null,
+    team_name: ?[]const u8 = null,
+    // WorktreeCreate: `name` (the worktree's logical name, not its path --
+    // emitted under the reference's literal `"name"` JSON key, so the Zig
+    // field is `worktree_name` to avoid shadowing anything struct-wide).
+    worktree_name: ?[]const u8 = null,
+    // WorktreeRemove: `worktree_path`.
+    worktree_path: ?[]const u8 = null,
+    // hooks-permissions-02 (corrected semantics): StopFailure fires INSTEAD
+    // OF Stop when the model/API call itself errored ending the turn
+    // (reference bundle: "Fires instead of Stop when an API error (rate
+    // limit, auth failure, etc.) ended the turn"), not when a Stop hook's own
+    // execution fails as originally guessed -- see agent_runtime.zig's
+    // `fireStopFailureHook` doc comment for the full correction. `error` is
+    // required; `error_details`/`last_assistant_message` are optional.
+    // `error` needs `@""`-escaping: it is a Zig keyword as a bare identifier.
+    @"error": ?[]const u8 = null,
+    error_details: ?[]const u8 = null,
+    last_assistant_message: ?[]const u8 = null,
 };
 
 /// Build the stdin JSON for a non-tool lifecycle event (SessionStart,
 /// UserPromptSubmit, Stop, SessionEnd, PreCompact, Notification, ...). Always
-/// includes `hook_event_name` and `cwd`; emits only the `fields` that are set.
-/// String values are JSON-escaped via `std.json.fmt`, matching the tool builder.
+/// includes `hook_event_name` and `cwd`; emits only the `fields` that are set,
+/// plus the reference's always-present `base` fields (hooks-permissions-09;
+/// see `HookBaseFields`), also emitted only when non-empty. String values are
+/// JSON-escaped via `std.json.fmt`, matching the tool builder.
+///
+/// Backward-compatible 4-arg call sites (every pre-existing caller/test) keep
+/// compiling unchanged by passing `.{}` for `base` -- see the 4-arg forwarding
+/// note is unnecessary here since Zig requires the argument explicitly; test
+/// call sites were updated alongside this signature change.
 pub fn buildLifecycleEventPayload(
     allocator: std.mem.Allocator,
     event_name: []const u8,
     cwd: []const u8,
     fields: LifecycleFields,
+    base: HookBaseFields,
 ) ![]u8 {
     var builder = sb.StringBuilder.init(allocator);
     defer builder.deinit();
@@ -163,11 +273,65 @@ pub fn buildLifecycleEventPayload(
     if (fields.reason) |v| try w.print(",\"reason\":{f}", .{std.json.fmt(v, .{})});
     if (fields.task_id) |v| try w.print(",\"task_id\":{f}", .{std.json.fmt(v, .{})});
     if (fields.task_subject) |v| try w.print(",\"task_subject\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.notification_type) |v| try w.print(",\"notification_type\":{f}", .{std.json.fmt(v, .{})});
+    // hooks-permissions-03 / hooks-permissions-02 (corrected): the remaining
+    // lifecycle events' fields (see `LifecycleFields`'s doc comment for the
+    // reference schema each maps to).
+    if (fields.file_path) |v| try w.print(",\"file_path\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.memory_type) |v| try w.print(",\"memory_type\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.load_reason) |v| try w.print(",\"load_reason\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.old_cwd) |v| try w.print(",\"old_cwd\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.new_cwd) |v| try w.print(",\"new_cwd\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.change_event) |v| try w.print(",\"event\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.teammate_name) |v| try w.print(",\"teammate_name\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.team_name) |v| try w.print(",\"team_name\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.worktree_name) |v| try w.print(",\"name\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.worktree_path) |v| try w.print(",\"worktree_path\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.@"error") |v| try w.print(",\"error\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.error_details) |v| try w.print(",\"error_details\":{f}", .{std.json.fmt(v, .{})});
+    if (fields.last_assistant_message) |v| try w.print(",\"last_assistant_message\":{f}", .{std.json.fmt(v, .{})});
+    try writeBaseFields(w, base);
     try w.writeAll("}");
     return allocator.dupe(u8, builder.items());
 }
 
-fn isValidJson(allocator: std.mem.Allocator, bytes: []const u8) bool {
+/// hooks-permissions-04: build the stdin JSON for `PostToolBatch`. Unlike
+/// every other tool-shaped event, PostToolBatch has no single tool_name/
+/// tool_input pair -- its payload is `tool_calls: [{tool_name, tool_input,
+/// tool_use_id, tool_response?}, ...]` for the whole batch (reference `Moe`/
+/// `Ioe` schemas). `tool_calls_json` is a pre-built, already-valid JSON array
+/// literal (the caller assembles each element; this function only embeds it
+/// verbatim, matching the tool builder's "raw JSON in, raw JSON out"
+/// convention for structured sub-values) -- an empty array `"[]"` is passed
+/// when the round had no tool calls (never actually reached by the one real
+/// call site, which only fires after at least one call resolved).
+pub fn buildPostToolBatchPayload(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    tool_calls_json: []const u8,
+    base: HookBaseFields,
+) ![]u8 {
+    var builder = sb.StringBuilder.init(allocator);
+    defer builder.deinit();
+    const w = builder.writer();
+
+    try w.print("{{\"hook_event_name\":\"PostToolBatch\",\"cwd\":{f},\"tool_calls\":", .{std.json.fmt(cwd, .{})});
+    if (tool_calls_json.len > 0 and isValidJson(allocator, tool_calls_json)) {
+        try w.writeAll(tool_calls_json);
+    } else {
+        try w.writeAll("[]");
+    }
+    try writeBaseFields(w, base);
+    try w.writeAll("}");
+    return allocator.dupe(u8, builder.items());
+}
+
+/// hooks-permissions-04: made `pub` so `agent_runtime.zig`'s PostToolBatch
+/// call site can apply the same "embed as object when it already parses as
+/// JSON, else as a JSON string" rule used throughout this file (`tool_input`/
+/// `tool_response`) when assembling each `tool_calls[]` element -- rather than
+/// duplicating this exact check there.
+pub fn isValidJson(allocator: std.mem.Allocator, bytes: []const u8) bool {
     const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
     if (trimmed.len == 0) return false;
     var p = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return false;
@@ -344,6 +508,8 @@ test "buildToolEventPayloadFull PostToolUse embeds json tool_response as object"
         "/repo",
         "{\"success\":true,\"bytes\":42}",
         true,
+        .{},
+        .{},
     );
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
@@ -365,6 +531,8 @@ test "buildToolEventPayloadFull PostToolUse embeds plain-string tool_response as
         "/repo",
         "drwxr-xr-x  total 0",
         true,
+        .{},
+        .{},
     );
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
@@ -381,6 +549,8 @@ test "buildToolEventPayloadFull PostToolUseFailure embeds error and interrupt fl
         "/repo",
         "command failed",
         false,
+        .{},
+        .{},
     );
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
@@ -401,6 +571,8 @@ test "buildToolEventPayloadFull PreToolUse with null response omits tool_respons
         "/repo",
         null,
         true,
+        .{},
+        .{},
     );
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
@@ -420,7 +592,7 @@ test "buildToolEventPayload 5-arg form still omits tool_response" {
 }
 
 test "buildLifecycleEventPayload SessionStart includes source not tool_name" {
-    const p = try buildLifecycleEventPayload(testing.allocator, "SessionStart", "/repo", .{ .source = "startup" });
+    const p = try buildLifecycleEventPayload(testing.allocator, "SessionStart", "/repo", .{ .source = "startup" }, .{});
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
     defer parsed.deinit();
@@ -432,8 +604,105 @@ test "buildLifecycleEventPayload SessionStart includes source not tool_name" {
     try testing.expect(parsed.value.object.get("prompt") == null);
 }
 
+test "hooks-permissions-09: buildToolEventPayloadFull emits base fields and tool_use_id/duration_ms when set" {
+    const p = try buildToolEventPayloadFull(
+        testing.allocator,
+        "PostToolUse",
+        "Bash",
+        "{\"command\":\"ls\"}",
+        "/repo",
+        "ok",
+        true,
+        .{ .session_id = "sess-1", .transcript_path = "/repo/.zcode/sessions/sess-1.jsonl", .permission_mode = "acceptEdits", .agent_id = "agent-2", .prompt_id = "prompt-3" },
+        .{ .tool_use_id = "tu-1", .duration_ms = 42 },
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("sess-1", parsed.value.object.get("session_id").?.string);
+    try testing.expectEqualStrings("/repo/.zcode/sessions/sess-1.jsonl", parsed.value.object.get("transcript_path").?.string);
+    try testing.expectEqualStrings("acceptEdits", parsed.value.object.get("permission_mode").?.string);
+    try testing.expectEqualStrings("agent-2", parsed.value.object.get("agent_id").?.string);
+    try testing.expectEqualStrings("prompt-3", parsed.value.object.get("prompt_id").?.string);
+    try testing.expectEqualStrings("tu-1", parsed.value.object.get("tool_use_id").?.string);
+    try testing.expectEqual(@as(i64, 42), parsed.value.object.get("duration_ms").?.integer);
+}
+
+test "hooks-permissions-09: empty base/extra fields are omitted, not emitted blank" {
+    const p = try buildToolEventPayloadFull(testing.allocator, "PreToolUse", "Bash", "ls", "/repo", null, true, .{}, .{});
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("session_id") == null);
+    try testing.expect(parsed.value.object.get("transcript_path") == null);
+    try testing.expect(parsed.value.object.get("permission_mode") == null);
+    try testing.expect(parsed.value.object.get("agent_id") == null);
+    try testing.expect(parsed.value.object.get("prompt_id") == null);
+    try testing.expect(parsed.value.object.get("tool_use_id") == null);
+    try testing.expect(parsed.value.object.get("reason") == null);
+    try testing.expect(parsed.value.object.get("duration_ms") == null);
+}
+
+test "hooks-permissions-09: buildLifecycleEventPayload emits base fields alongside lifecycle fields" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "UserPromptSubmit",
+        "/repo",
+        .{ .prompt = "do the thing" },
+        .{ .session_id = "sess-9", .permission_mode = "plan" },
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("do the thing", parsed.value.object.get("prompt").?.string);
+    try testing.expectEqualStrings("sess-9", parsed.value.object.get("session_id").?.string);
+    try testing.expectEqualStrings("plan", parsed.value.object.get("permission_mode").?.string);
+}
+
+test "hooks-permissions-10: buildLifecycleEventPayload emits notification_type" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "Notification",
+        "/repo",
+        .{ .message = "idle for a while", .notification_type = "idle" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("idle for a while", parsed.value.object.get("message").?.string);
+    try testing.expectEqualStrings("idle", parsed.value.object.get("notification_type").?.string);
+}
+
+test "hooks-permissions-04: buildPostToolBatchPayload embeds the tool_calls array and base fields" {
+    const p = try buildPostToolBatchPayload(
+        testing.allocator,
+        "/repo",
+        "[{\"tool_name\":\"Read\",\"tool_input\":{\"path\":\"a.txt\"},\"tool_use_id\":\"\"},{\"tool_name\":\"Glob\",\"tool_input\":{\"pattern\":\"*.zig\"},\"tool_use_id\":\"\"}]",
+        .{ .session_id = "sess-batch" },
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("PostToolBatch", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("/repo", parsed.value.object.get("cwd").?.string);
+    try testing.expectEqualStrings("sess-batch", parsed.value.object.get("session_id").?.string);
+    const calls = parsed.value.object.get("tool_calls").?.array;
+    try testing.expectEqual(@as(usize, 2), calls.items.len);
+    try testing.expectEqualStrings("Read", calls.items[0].object.get("tool_name").?.string);
+    try testing.expectEqualStrings("Glob", calls.items[1].object.get("tool_name").?.string);
+}
+
+test "hooks-permissions-04: buildPostToolBatchPayload falls back to an empty array for invalid input" {
+    const p = try buildPostToolBatchPayload(testing.allocator, "/repo", "not valid json", .{});
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed.value.object.get("tool_calls").?.array.items.len);
+}
+
 test "buildLifecycleEventPayload UserPromptSubmit emits prompt only" {
-    const p = try buildLifecycleEventPayload(testing.allocator, "UserPromptSubmit", "/repo", .{ .prompt = "do the thing" });
+    const p = try buildLifecycleEventPayload(testing.allocator, "UserPromptSubmit", "/repo", .{ .prompt = "do the thing" }, .{});
     defer testing.allocator.free(p);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
     defer parsed.deinit();
@@ -529,6 +798,113 @@ test "detectAsyncFirstLine returns asyncTimeout for an async sentinel" {
     try testing.expectEqual(@as(?u64, 0), detectAsyncFirstLine("{\"async\":true}"));
     // Leading/trailing whitespace is tolerated.
     try testing.expectEqual(@as(?u64, 250), detectAsyncFirstLine("  {\"async\":true,\"asyncTimeout\":250}  \n"));
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits CwdChanged old_cwd/new_cwd" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "CwdChanged",
+        "/repo/sub",
+        .{ .old_cwd = "/repo" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo", parsed.value.object.get("old_cwd").?.string);
+    // The "new" cwd is the event's own top-level `cwd`, not a duplicated field.
+    try testing.expectEqualStrings("/repo/sub", parsed.value.object.get("cwd").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits FileChanged file_path and event kind" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "FileChanged",
+        "/repo",
+        .{ .file_path = "/repo/a.zig", .change_event = "add" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo/a.zig", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("add", parsed.value.object.get("event").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits InstructionsLoaded fields" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "InstructionsLoaded",
+        "/repo",
+        .{ .file_path = "/repo/ZCODE.md", .memory_type = "Project", .load_reason = "session_start" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo/ZCODE.md", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("Project", parsed.value.object.get("memory_type").?.string);
+    try testing.expectEqualStrings("session_start", parsed.value.object.get("load_reason").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits TeammateIdle teammate_name/team_name" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "TeammateIdle",
+        "/repo",
+        .{ .teammate_name = "worker", .team_name = "alpha" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("worker", parsed.value.object.get("teammate_name").?.string);
+    try testing.expectEqualStrings("alpha", parsed.value.object.get("team_name").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits WorktreeCreate name and WorktreeRemove worktree_path" {
+    const create = try buildLifecycleEventPayload(testing.allocator, "WorktreeCreate", "/repo", .{ .worktree_name = "feature-x" }, .{});
+    defer testing.allocator.free(create);
+    var parsed_create = try std.json.parseFromSlice(std.json.Value, testing.allocator, create, .{});
+    defer parsed_create.deinit();
+    try testing.expectEqualStrings("feature-x", parsed_create.value.object.get("name").?.string);
+
+    const remove = try buildLifecycleEventPayload(testing.allocator, "WorktreeRemove", "/repo", .{ .worktree_path = "/repo/../feature-x" }, .{});
+    defer testing.allocator.free(remove);
+    var parsed_remove = try std.json.parseFromSlice(std.json.Value, testing.allocator, remove, .{});
+    defer parsed_remove.deinit();
+    try testing.expectEqualStrings("/repo/../feature-x", parsed_remove.value.object.get("worktree_path").?.string);
+}
+
+test "hooks-permissions-03: buildLifecycleEventPayload emits ConfigChange source and optional file_path" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "ConfigChange",
+        "/repo",
+        .{ .source = "skills" },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("skills", parsed.value.object.get("source").?.string);
+    try testing.expect(parsed.value.object.get("file_path") == null);
+}
+
+test "hooks-permissions-02 (corrected): buildLifecycleEventPayload emits StopFailure error fields" {
+    const p = try buildLifecycleEventPayload(
+        testing.allocator,
+        "StopFailure",
+        "/repo",
+        .{ .@"error" = "RateLimited", .error_details = "Rate limited by the API provider.", .last_assistant_message = "Here is the plan..." },
+        .{},
+    );
+    defer testing.allocator.free(p);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("RateLimited", parsed.value.object.get("error").?.string);
+    try testing.expectEqualStrings("Rate limited by the API provider.", parsed.value.object.get("error_details").?.string);
+    try testing.expectEqualStrings("Here is the plan...", parsed.value.object.get("last_assistant_message").?.string);
 }
 
 test "detectAsyncFirstLine returns null for a non-async line" {

@@ -549,12 +549,12 @@ test "parse tool args preserves array payload values" {
 
 test "parse parameter wrapper with single-quoted name attribute" {
     const allocator = testing.allocator;
-    const input = "<parameter name='tool_calls'>[{\"name\":\"TaskPoll\",\"args\":{\"id\":\"task-1\"}}]</parameter>";
+    const input = "<parameter name='tool_calls'>[{\"name\":\"TaskGet\",\"args\":{\"id\":\"task-1\"}}]</parameter>";
 
     var p = try parse(allocator, input);
     defer p.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 1), p.tool_calls.len);
-    try testing.expectEqualStrings("TaskPoll", p.tool_calls[0].name);
+    try testing.expectEqualStrings("TaskGet", p.tool_calls[0].name);
     try testing.expectEqualStrings("id=task-1", p.tool_calls[0].args);
 }

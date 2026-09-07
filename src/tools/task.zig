@@ -388,6 +388,11 @@ pub fn taskUpdate(
     var rec = readTaskRecord(allocator, task_path) catch return allocator.dupe(u8, "task not found");
     defer rec.deinit(allocator);
 
+    // hooks-permissions-02: TaskCompleted fires on the transition INTO a
+    // resolved status, not on every subsequent update of an already-done
+    // task (mirrors TaskCreated firing exactly once, at creation).
+    const was_resolved = isResolvedStatus(rec.status);
+
     if (title) |v| try helpers.replaceOwned(allocator, &rec.title, v);
     if (summary) |v| try helpers.replaceOwned(allocator, &rec.summary, v);
     if (status) |v| {
@@ -400,6 +405,11 @@ pub fn taskUpdate(
 
     try writeTaskRecord(allocator, task_path, &rec);
     try appendTaskNotification(allocator, cwd, rec.id, "updated", rec.status, rec.title);
+
+    if (!was_resolved and isResolvedStatus(rec.status)) {
+        hooks.runTaskCompletedHook(allocator, cwd, rec.id, rec.title);
+    }
+
     return formatTaskRecord(allocator, &rec);
 }
 

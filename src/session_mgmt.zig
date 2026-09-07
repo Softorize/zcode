@@ -1,6 +1,7 @@
 const std = @import("std");
 const rt = @import("zcode_runtime");
 const std_io = @import("core/std_io.zig");
+const clock = @import("core/clock.zig");
 const build_options = @import("build_options");
 
 const repl = @import("cli/repl.zig");
@@ -136,6 +137,7 @@ pub fn replOptionsFromConfig(cfg: *const config_mod.Config, yolo_mode: bool, cwd
         .status_workspace = cwd,
         .status_branch = branch,
         .status_model_context_window = cfg.model_context_window,
+        .autocompact_enabled = cfg.auto_compact_enabled,
         .status_approval_mode = if (yolo_mode) "yolo" else cfg.approval_mode,
         .status_sandbox = cfg.sandbox,
         .status_show_workspace = cfg.ui_status_show_workspace,
@@ -163,6 +165,9 @@ pub fn replOptionsFromConfig(cfg: *const config_mod.Config, yolo_mode: bool, cwd
         .ui_density = density,
         .ui_leader_key = cfg.ui_leader_key,
         .show_top_bar = cfg.ui_show_top_bar,
+        .legacy_banner = cfg.ui_legacy_banner,
+        .legacy_footer = cfg.ui_legacy_footer,
+        .ui_legacy_transcript = cfg.ui_legacy_transcript,
         .shortcuts_panel_enabled = cfg.ui_show_shortcuts_panel,
         .vim_mode_enabled = cfg.ui_vim_mode,
         .input_mode_label = if (cfg.ui_vim_mode) "VIM INSERT" else "",
@@ -242,6 +247,14 @@ pub fn runInteractive(
     initial_agent: ?[]const u8,
     session_name: ?[]const u8,
 ) !void {
+    // sessions-storage-02/04: every session this process mints from here on
+    // lands under `<zcode_home>/projects/<slug(cwd)>/` instead of the flat
+    // legacy directory, and the store's cross-directory-resume/origin-cwd
+    // machinery keys off this. sessions-storage-03/12: a `--session-id
+    // <uuid>` pin is one-shot -- consume it right before the runtime mints
+    // the id (AgentRuntime.init calls store.createSessionId()).
+    store.active_cwd = cwd;
+    if (cfg.session_id.len > 0) store.pinNextSessionId(cfg.session_id) catch {};
     var runtime = try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, true, auto_approve_high, strict, yolo_mode);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
@@ -388,6 +401,11 @@ pub fn runKairosTurn(
     prompt: []const u8,
     approval_handler: ?agent_runtime.ApprovalHandler,
 ) ![]u8 {
+    // sessions-storage-02: shard KAIROS turns into the same per-project
+    // bucket a normal session from this cwd would use. Unlike the CLI entry
+    // points above, a KAIROS turn never carries a `--session-id` pin, so
+    // cfg.session_id is deliberately not consumed here.
+    store.active_cwd = cwd;
     var runtime = try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, false, false, false, false);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
@@ -422,6 +440,9 @@ pub fn runOneShot(
     yolo_mode: bool,
     initial_agent: ?[]const u8,
 ) !agent_runtime.OneShotOutput {
+    // sessions-storage-02/03/12: see the identical comment in runInteractive.
+    store.active_cwd = cwd;
+    if (cfg.session_id.len > 0) store.pinNextSessionId(cfg.session_id) catch {};
     var runtime = try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, false, auto_approve_high, strict, yolo_mode);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
@@ -443,6 +464,7 @@ pub fn runOneShot(
         return .{
             .body = try allocator.dupe(u8, result.final_text),
             .strict_violation = result.strict_violation,
+            .session_id = try allocator.dupe(u8, runtime.session_id),
         };
     }
 
@@ -474,6 +496,7 @@ pub fn runOneShot(
             json_traces,
         ),
         .strict_violation = result.strict_violation,
+        .session_id = try allocator.dupe(u8, runtime.session_id),
     };
 }
 
@@ -521,6 +544,9 @@ pub fn runHeadlessResult(
     initial_agent: ?[]const u8,
     caps: HeadlessCaps,
 ) !sdk_output.Result {
+    // sessions-storage-02/03/12: see the identical comment in runInteractive.
+    store.active_cwd = cwd;
+    if (cfg.session_id.len > 0) store.pinNextSessionId(cfg.session_id) catch {};
     var runtime = try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, false, auto_approve_high, strict, yolo_mode);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
@@ -597,12 +623,83 @@ pub fn runHeadlessResult(
     };
 }
 
-/// Free the allocator-owned fields of a result returned by runHeadlessResult.
+/// Free the allocator-owned fields of a result returned by runHeadlessResult
+/// or runHeadlessResumeResult (same output shape).
 pub fn freeHeadlessResult(allocator: std.mem.Allocator, result: *sdk_output.Result) void {
     allocator.free(result.session_id);
     allocator.free(result.result_text);
     allocator.free(result.model);
     if (result.structured_output_json.len > 0) allocator.free(result.structured_output_json);
+}
+
+/// sessions-storage-09/12: the headless analogue of `resumeSessionInteractive`
+/// -- load an EXISTING session's history and answer exactly one more prompt
+/// against it non-interactively, the same way `runHeadlessResult` does for a
+/// brand-new session. `resumeSessionInteractive` opens the interactive REPL
+/// (blocking on stdin), which is wrong for a detached/background caller that
+/// never provides one; this is what `/fork`'s background continuation uses
+/// to actually answer the queued prompt on the forked session, and is the
+/// same shape a future `--resume <id> --print "<prompt>"` CLI route would
+/// need. Caller owns the returned result's allocations (free via
+/// freeHeadlessResult).
+pub fn runHeadlessResumeResult(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    cfg: *const config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    prompt: []const u8,
+    auto_approve_high: bool,
+    strict: bool,
+    yolo_mode: bool,
+) !sdk_output.Result {
+    store.active_cwd = cwd;
+
+    var loaded = try store.load(session_id);
+    defer loaded.deinit(allocator);
+
+    var runtime = try AgentRuntime.initFromSession(allocator, cwd, cfg, policy, audit, store, mcp, browser, &loaded, false, auto_approve_high, strict, yolo_mode);
+    defer runtime.deinit();
+    prompt_sections.setGlobal(&runtime.prompt_sections_registry);
+
+    try runPluginEventSilent(allocator, .{
+        .event = .session_start,
+        .cwd = cwd,
+    });
+
+    var result = try runtime.handlePromptDetailed(prompt);
+    defer result.deinit(allocator);
+
+    const usage = blk: {
+        runtime.token_status_lock.lock(rt.io) catch {};
+        defer runtime.token_status_lock.unlock(rt.io);
+        break :blk sdk_output.Usage{
+            .input_tokens = runtime.token_status.total_input_tokens,
+            .output_tokens = runtime.token_status.total_output_tokens,
+        };
+    };
+    const est_cost = cost_mod.estimateCost(
+        runtime.active_provider,
+        runtime.active_model,
+        usage.input_tokens,
+        usage.output_tokens,
+    );
+
+    return .{
+        .subtype = .success,
+        .session_id = try allocator.dupe(u8, runtime.session_id),
+        .result_text = try allocator.dupe(u8, result.final_text),
+        .num_turns = result.rounds,
+        .total_cost_usd = est_cost,
+        .usage = usage,
+        .model = try allocator.dupe(u8, runtime.active_model),
+        .stop_reason = "end_turn",
+        .structured_output_json = "",
+    };
 }
 
 pub fn cmdPromptInspect(
@@ -660,12 +757,30 @@ pub fn resumeSessionInteractive(
     yolo_mode: bool,
     initial_agent: ?[]const u8,
 ) !void {
+    // sessions-storage-02/04: resolve/write this resumed session's turns
+    // through the same per-project bucket a fresh session from this cwd
+    // would use (sessionPath's cross-project scan already finds a session
+    // that actually lives in a DIFFERENT project's bucket, so this is safe
+    // even when resuming across directories).
+    store.active_cwd = cwd;
+
     var loaded = try store.load(session_id);
     defer loaded.deinit(allocator);
 
     var runtime = try AgentRuntime.initFromSession(allocator, cwd, cfg, policy, audit, store, mcp, browser, &loaded, true, auto_approve_high, strict, yolo_mode);
     defer runtime.deinit();
     prompt_sections.setGlobal(&runtime.prompt_sections_registry);
+
+    // phase-26 daemon-background: register a RESUMED session the same way
+    // runInteractive registers a fresh one, so `zcode ps`/`attach` can see
+    // and reattach to it too -- previously only brand-new sessions showed
+    // up in the live-process registry at all.
+    session_registry.register(allocator, .{
+        .session_id = runtime.session_id,
+        .cwd = cwd,
+        .name = null,
+    }) catch {};
+    defer session_registry.unregister(allocator);
 
     try runPluginEvent(allocator, writer, .{
         .event = .session_start,
@@ -701,6 +816,121 @@ pub fn resumeSessionInteractive(
     };
 
     try repl.run(allocator, stdin, writer, handler, options);
+}
+
+/// How long `resumeSessionHeadless`'s idle loop sleeps between heartbeat
+/// checks once it has nothing left to do. Short enough that `zcode kill`'s
+/// SIGTERM (which needs no signal handler -- the default action just ends
+/// the process) is noticed promptly if a test or caller ever wants to poll
+/// for shutdown; long enough not to spin.
+const HEADLESS_IDLE_POLL_NS: u64 = 2 * std.time.ns_per_s;
+
+/// commands-12: the detached child a `/background`/`/bg` (or a bare `--bg`)
+/// re-invocation of `--resume <id>` spawns. `resumeSessionInteractive` (what
+/// plain `--resume` uses) opens the interactive REPL and blocks reading
+/// stdin -- but the spawner redirects the child's stdin to `.ignore`, so
+/// that read fails immediately with `EndOfStream` the instant there is no
+/// queued input. This variant never touches stdin at all: it loads the
+/// session (falling back to minting a brand-new one under the SAME id when
+/// the session has zero prior turns and was therefore never flushed to the
+/// store yet -- `store.load`'s FileNotFound in that case is not an error,
+/// just "nothing to resume"), answers `initial_prompt` if one was queued
+/// (the `[prompt]` argument to `/background`, forwarded via
+/// `ZCODE_BG_INITIAL_PROMPT`), then idles. Idling (rather than exiting)
+/// keeps `zcode ps` honestly showing a live process for this session until
+/// `zcode kill`/`rm` SIGTERMs it or the process is otherwise stopped --
+/// mirrors `kairos.serve`'s same "run until externally killed" daemon shape.
+/// A LATER `zcode attach`/`--resume` always re-reads the persisted
+/// transcript from a fresh process regardless of whether this one is still
+/// alive, so nothing further is lost if it is killed.
+pub fn resumeSessionHeadless(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    cfg: *const config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    initial_prompt: ?[]const u8,
+    auto_approve_high: bool,
+    strict: bool,
+    yolo_mode: bool,
+    initial_agent: ?[]const u8,
+) !void {
+    try prepBackgroundRuntime(allocator, cwd, cfg, policy, audit, store, mcp, browser, session_id, initial_prompt, auto_approve_high, strict, yolo_mode, initial_agent);
+    while (true) clock.sleepNanos(HEADLESS_IDLE_POLL_NS);
+}
+
+/// The testable half of `resumeSessionHeadless`: everything up to (but not
+/// including) the infinite idle loop, so a test can assert the session
+/// loaded/minted and the queued prompt was answered without hanging forever.
+fn prepBackgroundRuntime(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    cfg: *const config_mod.Config,
+    policy: *policy_mod.Policy,
+    audit: *logger_mod.AuditLogger,
+    store: *session_store.Store,
+    mcp: *mcp_client.Client,
+    browser: ?*browser_bridge_mod.BrowserBridge,
+    session_id: []const u8,
+    initial_prompt: ?[]const u8,
+    auto_approve_high: bool,
+    strict: bool,
+    yolo_mode: bool,
+    initial_agent: ?[]const u8,
+) !void {
+    store.active_cwd = cwd;
+
+    var runtime = blk: {
+        var loaded = store.load(session_id) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Zero prior turns: nothing was ever flushed to the store.
+                // Pin the id so the fresh runtime mints exactly this session
+                // id (sessions-storage-03/12's `--session-id` one-shot pin)
+                // instead of a random new one, so `zcode attach
+                // <session_id>` still finds it afterward.
+                store.pinNextSessionId(session_id) catch {};
+                break :blk try AgentRuntime.init(allocator, cwd, cfg, policy, audit, store, mcp, browser, true, auto_approve_high, strict, yolo_mode);
+            },
+            else => return err,
+        };
+        defer loaded.deinit(allocator);
+        break :blk try AgentRuntime.initFromSession(allocator, cwd, cfg, policy, audit, store, mcp, browser, &loaded, true, auto_approve_high, strict, yolo_mode);
+    };
+    defer runtime.deinit();
+    prompt_sections.setGlobal(&runtime.prompt_sections_registry);
+
+    // Same registration `resumeSessionInteractive` does, so `zcode
+    // ps`/`attach` see this session too.
+    session_registry.register(allocator, .{
+        .session_id = runtime.session_id,
+        .cwd = cwd,
+        .name = null,
+    }) catch {};
+    defer session_registry.unregister(allocator);
+
+    runPluginEventSilent(allocator, .{ .event = .session_start, .cwd = cwd }) catch {};
+
+    if (initial_agent) |agent_name| {
+        const activation = try runtime.activateAgentByNameStrict(agent_name);
+        defer allocator.free(activation);
+    }
+
+    if (initial_prompt) |p| {
+        if (p.len > 0) {
+            const stdout = std_io.stdoutWriter();
+            if (runtime.handlePromptDetailed(p)) |result_val| {
+                var result = result_val;
+                defer result.deinit(allocator);
+                stdout.print("{s}\n", .{result.final_text}) catch {};
+            } else |err| {
+                stdout.print("error handling queued prompt: {s}\n", .{@errorName(err)}) catch {};
+            }
+        }
+    }
 }
 
 const testing_alloc = std.testing;
@@ -763,6 +993,23 @@ test "replOptionsFromConfig: yolo flips approval_mode and threads location" {
     const opts_yolo = replOptionsFromConfig(&cfg, true, "/tmp/ws", "main");
     try testing_alloc.expectEqualStrings("yolo", opts_yolo.status_approval_mode);
     try testing_alloc.expect(opts_yolo.yolo_mode);
+}
+
+// repl-ux-missed-128/130: confirms Config.auto_compact_enabled genuinely
+// reaches the live repl.Options the footer render pipeline reads --
+// not just the isolated repl_render.zig unit test.
+test "replOptionsFromConfig: threads auto_compact_enabled into Options.autocompact_enabled" {
+    const alloc = testing_alloc.allocator;
+    var cfg = try config_mod.Config.init(alloc);
+    defer cfg.deinit(alloc);
+
+    cfg.auto_compact_enabled = true;
+    const opts_on = replOptionsFromConfig(&cfg, false, "/tmp/ws", "main");
+    try testing_alloc.expect(opts_on.autocompact_enabled);
+
+    cfg.auto_compact_enabled = false;
+    const opts_off = replOptionsFromConfig(&cfg, false, "/tmp/ws", "main");
+    try testing_alloc.expect(!opts_off.autocompact_enabled);
 }
 
 // ── sdk-headless-14: headless caps threaded into the runtime ───────
@@ -871,6 +1118,132 @@ test "sdk-headless-14: --max-turns 1 against a multi-round mock prompt yields er
     try testing_alloc.expectEqualStrings("max_turns", result.stop_reason);
     // num_turns reached the cap.
     try testing_alloc.expect(result.num_turns >= 1);
+}
+
+// ── sessions-storage-09/12: headless (non-interactive) resume ─────────────
+
+test "runHeadlessResumeResult answers one more turn on an EXISTING session without opening the REPL" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing_alloc.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try HeadlessCapsHarness.init(alloc, root);
+    defer h.deinit();
+
+    // Seed an existing session with one prior turn, mirroring what
+    // `/fork`'s background continuation (or a real headless `--resume`)
+    // would find already on disk.
+    try h.store.appendTurn("resume-headless-test", .user, "earlier turn", "");
+
+    var result = try runHeadlessResumeResult(
+        alloc,
+        h.cwd,
+        &h.cfg,
+        &h.policy,
+        &h.audit,
+        &h.store,
+        &h.mcp,
+        null,
+        "resume-headless-test",
+        "one more turn",
+        true, // auto_approve_high
+        false, // strict
+        true, // yolo_mode
+    );
+    defer freeHeadlessResult(alloc, &result);
+
+    try testing_alloc.expectEqual(sdk_output.ResultSubtype.success, result.subtype);
+    try testing_alloc.expectEqualStrings("resume-headless-test", result.session_id);
+
+    // The new prompt (and the model's reply) were appended to the SAME
+    // session file -- the prior turn survives untouched, it is not replaced
+    // or interactively re-read from stdin.
+    var loaded = try h.store.load("resume-headless-test");
+    defer loaded.deinit(alloc);
+    try testing_alloc.expect(loaded.history.len >= 3); // prior + new user + assistant reply
+    try testing_alloc.expectEqualStrings("earlier turn", loaded.history[0].content);
+}
+
+test "commands-12: prepBackgroundRuntime mints a fresh session under the pinned id when nothing was ever flushed to the store" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing_alloc.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try HeadlessCapsHarness.init(alloc, root);
+    defer h.deinit();
+
+    // The bug: a `/background` invoked as the session's very FIRST command
+    // has never been flushed to the store, so `store.load` would return
+    // FileNotFound. Before the fix that bubbled up as a hard error;
+    // `prepBackgroundRuntime` must instead mint a fresh session under this
+    // exact id (via pinNextSessionId) and answer the queued prompt on it.
+    try prepBackgroundRuntime(
+        alloc,
+        h.cwd,
+        &h.cfg,
+        &h.policy,
+        &h.audit,
+        &h.store,
+        &h.mcp,
+        null,
+        "brand-new-bg-session",
+        "say hello",
+        true, // auto_approve_high
+        false, // strict
+        true, // yolo_mode
+        null, // initial_agent
+    );
+
+    var loaded = try h.store.load("brand-new-bg-session");
+    defer loaded.deinit(alloc);
+    try testing_alloc.expect(loaded.history.len >= 2); // queued user turn + assistant reply
+}
+
+test "commands-12: prepBackgroundRuntime is a no-op turn-wise when no prompt is queued (bare /background)" {
+    const test_helpers = @import("core/test_helpers.zig");
+    const alloc = testing_alloc.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+
+    var h = try HeadlessCapsHarness.init(alloc, root);
+    defer h.deinit();
+
+    try h.store.appendTurn("bare-bg-session", .user, "earlier turn", "");
+
+    // Bare `/background` (no `[prompt]` arg) queues nothing -- this must
+    // load the existing session and return without touching stdin or
+    // appending a spurious turn.
+    try prepBackgroundRuntime(
+        alloc,
+        h.cwd,
+        &h.cfg,
+        &h.policy,
+        &h.audit,
+        &h.store,
+        &h.mcp,
+        null,
+        "bare-bg-session",
+        null,
+        true,
+        false,
+        true,
+        null,
+    );
+
+    var loaded = try h.store.load("bare-bg-session");
+    defer loaded.deinit(alloc);
+    try testing_alloc.expectEqual(@as(usize, 1), loaded.history.len);
 }
 
 test "sdk-headless-14: --json-schema sets pending_response_schema and surfaces structured_output" {

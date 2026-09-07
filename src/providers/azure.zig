@@ -105,6 +105,10 @@ fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReque
             self.cb.recordFailure();
             if (!common.shouldRetryHttpError(err) or retries >= self.retry_count) return err;
             const delay_ms = circuit_breaker.backoffDelayMs(retries, 100, 30_000);
+            // repl-ux-04: drive the interactive spinner's escalating retry
+            // status line (no-op when no turn reporter is registered, e.g.
+            // headless/background calls).
+            common.notifyRetryStatus(delay_ms, retries + 1);
             clock.sleepNanos(delay_ms * std.time.ns_per_ms);
             retries += 1;
             continue;
@@ -115,6 +119,10 @@ fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReque
         const err_kind = common.classifyErrorBody(allocator, raw);
         if (err_kind == .retryable and retries < self.retry_count) {
             const delay_ms = circuit_breaker.backoffDelayMs(retries, 100, 30_000);
+            // repl-ux-04: drive the interactive spinner's escalating retry
+            // status line (no-op when no turn reporter is registered, e.g.
+            // headless/background calls).
+            common.notifyRetryStatus(delay_ms, retries + 1);
             std.log.warn("azure: provider returned retryable error body, retry {d}/{d} after {d}ms", .{ retries + 1, self.retry_count, delay_ms });
             allocator.free(raw);
             clock.sleepNanos(delay_ms * std.time.ns_per_ms);

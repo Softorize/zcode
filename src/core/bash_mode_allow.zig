@@ -117,7 +117,9 @@ pub fn checkMode(mode: Mode, command: []const u8) Decision {
     return switch (mode) {
         .bypassPermissions, .dontAsk => .passthrough,
         .acceptEdits => if (acceptEditsAutoAllows(command)) .allow else .passthrough,
-        .default, .plan => .passthrough,
+        // hooks-permissions-05: `auto` has no classifier in zcode, so it takes
+        // the same passthrough path as `default` (see permission_decision.Mode).
+        .default, .plan, .auto => .passthrough,
     };
 }
 

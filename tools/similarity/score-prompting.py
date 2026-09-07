@@ -11,8 +11,8 @@ everything. Three axes:
 """
 import os, re
 
-CC = "/Users/example/Downloads/claude-code-main"
-ZC = "/Users/example/Projects/zig-code"
+CC = os.environ.get("ZCODE_CC_REF", os.path.expanduser("~/projects/experiments/edualc"))
+ZC = os.environ.get("ZCODE_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # --- 1. Prompt sections ---
 # CC ships 18 section functions in src/constants/prompts.ts.
@@ -33,8 +33,8 @@ SECTION_MAP = {
     "getLanguageSection":                ("src/core/prompt_helpers.zig", "# Language"),
     "getOutputStyleSection":             ("src/core/prompt_helpers.zig", "output_style"),
     "getMcpInstructionsSection":         ("src/agent_runtime.zig", "mcp_announced_instruction_names"),
-    "getAgentToolSection":               ("src/tools/tool_schemas.zig", '"AgentRun"'),
-    "getSessionSpecificGuidanceSection": ("src/core/prompt_helpers.zig", "# Execution continuity"),
+    "getAgentToolSection":               ("src/tools/tool_schemas.zig", '.name = "Agent"'),
+    "getSessionSpecificGuidanceSection": ("src/core/prompt_engine.zig", "zcode-session-tips"),
     "getBriefSection":                   ("src/tools/tool_schemas.zig", '"Brief"'),
     "getProactiveSection":               ("src/agent_tools.zig", "shouldRepromptForToolCalls"),
     "getFunctionResultClearingSection":  ("src/agent_history.zig", "stripEchoedToolTraces"),

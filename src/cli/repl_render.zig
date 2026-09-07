@@ -7,15 +7,24 @@ const repl_attachments = @import("repl_attachments.zig");
 const repl_help = @import("repl_help.zig");
 const repl_footer = @import("repl_footer.zig");
 const figures = @import("../core/figures.zig");
+const format_mod = @import("../core/format.zig");
 const ui_theme = @import("../core/ui_theme.zig");
 const sandbox_mod = @import("../core/sandbox.zig");
 const terminal_caps = @import("../core/terminal_caps.zig");
+const permission_decision = @import("../core/permission_decision.zig");
 
 const UiTranscript = repl_spinner.UiTranscript;
 const TRANSCRIPT_DIVIDER_PREFIX = "[[divider:";
 const TRANSCRIPT_DIVIDER_SUFFIX = "]]";
 const TRANSCRIPT_ASSISTANT_BLOCK_START = "[[assistant_block:start]]";
 const TRANSCRIPT_ASSISTANT_BLOCK_END = "[[assistant_block:end]]";
+// r4-transcript-01: mirrors the assistant-block markers above, but for the
+// user's own echoed prompt. Only emitted by appendInputLine when
+// `!options.ui_legacy_transcript`, so the render loop's `in_user_block`
+// state (and the hanging-indent renderer it enables) never activates for
+// legacy transcripts -- a legacy caller simply never appends this marker.
+const TRANSCRIPT_USER_BLOCK_START = "[[user_block:start]]";
+const TRANSCRIPT_USER_BLOCK_END = "[[user_block:end]]";
 const PROMPT_PLACEHOLDER = "Type a task or use / for commands";
 const FOOTER_SEGMENT_SEPARATOR = " \xe2\x88\x99 ";
 const BRIEF_ASSISTANT_BODY_ROWS: usize = 6;
@@ -30,7 +39,66 @@ const TranscriptDecorState = struct {
     in_assistant_block: bool = false,
     assistant_brief_rows_used: usize = 0,
     assistant_brief_hidden_rows: usize = 0,
+    /// r4-transcript-02: 0-based index of the content line currently being
+    /// rendered within the assistant block (reset at block start). Row 0
+    /// of line index 0 gets the "⏺ " bullet; every other row gets the
+    /// plain 2-space hanging indent.
+    assistant_line_index: usize = 0,
+    /// r4-transcript-01: same idea as `in_assistant_block` for the user's
+    /// own echoed prompt.
+    in_user_block: bool = false,
+    /// r4-transcript-01: 0-based index of the content line currently being
+    /// rendered within the user block (reset at block start). Row 0 of
+    /// line index 0 gets the "> " pointer; every other row gets the plain
+    /// 2-space hanging indent (multi-line prompts).
+    user_line_index: usize = 0,
 };
+
+// repl-ux-07: shared "Settings"-style sectioned panel for /status and
+// /config, mirroring the reference's Settings dialog (edualc
+// src/components/Settings/Status.tsx: named property groups like
+// `label:'Version'`, `buildAccountProperties()`, `buildMcpProperties()`,
+// rendered as Title-Case "Label: value" rows) instead of a raw
+// snake_case `key={value}` dump.
+pub const StatusField = struct {
+    label: []const u8,
+    value: []const u8,
+};
+
+pub const StatusSection = struct {
+    title: []const u8,
+    fields: []const StatusField,
+};
+
+/// Render `sections` as a bordered, Title-Case panel: a bold title row,
+/// then one bold-accent section heading per group followed by its
+/// "Label: value" rows (dim label, plain value). Used by both `/status`
+/// and `/config` (no args) so the two commands visibly share one panel
+/// surface rather than being unrelated raw dumps, per the reference's
+/// single Settings dialog on two different default tabs.
+pub fn renderStatusPanel(writer: anytype, title: []const u8, sections: []const StatusSection, use_color: bool) !void {
+    if (use_color) {
+        try writer.print("\n  {s}{s}{s}\n", .{ repl_markdown.ANSI_BRAND_ACCENT_BOLD, title, repl_markdown.ANSI_RESET });
+    } else {
+        try writer.print("\n{s}\n", .{title});
+    }
+    for (sections) |section| {
+        if (section.fields.len == 0) continue;
+        if (use_color) {
+            try writer.print("\n  {s}{s}{s}\n", .{ repl_markdown.ANSI_BRAND_ACCENT_BOLD, section.title, repl_markdown.ANSI_RESET });
+        } else {
+            try writer.print("\n{s}\n", .{section.title});
+        }
+        for (section.fields) |field| {
+            if (use_color) {
+                try writer.print("  {s}{s}:{s} {s}\n", .{ repl_markdown.ANSI_DIM, field.label, repl_markdown.ANSI_RESET, field.value });
+            } else {
+                try writer.print("  {s}: {s}\n", .{ field.label, field.value });
+            }
+        }
+    }
+    try writer.writeByte('\n');
+}
 
 pub fn formatTranscriptDivider(out: []u8, label: []const u8) []const u8 {
     var pos: usize = 0;
@@ -50,6 +118,14 @@ pub fn transcriptAssistantBlockEndMarker() []const u8 {
     return TRANSCRIPT_ASSISTANT_BLOCK_END;
 }
 
+pub fn transcriptUserBlockStartMarker() []const u8 {
+    return TRANSCRIPT_USER_BLOCK_START;
+}
+
+pub fn transcriptUserBlockEndMarker() []const u8 {
+    return TRANSCRIPT_USER_BLOCK_END;
+}
+
 fn parseTranscriptDividerLabel(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, TRANSCRIPT_DIVIDER_PREFIX)) return null;
     if (!std.mem.endsWith(u8, line, TRANSCRIPT_DIVIDER_SUFFIX)) return null;
@@ -65,6 +141,14 @@ fn isTranscriptAssistantBlockStart(line: []const u8) bool {
 
 fn isTranscriptAssistantBlockEnd(line: []const u8) bool {
     return std.mem.eql(u8, line, TRANSCRIPT_ASSISTANT_BLOCK_END);
+}
+
+fn isTranscriptUserBlockStart(line: []const u8) bool {
+    return std.mem.eql(u8, line, TRANSCRIPT_USER_BLOCK_START);
+}
+
+fn isTranscriptUserBlockEnd(line: []const u8) bool {
+    return std.mem.eql(u8, line, TRANSCRIPT_USER_BLOCK_END);
 }
 
 pub fn inputContentRows(input_text: []const u8, cols: usize) usize {
@@ -90,13 +174,24 @@ pub fn inputContentRows(input_text: []const u8, cols: usize) usize {
     return @min(@max(rows, 1), 3); // 1-3 rows
 }
 
+/// commands-16: /focus caps how many transcript rows are visible, so the
+/// bottom-anchored scroll window naturally shows mostly just the latest
+/// exchange (with "... N earlier rows above ..." standing in for the
+/// reference's one-line prior-turns summary) instead of the full
+/// scrollback -- reusing the existing scroll/window machinery rather than
+/// a bespoke turn-boundary content filter.
+const FOCUS_MODE_MAX_WINDOW_ROWS: usize = 12;
+
 pub fn transcriptWindowRows(total_rows: usize, options: anytype) usize {
     const margin = repl_spinner.boundedBottomMarginRows(total_rows, options.bottom_margin_rows);
     const panel_gap = inputPanelGapRows(total_rows);
     const chrome_gaps = bottomChromeGutterRows(total_rows) * 2;
     const reserved = 7 + chrome_gaps + panel_gap + margin + topContextBarRows(options); // input panel + footer + status + gutters + top bar + margin
-    if (total_rows <= reserved) return 1;
-    return total_rows - reserved;
+    const available = if (total_rows <= reserved) 1 else total_rows - reserved;
+    if (@hasField(@TypeOf(options), "focus_mode") and options.focus_mode) {
+        return @min(available, FOCUS_MODE_MAX_WINDOW_ROWS);
+    }
+    return available;
 }
 
 pub fn inputPanelGapRows(total_rows: usize) usize {
@@ -256,6 +351,25 @@ fn isCleanDensity(options: anytype) bool {
     return @hasField(@TypeOf(options), "ui_density") and options.ui_density == .clean;
 }
 
+/// r4-transcript-01/02: gates the reference's plain "> text" / "⏺ text"
+/// transcript rendering against zcode's older bordered "You"/"Assistant"
+/// card look. Mirrors `composerUsesLegacyChrome`'s convention: a missing
+/// field (the many anonymous option literals in this file's older tests)
+/// defaults to legacy=true so those tests keep asserting the pre-existing
+/// output, while the real `Options` struct defaults the field to false
+/// (config `ui_legacy_transcript`, default off) so a fresh session gets
+/// the new look without every caller opting in.
+fn isLegacyTranscript(options: anytype) bool {
+    return !@hasField(@TypeOf(options), "ui_legacy_transcript") or options.ui_legacy_transcript;
+}
+
+/// The assistant card's top/bottom border (and the old always-BOX_V rail)
+/// disappear whenever either the existing "clean" density opted out of
+/// them, or the new (non-legacy) transcript look is active.
+fn suppressAssistantBorder(options: anytype) bool {
+    return isCleanDensity(options) or !isLegacyTranscript(options);
+}
+
 /// Whether to wrap the full-screen redraw in DEC 2026 BSU/ESU. The REPL sets
 /// `enable_synchronized_output` once from `terminal_caps.isSynchronizedOutputSupported`
 /// so this hot render path does not re-read env per frame. Defaults to false
@@ -266,7 +380,23 @@ fn synchronizedOutputEnabled(options: anytype) bool {
 }
 
 fn assistantInnerWidthForOptions(cols: usize, options: anytype) usize {
+    // r4-transcript-02: the new (non-legacy) hanging-indent layout uses a
+    // fixed 2-column left gutter on every row (the "⏺ " bullet on the
+    // first, a plain 2-space indent on every other), so the wrappable
+    // text width is `cols - 2` regardless of ui_density. Legacy mode
+    // keeps its pre-existing full-width-in-clean-density / cols-2-in-a-
+    // bordered-card split.
+    if (!isLegacyTranscript(options)) return if (cols > 2) cols - 2 else 1;
     return if (isCleanDensity(options)) @max(@as(usize, 1), cols) else assistantCardInnerWidth(cols);
+}
+
+/// r4-transcript-01: matching width helper for the user's own echoed
+/// prompt block. Always `cols - 2` in the new layout (the "> " pointer on
+/// the first row, a plain 2-space indent otherwise) -- there is no legacy
+/// counterpart because `appendInputLine` only ever emits the user-block
+/// markers this width feeds when `!ui_legacy_transcript`.
+fn userInnerWidthForOptions(cols: usize) usize {
+    return if (cols > 2) cols - 2 else 1;
 }
 
 fn assistantVisibleRowsForLine(line: []const u8, cols: usize, decor_state: TranscriptDecorState, options: anytype) usize {
@@ -284,15 +414,21 @@ fn assistantHiddenRowsForLine(line: []const u8, cols: usize, decor_state: Transc
 
 fn visualRowsForTranscriptLineWithState(line: []const u8, cols: usize, decor_state: TranscriptDecorState, options: anytype) usize {
     if (parseTranscriptDividerLabel(line) != null) return 1;
-    if (isTranscriptAssistantBlockStart(line)) return if (isCleanDensity(options)) 0 else 1;
+    const suppress_card = suppressAssistantBorder(options);
+    if (isTranscriptAssistantBlockStart(line)) return if (suppress_card) 0 else 1;
     if (isTranscriptAssistantBlockEnd(line)) {
-        if (isCleanDensity(options)) {
+        if (suppress_card) {
             return if (isBriefMode(options) and decor_state.assistant_brief_hidden_rows > 0) 1 else 0;
         }
         if (isBriefMode(options) and decor_state.assistant_brief_hidden_rows > 0) return 2;
         return 1;
     }
+    // r4-transcript-01: the user-block markers never carry a border in
+    // either mode -- legacy callers simply never emit them (see
+    // appendInputLine), so there is no legacy-preserving branch to guard.
+    if (isTranscriptUserBlockStart(line) or isTranscriptUserBlockEnd(line)) return 0;
     if (decor_state.in_assistant_block) return assistantVisibleRowsForLine(line, cols, decor_state, options);
+    if (decor_state.in_user_block) return wrappedRowsForLine(line, userInnerWidthForOptions(cols));
     return wrappedRowsForLine(line, cols);
 }
 
@@ -305,17 +441,35 @@ fn advanceTranscriptDecorState(line: []const u8, cols: usize, decor_state: *Tran
         decor_state.in_assistant_block = true;
         decor_state.assistant_brief_rows_used = 0;
         decor_state.assistant_brief_hidden_rows = 0;
+        decor_state.assistant_line_index = 0;
         return;
     }
     if (isTranscriptAssistantBlockEnd(line)) {
         decor_state.in_assistant_block = false;
         decor_state.assistant_brief_rows_used = 0;
         decor_state.assistant_brief_hidden_rows = 0;
+        decor_state.assistant_line_index = 0;
         return;
     }
-    if (decor_state.in_assistant_block and isBriefMode(options)) {
-        decor_state.assistant_brief_hidden_rows += assistantHiddenRowsForLine(line, cols, decor_state.*, options);
-        decor_state.assistant_brief_rows_used += assistantVisibleRowsForLine(line, cols, decor_state.*, options);
+    if (isTranscriptUserBlockStart(line)) {
+        decor_state.in_user_block = true;
+        decor_state.user_line_index = 0;
+        return;
+    }
+    if (isTranscriptUserBlockEnd(line)) {
+        decor_state.in_user_block = false;
+        decor_state.user_line_index = 0;
+        return;
+    }
+    if (decor_state.in_assistant_block) {
+        if (isBriefMode(options)) {
+            decor_state.assistant_brief_hidden_rows += assistantHiddenRowsForLine(line, cols, decor_state.*, options);
+            decor_state.assistant_brief_rows_used += assistantVisibleRowsForLine(line, cols, decor_state.*, options);
+        }
+        decor_state.assistant_line_index += 1;
+    }
+    if (decor_state.in_user_block) {
+        decor_state.user_line_index += 1;
     }
 }
 
@@ -431,17 +585,33 @@ fn renderAssistantWrappedLineRows(
     kind: repl_markdown.LineRenderKind,
     state: *repl_markdown.MarkdownRenderState,
     options: anytype,
+    is_first_line: bool,
 ) !void {
     const use_color = repl_markdown.shouldUseColor(options);
     const width = assistantInnerWidthForOptions(cols, options);
     if (row_from >= row_to) return;
+    const hanging_indent = !isLegacyTranscript(options);
 
     var row_idx = row_from;
     while (row_idx < row_to) : (row_idx += 1) {
         // Codepoint-safe slice (see renderWrappedLineRows above).
         const chunk = utf8RowSlice(line, row_idx, width);
 
-        if (!isCleanDensity(options)) {
+        if (hanging_indent) {
+            // r4-transcript-02: AssistantTextMessage.tsx's layout -- a
+            // 2-column gutter holding the "⏺ " bullet only on the very
+            // first visible row of the whole block, a plain indent on
+            // every other row (wrapped continuations and later lines
+            // alike) so the markdown body reads as one hanging paragraph.
+            if (is_first_line and row_idx == 0) {
+                if (use_color) try writer.writeAll(repl_markdown.promptAnsi(options));
+                try writer.writeAll(figures.toolCallGlyph());
+                if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
+                try writer.writeByte(' ');
+            } else {
+                try writer.writeAll("  ");
+            }
+        } else if (!isCleanDensity(options)) {
             if (use_color) try writer.writeAll(repl_markdown.ANSI_DIM);
             try writer.writeAll(repl_markdown.BOX_V);
             if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
@@ -465,8 +635,50 @@ fn renderAssistantWrappedLineRows(
     }
 }
 
+/// r4-transcript-01: the user-turn counterpart of
+/// `renderAssistantWrappedLineRows` -- UserPromptMessage.tsx's "{pointer}
+/// {text}" line, with the same 2-column hanging-indent gutter (pointer on
+/// the very first row, a plain indent on every wrapped/continuation row).
+/// Deliberately bypasses `repl_markdown.writeStyledLine`'s markdown
+/// parsing: the raw echoed prompt is not markdown, and running it through
+/// the parser is what made a prompt starting with "> " misrender as a
+/// blockquote in the old renderer (the exact bug this gap replaces).
+fn renderUserWrappedLineRows(
+    writer: anytype,
+    line: []const u8,
+    cols: usize,
+    row_from: usize,
+    row_to: usize,
+    options: anytype,
+    is_first_line: bool,
+) !void {
+    if (row_from >= row_to) return;
+    const use_color = repl_markdown.shouldUseColor(options);
+    const width = userInnerWidthForOptions(cols);
+    const prompt_label: []const u8 = if (@hasField(@TypeOf(options), "prompt_label")) options.prompt_label else ">";
+
+    var row_idx = row_from;
+    while (row_idx < row_to) : (row_idx += 1) {
+        const chunk = utf8RowSlice(line, row_idx, width);
+
+        if (is_first_line and row_idx == 0) {
+            if (use_color) try writer.writeAll(repl_markdown.ANSI_DIM);
+            try writer.writeAll(prompt_label);
+            if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
+            try writer.writeByte(' ');
+        } else {
+            try writer.writeAll("  ");
+        }
+
+        var clean_buf: [8 * 1024]u8 = undefined;
+        const clean = repl_markdown.stripAnsiInto(&clean_buf, chunk);
+        try writer.writeAll(clean);
+        try writer.writeByte('\n');
+    }
+}
+
 fn writeAssistantCardBorder(writer: anytype, cols: usize, top: bool, options: anytype) !void {
-    if (isCleanDensity(options)) return;
+    if (suppressAssistantBorder(options)) return;
     const use_color = repl_markdown.shouldUseColor(options);
     if (cols <= 1) {
         if (use_color) try writer.writeAll(repl_markdown.ANSI_DIM);
@@ -489,7 +701,7 @@ fn writeAssistantBriefNotice(writer: anytype, cols: usize, hidden_rows: usize, o
     const use_color = repl_markdown.shouldUseColor(options);
     const width = assistantInnerWidthForOptions(cols, options);
 
-    if (!isCleanDensity(options)) {
+    if (!suppressAssistantBorder(options)) {
         if (use_color) try writer.writeAll(repl_markdown.ANSI_DIM);
         try writer.writeAll(repl_markdown.BOX_V);
         if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
@@ -517,14 +729,14 @@ fn renderAssistantEndRows(writer: anytype, cols: usize, row_from: usize, row_to:
             try writeAssistantBriefNotice(writer, cols, decor_state.assistant_brief_hidden_rows, options);
             try writer.writeByte('\n');
         }
-        if (!isCleanDensity(options) and row_to > 1) {
+        if (!suppressAssistantBorder(options) and row_to > 1) {
             try writeAssistantCardBorder(writer, cols, false, options);
             try writer.writeByte('\n');
         }
         return;
     }
 
-    if (isCleanDensity(options)) return;
+    if (suppressAssistantBorder(options)) return;
     try writeAssistantCardBorder(writer, cols, false, options);
     try writer.writeByte('\n');
 }
@@ -628,6 +840,9 @@ fn renderFullScreenInternal(
             const divider_label = parseTranscriptDividerLabel(line);
             const assistant_start = isTranscriptAssistantBlockStart(line);
             const assistant_end = isTranscriptAssistantBlockEnd(line);
+            const user_start = isTranscriptUserBlockStart(line);
+            const user_end = isTranscriptUserBlockEnd(line);
+            const is_structural = divider_label != null or assistant_start or assistant_end or user_start or user_end;
             const line_rows = visualRowsForTranscriptLineWithState(line, cols, decor_state, options);
             const line_start = row_cursor;
             const line_end = row_cursor + line_rows;
@@ -639,7 +854,13 @@ fn renderFullScreenInternal(
             const block_end = line_end + spacing_rows;
 
             if (block_end <= start_row) {
-                if (divider_label == null and !assistant_start and !assistant_end) {
+                // r4-transcript-01: also skip markdown-state tracking for
+                // the raw user-block content itself (not just its
+                // start/end markers) -- `renderUserWrappedLineRows` never
+                // parses it as markdown, so nothing should update
+                // `md_state` on its account either, matching how the
+                // structural marker lines are already excluded below.
+                if (!is_structural and !decor_state.in_user_block) {
                     repl_markdown.advanceMarkdownStateForLine(line, &md_state);
                 }
                 decor_state = next_decor_state;
@@ -663,17 +884,23 @@ fn renderFullScreenInternal(
                     }
                 } else if (assistant_end) {
                     try renderAssistantEndRows(writer, cols, row_from, row_to, decor_state, options);
+                } else if (user_start or user_end) {
+                    // r4-transcript-01: never a border in either mode
+                    // (see visualRowsForTranscriptLineWithState) -- these
+                    // markers only exist to flip in_user_block.
+                } else if (decor_state.in_user_block) {
+                    try renderUserWrappedLineRows(writer, line, cols, row_from, row_to, options, decor_state.user_line_index == 0);
                 } else {
                     const render_kind = repl_markdown.classifyLineRenderKind(line, &md_state);
                     if (decor_state.in_assistant_block) {
-                        try renderAssistantWrappedLineRows(writer, line, cols, row_from, row_to, render_kind, &md_state, options);
+                        try renderAssistantWrappedLineRows(writer, line, cols, row_from, row_to, render_kind, &md_state, options, decor_state.assistant_line_index == 0);
                     } else {
                         try renderWrappedLineRows(writer, line, cols, row_from, row_to, render_kind, &md_state, options);
                     }
                 }
             }
 
-            if (divider_label == null and !assistant_start and !assistant_end) {
+            if (!is_structural and !decor_state.in_user_block) {
                 repl_markdown.advanceMarkdownStateForLine(line, &md_state);
             }
             decor_state = next_decor_state;
@@ -739,7 +966,7 @@ fn renderFullScreenInternal(
 
     if (show_prompt) {
         // Place cursor at the input_cursor position within the rendered input
-        const cursor_pos = computeMultilineCursorPosition(options.prompt_label, actual_input, input_cursor, cols, input_rows);
+        const cursor_pos = computeMultilineCursorPosition(options.prompt_label, actual_input, input_cursor, cols, input_rows, composerUsesLegacyChrome(options));
         const target_row = input_first_row + cursor_pos.row;
         try writer.print("\x1b[{d};{d}H", .{ target_row, cursor_pos.col });
     }
@@ -870,13 +1097,187 @@ fn renderDraftMeter(writer: anytype, used_cols: *usize, cols: usize, input_text:
     try writeBestFooterSegment(writer, used_cols, cols, &candidates, .dim, options);
 }
 
+/// repl-ux-01: the reference `getNextPermissionMode` footer chip table
+/// (cc_strings.txt `var W=[{label:"default",...},{label:"accept edits
+/// on",symbol:xke,color:"autoAccept"},{label:"plan mode
+/// on",symbol:dkt,color:"planMode"},{label:"auto mode
+/// on",symbol:xke,color:"warning"}]` where `dkt="⏸"` and
+/// `xke="⏵⏵"`). `.default` and `.dontAsk` render no chip at all,
+/// matching the reference (dontAsk never appears in the Shift+Tab cycle).
+fn permissionModeChipText(buf: []u8, live_mode: permission_decision.Mode) []const u8 {
+    return switch (live_mode) {
+        .default, .dontAsk => "",
+        .acceptEdits => std.fmt.bufPrint(buf, "\xe2\x8f\xb5\xe2\x8f\xb5 accept edits on", .{}) catch "accept edits on",
+        .plan => std.fmt.bufPrint(buf, "\xe2\x8f\xb8 plan mode on", .{}) catch "plan mode on",
+        .bypassPermissions => std.fmt.bufPrint(buf, "\xe2\x8f\xb5\xe2\x8f\xb5 auto mode on", .{}) catch "auto mode on",
+        // hooks-permissions-05: the reference's sixth mode, distinct from the
+        // `bypassPermissions` chip above (whose text predates `.auto` and
+        // reuses "auto mode on" for an unrelated concept). Reference
+        // mode-metadata: `auto:{indicator:"auto mode",color:"warning"}` --
+        // used verbatim (no "on" suffix) so the two chips never read as the
+        // same mode.
+        .auto => std.fmt.bufPrint(buf, "\xe2\x8f\xb5\xe2\x8f\xb5 auto mode", .{}) catch "auto mode",
+    };
+}
+
+fn permissionModeChipTone(live_mode: permission_decision.Mode) FooterSegmentTone {
+    return switch (live_mode) {
+        .default, .dontAsk => .plain,
+        .acceptEdits => .accent,
+        .plan => .dim,
+        .bypassPermissions => .danger,
+        // hooks-permissions-05: reference color "warning" -- `.danger` is the
+        // closest existing footer tone (also used for bypassPermissions' own
+        // warning-colored chip).
+        .auto => .danger,
+    };
+}
+
+fn renderPermissionModeChip(writer: anytype, used_cols: *usize, cols: usize, options: anytype) !void {
+    if (!@hasField(@TypeOf(options), "live_permission_mode")) return;
+    var chip_buf: [48]u8 = undefined;
+    const chip = permissionModeChipText(&chip_buf, options.live_permission_mode);
+    if (chip.len == 0) return;
+    _ = try writeFooterSegment(writer, used_cols, cols, chip, permissionModeChipTone(options.live_permission_mode), options);
+}
+
+/// repl-ux-missed-128 / repl-ux-missed-130: once context usage crosses
+/// this percent-used threshold, show the proactive footer warning below
+/// -- well before compaction is actually forced, mirroring the
+/// reference's live, escalating notice (as opposed to zcode's prior
+/// only-after-the-fact compact-boundary marker in the transcript).
+const CONTEXT_LOW_WARNING_USED_PCT: usize = 90;
+
+/// Compute the reference's "Context low (N% remaining) \xc2\xb7 Run
+/// /compact to compact & continue" line (cc_strings.txt: `` `Context low
+/// (${pctLeft}% remaining) \xB7 ${...}` ``, "Run /compact to compact &
+/// continue"), or its off-variant "Context low (N% remaining) \xc2\xb7
+/// auto-compact is off \xc2\xb7 /config to turn it on" when
+/// `options.autocompact_enabled` is present and false -- the reference
+/// does not suggest a command that will not self-trigger. Reuses the
+/// same percent-used inputs `buildTokenStatusVariants` already computes
+/// from the status-metrics provider and the model's context window -- no
+/// new plumbing needed. Returns "" when there is no metrics provider, no
+/// usage data yet, or usage is still comfortably below the threshold.
+/// A caller that does not carry `autocompact_enabled` at all (existing
+/// call sites/tests) gets the normal "/compact" variant, matching prior
+/// behavior exactly.
+fn computeContextLowWarning(buf: []u8, options: anytype) []const u8 {
+    if (!@hasField(@TypeOf(options), "status_metrics_provider")) return "";
+    const provider = options.status_metrics_provider orelse return "";
+    const metrics = provider.get(provider.ctx);
+
+    const ctx_base = if (metrics.last_budget_input > 0)
+        metrics.last_budget_input
+    else if (options.status_model_context_window > 0)
+        options.status_model_context_window
+    else
+        0;
+    if (ctx_base == 0 or metrics.last_prompt_tokens == 0) return "";
+
+    const used_pct = @min(@as(usize, 100), (metrics.last_prompt_tokens * 100) / ctx_base);
+    if (used_pct < CONTEXT_LOW_WARNING_USED_PCT) return "";
+
+    const percent_left = 100 -| used_pct;
+    const autocompact_enabled = if (@hasField(@TypeOf(options), "autocompact_enabled")) options.autocompact_enabled else true;
+    if (!autocompact_enabled) {
+        return std.fmt.bufPrint(
+            buf,
+            "Context low ({d}% remaining) \xc2\xb7 auto-compact is off \xc2\xb7 /config to turn it on",
+            .{percent_left},
+        ) catch "";
+    }
+    return std.fmt.bufPrint(buf, "Context low ({d}% remaining) \xc2\xb7 Run /compact to compact & continue", .{percent_left}) catch "";
+}
+
+fn renderContextLowWarning(writer: anytype, used_cols: *usize, cols: usize, options: anytype) !void {
+    var warning_buf: [96]u8 = undefined;
+    const warning = computeContextLowWarning(&warning_buf, options);
+    if (warning.len == 0) return;
+    _ = try writeFooterSegment(writer, used_cols, cols, warning, .danger, options);
+}
+
+/// r3-chrome-04: the reference default footer (edualc
+/// PromptInputFooterLeftSide.tsx:411, "? for shortcuts" -- hidden only
+/// when a custom `statusLine` command is configured (config-layout-16:
+/// `options.status_line_text`, refreshed by the REPL's own footer-state
+/// tick from a spawned `statusLine.command` in settings.json)) paired with
+/// the persistent permission-mode chip from PromptInputFooter,
+/// right-aligned on the same row. The context-low warning and the
+/// queued-message notice keep the same priority they had in the legacy
+/// multi-segment footer: both are more urgent than either the configured
+/// statusLine text or the static "? for shortcuts" hint, so they replace
+/// it on the left when present.
+fn renderDefaultFooterLine(writer: anytype, options: anytype, cols: usize) !void {
+    if (cols == 0) return;
+
+    var warning_buf: [96]u8 = undefined;
+    const warning = computeContextLowWarning(&warning_buf, options);
+    const left_text: []const u8 = if (warning.len > 0)
+        warning
+    else if (@hasField(@TypeOf(options), "queued_prompt_notice") and options.queued_prompt_notice.len > 0)
+        options.queued_prompt_notice
+    else if (@hasField(@TypeOf(options), "status_line_text") and options.status_line_text.len > 0)
+        options.status_line_text
+    else
+        "? for shortcuts";
+    const left_tone: FooterSegmentTone = if (warning.len > 0) .danger else .dim;
+
+    var chip_buf: [48]u8 = undefined;
+    const chip = if (@hasField(@TypeOf(options), "live_permission_mode"))
+        permissionModeChipText(&chip_buf, options.live_permission_mode)
+    else
+        "";
+    const chip_tone: FooterSegmentTone = if (@hasField(@TypeOf(options), "live_permission_mode"))
+        permissionModeChipTone(options.live_permission_mode)
+    else
+        .plain;
+
+    // Reserve room for the chip (plus one gap column) before deciding how
+    // much of the left text fits, so a long context-low warning never
+    // shoves the mode chip off the edge of a narrow terminal.
+    const reserved = if (chip.len > 0 and chip.len + 1 < cols) chip.len + 1 else 0;
+    const left_budget = if (cols > reserved) cols - reserved else 0;
+    const left_shown_len = @min(left_text.len, left_budget);
+    const left_shown = left_text[0..left_shown_len];
+
+    var used_cols: usize = 0;
+    if (left_shown.len > 0) {
+        _ = try writeFooterSegment(writer, &used_cols, cols, left_shown, left_tone, options);
+    }
+
+    if (chip.len > 0) {
+        const pad: usize = if (cols > used_cols + chip.len)
+            cols - used_cols - chip.len
+        else if (used_cols < cols)
+            @as(usize, 1)
+        else
+            @as(usize, 0);
+        var i: usize = 0;
+        while (i < pad) : (i += 1) try writer.writeByte(' ');
+        var chip_used: usize = 0;
+        _ = try writeFooterSegment(writer, &chip_used, chip.len, chip, chip_tone, options);
+    }
+}
+
 fn renderPromptFooter(writer: anytype, options: anytype, mode: anytype, cols: usize, input_text: []const u8) !void {
     if (cols == 0) return;
+
+    // r3-chrome-04: the reference's single-line default footer replaces
+    // this whole multi-segment "actions" bar (and renderStatusLine's
+    // "ready" row below it). `legacy_footer` is a new field on the real
+    // Options struct (default false); anonymous option literals from
+    // older tests that don't declare it fall through to the untouched
+    // legacy path below via `!@hasField`.
+    if (@hasField(@TypeOf(options), "legacy_footer") and !options.legacy_footer) {
+        return renderDefaultFooterLine(writer, options, cols);
+    }
 
     var used_cols: usize = 0;
 
     _ = mode;
     _ = try writeFooterSegment(writer, &used_cols, cols, "actions", .accent, options);
+    try renderPermissionModeChip(writer, &used_cols, cols, options);
 
     if (@hasField(@TypeOf(options), "input_mode_label")) {
         if (options.input_mode_label.len > 0) {
@@ -912,6 +1313,8 @@ fn renderPromptFooter(writer: anytype, options: anytype, mode: anytype, cols: us
             _ = try writeFooterSegment(writer, &used_cols, cols, safety_single, safety_tone, options);
         }
     }
+
+    try renderContextLowWarning(writer, &used_cols, cols, options);
 
     if (@hasField(@TypeOf(options), "footer_tmux_state")) {
         if (options.footer_tmux_state.len > 0) {
@@ -1345,7 +1748,7 @@ const CursorPos = struct {
     col: usize,
 };
 
-fn computeMultilineCursorPosition(prompt_label: []const u8, input_text: []const u8, cursor_byte: usize, cols: usize, num_rows: usize) CursorPos {
+fn computeMultilineCursorPosition(prompt_label: []const u8, input_text: []const u8, cursor_byte: usize, cols: usize, num_rows: usize, legacy_chrome: bool) CursorPos {
     if (cols <= 4) return .{ .row = 0, .col = 1 };
     const content_max = cols - 4;
     var content_buf: [16 * 1024]u8 = undefined;
@@ -1389,7 +1792,13 @@ fn computeMultilineCursorPosition(prompt_label: []const u8, input_text: []const 
     }
     const skip = if (total_rows > num_rows) total_rows - num_rows else 0;
     const visible_row = if (row >= skip) row - skip else 0;
-    return .{ .row = visible_row, .col = 3 + col };
+    // r4-prompt-01: the legacy composer reserves 2 leading columns for
+    // "│ " before the content starts (1-indexed column 3); the reference
+    // layout has no left border, just the unconditional pad space
+    // renderMultiLineInput still writes before the content, so the
+    // content starts at column 1.
+    const col_offset: usize = if (legacy_chrome) 3 else 1;
+    return .{ .row = visible_row, .col = col_offset + col };
 }
 
 fn renderTopContextBar(writer: anytype, options: anytype, mode: anytype, cols: usize) !void {
@@ -1478,6 +1887,13 @@ fn renderTopContextBar(writer: anytype, options: anytype, mode: anytype, cols: u
 }
 
 pub fn renderStatusLine(writer: anytype, options: anytype, mode: anytype, offset: usize, max_off: usize, hint: []const u8, cols: usize) !void {
+    // r3-chrome-04: this whole "\xe2\x97\x8f ready \xe2\x88\x99 zcode vX
+    // \xe2\x88\x99 \xe2\x96\xb6 execution \xe2\x88\x99 cwd \xe2\x88\x99 model"
+    // row is legacy chrome -- the reference has no second footer row, only
+    // renderPromptFooter's single "? for shortcuts" + mode-chip line above.
+    // See that function's matching guard for the new default.
+    if (@hasField(@TypeOf(options), "legacy_footer") and !options.legacy_footer) return;
+
     const use_color = repl_markdown.shouldUseColor(options);
     const ident_result = if (options.status_identity_provider) |provider|
         provider.get(provider.ctx)
@@ -1650,14 +2066,26 @@ pub fn renderStatusLine(writer: anytype, options: anytype, mode: anytype, offset
 }
 
 fn writeTranscriptDivider(writer: anytype, label: []const u8, cols: usize, options: anytype) !void {
+    const is_you = repl_markdown.containsIgnoreCase(label, "You");
+    const is_assistant = repl_markdown.containsIgnoreCase(label, "Assistant");
+
+    // r4-transcript-01/02: the reference has no divider/label row at all
+    // for the user's or the assistant's turn -- UserPromptMessage.tsx
+    // renders one "{pointer} {text}" line and AssistantTextMessage.tsx a
+    // "{bullet} {markdown}" line, neither with a role-name heading. This
+    // row still occupies its one visual row (see
+    // visualRowsForTranscriptLineWithState), which becomes the
+    // reference's `marginTop 1` blank line ahead of the turn.
+    if (!isLegacyTranscript(options) and (is_you or is_assistant)) return;
+
     const use_color = repl_markdown.shouldUseColor(options);
     const tone = dividerToneFromLabel(label);
 
     // Role-specific icons: keep the transcript scannable without
     // repeating the role name in noisy chrome.
-    const role_icon = if (repl_markdown.containsIgnoreCase(label, "You"))
+    const role_icon = if (is_you)
         "\xe2\x9d\xaf " // ❯
-    else if (repl_markdown.containsIgnoreCase(label, "Assistant"))
+    else if (is_assistant)
         figures.BLACK_DIAMOND ++ " "
     else
         "";
@@ -1797,6 +2225,46 @@ fn clipEndInto(out: []u8, text: []const u8, max_len: usize) []const u8 {
     @memcpy(out[0..keep], text[0..keep]);
     @memcpy(out[keep .. keep + 3], "...");
     return out[0..safe_max];
+}
+
+/// r3-chrome-01: the three text lines shown beside `figures.CONDENSED_LOGO_ROWS`
+/// in the 2.1.261-style condensed startup banner -- "<product> v<version>",
+/// "<model> \xc2\xb7 <provider>", and the cwd. Ported from edualc's
+/// CondensedLogo.tsx + logoV2Utils.formatModelAndBilling: `cols` bounds the
+/// available text width the same way the reference derives `textWidth` as
+/// `max(columns - 15, 20)` (15 cells reserved for the glyph column + gap),
+/// and the model/provider pairing degrades to a single truncated string
+/// instead of the reference's two-line split when it doesn't fit (zcode's
+/// banner is a fixed three-row layout; see the r3a-repl-chrome package notes
+/// for the rationale). Reuses the existing `format.truncatePathMiddle` for
+/// the cwd line so long paths keep their leading and trailing segments
+/// rather than losing the project directory name to a plain end-clip.
+///
+/// Caller owns the three returned slices (free each with `allocator.free`).
+pub fn buildCondensedHeaderLines(
+    allocator: std.mem.Allocator,
+    app_version: []const u8,
+    model: []const u8,
+    provider: []const u8,
+    cwd: []const u8,
+    cols: usize,
+) ![3][]u8 {
+    const text_width: usize = if (cols > 15) cols - 15 else 20;
+
+    var version_raw_buf: [96]u8 = undefined;
+    const version_raw = std.fmt.bufPrint(&version_raw_buf, "zcode v{s}", .{app_version}) catch "zcode";
+    var version_clip_buf: [96]u8 = undefined;
+    const line0 = try allocator.dupe(u8, clipEndInto(&version_clip_buf, version_raw, @max(text_width, 6)));
+
+    var combined_buf: [192]u8 = undefined;
+    const combined = std.fmt.bufPrint(&combined_buf, "{s} \xc2\xb7 {s}", .{ model, provider }) catch model;
+    var combined_clip_buf: [192]u8 = undefined;
+    const line1 = try allocator.dupe(u8, clipEndInto(&combined_clip_buf, combined, @max(text_width, 10)));
+
+    var cwd_buf: [768]u8 = undefined;
+    const line2 = try allocator.dupe(u8, format_mod.truncatePathMiddle(&cwd_buf, cwd, @max(text_width, 10)));
+
+    return .{ line0, line1, line2 };
 }
 
 fn buildTokenStatusVariants(options: anytype, wide_out: []u8, compact_out: []u8, minimal_out: []u8) TokenStatusVariants {
@@ -2015,16 +2483,52 @@ pub fn renderHorizontalBorder(writer: anytype, cols: usize) !void {
     try writer.writeAll(repl_markdown.ANSI_RESET);
 }
 
+// r3-chrome-03: the reference's PromptInput border (edualc
+// PromptInput.tsx:2291, `borderStyle="round" borderLeft={false}
+// borderRight={false} borderBottom`) carries no title, no keyboard hints,
+// and no left/right border glyphs -- it is a plain top rule, the "> "
+// prompt content with no vertical bars around it, and a plain bottom rule.
+// The mode/permission indicator and hint text live in the footer row below
+// instead (renderPromptFooter). `legacy_footer` (default false on the real
+// Options struct; absent -- and therefore also legacy -- on the many
+// anonymous option literals throughout this file's older tests) opts back
+// into zcode's previous embedded-label, left/right-bordered composer for
+// anyone who preferred that density. Shared by renderComposerBorder (the
+// top/bottom rule) and renderMultiLineInput (the content rows) so both
+// halves of the composer box switch together.
+fn composerUsesLegacyChrome(options: anytype) bool {
+    return !@hasField(@TypeOf(options), "legacy_footer") or options.legacy_footer;
+}
+
 fn renderComposerBorder(writer: anytype, cols: usize, top: bool, mode: anytype, options: anytype) !void {
     if (cols == 0) return;
     if (cols < 4) return renderHorizontalBorder(writer, cols);
 
     const use_color = repl_markdown.shouldUseColor(options);
+    const use_legacy_labels = composerUsesLegacyChrome(options);
+
+    // r4-prompt-01: the reference's PromptInput draws `borderStyle="round"
+    // borderLeft={false} borderRight={false}` -- a full-width "─" rule
+    // with no corner glyphs, since there is no left/right edge left to
+    // connect them to. zcode's default (non-legacy) composer used to keep
+    // the rounded BOX_TL/BOX_TR corners at both ends even after dropping
+    // the embedded title/hint text, which still read as "a box" instead
+    // of "two plain rules". Render a bare BOX_H run instead.
+    if (!use_legacy_labels) {
+        if (use_color) try writer.writeAll(if (top) repl_markdown.promptAnsi(options) else repl_markdown.ANSI_DIM);
+        var plain_i: usize = 0;
+        while (plain_i < cols) : (plain_i += 1) try writer.writeAll(repl_markdown.BOX_H);
+        if (use_color) try writer.writeAll(repl_markdown.ANSI_RESET);
+        return;
+    }
+
     const left = if (top) repl_markdown.BOX_TL else repl_markdown.BOX_BL;
     const right = if (top) repl_markdown.BOX_TR else repl_markdown.BOX_BR;
 
     var label_buf: [160]u8 = undefined;
     const mode_word = shortModeLabel(mode);
+    // use_legacy_labels is always true past this point (see the early
+    // return above), so the label is always the legacy title/hint text.
     const label = if (top)
         std.fmt.bufPrint(&label_buf, " ask zcode  {s} ", .{mode_word}) catch " ask zcode "
     else if (@hasField(@TypeOf(options), "ui_leader_key"))
@@ -2032,7 +2536,7 @@ fn renderComposerBorder(writer: anytype, cols: usize, top: bool, mode: anytype, 
     else
         " Enter submit  Shift+Enter newline  ? shortcuts ";
 
-    const show_label = cols > label.len + 4;
+    const show_label = label.len > 0 and cols > label.len + 4;
     const label_cols = if (show_label) label.len else 0;
     const fill_cols = cols - 2 - label_cols;
     const label_pad: usize = @min(@as(usize, 2), fill_cols);
@@ -2202,6 +2706,13 @@ fn renderStyledInputChunk(
 }
 
 fn renderMultiLineInput(writer: anytype, prompt_label: []const u8, input_text: []const u8, cols: usize, first_row: usize, num_rows: usize, show_placeholder: bool, options: anytype) !void {
+    // r3-chrome-03: match renderComposerBorder's default/legacy_footer
+    // switch so the composer's content rows drop the left/right BOX_V
+    // pipes in lockstep with the top/bottom rule dropping its embedded
+    // title and hint text -- otherwise the default composer still reads
+    // as a full rounded box instead of the reference's borderLeft={false}
+    // borderRight={false} plain-rule look.
+    const use_legacy_labels = composerUsesLegacyChrome(options);
     const content_max: usize = if (cols > 4) cols - 4 else 1;
     var content_buf: [16 * 1024]u8 = undefined;
     const content = repl_input.formatInputPreview(prompt_label, input_text, &content_buf);
@@ -2302,10 +2813,12 @@ fn renderMultiLineInput(writer: anytype, prompt_label: []const u8, input_text: [
         "";
     while (row < num_rows) : (row += 1) {
         try writer.print("\x1b[{d};1H\x1b[2K", .{first_row + row});
-        try writer.writeAll(repl_markdown.ANSI_DIM);
-        try writer.writeAll(repl_markdown.BOX_V);
-        try writer.writeAll(repl_markdown.ANSI_RESET);
-        try writer.writeByte(' ');
+        if (use_legacy_labels) {
+            try writer.writeAll(repl_markdown.ANSI_DIM);
+            try writer.writeAll(repl_markdown.BOX_V);
+            try writer.writeAll(repl_markdown.ANSI_RESET);
+            try writer.writeByte(' ');
+        }
 
         if (row < visible_count) {
             const row_info = visual_rows[row];
@@ -2355,9 +2868,11 @@ fn renderMultiLineInput(writer: anytype, prompt_label: []const u8, input_text: [
         }
 
         try writer.writeByte(' ');
-        try writer.writeAll(repl_markdown.ANSI_DIM);
-        try writer.writeAll(repl_markdown.BOX_V);
-        try writer.writeAll(repl_markdown.ANSI_RESET);
+        if (use_legacy_labels) {
+            try writer.writeAll(repl_markdown.ANSI_DIM);
+            try writer.writeAll(repl_markdown.BOX_V);
+            try writer.writeAll(repl_markdown.ANSI_RESET);
+        }
     }
 }
 
@@ -2478,6 +2993,23 @@ test "transcriptWindowRows accounts for bottom margin" {
         .transcript_line_spacing = @as(usize, 1),
     };
     try testing.expectEqual(@as(usize, 18), transcriptWindowRows(30, options));
+}
+
+test "transcriptWindowRows caps the visible window when focus_mode is on" {
+    const options = .{
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .focus_mode = true,
+    };
+    try testing.expectEqual(@as(usize, FOCUS_MODE_MAX_WINDOW_ROWS), transcriptWindowRows(30, options));
+
+    // A terminal already smaller than the cap is unaffected either way.
+    const small_options = .{
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .focus_mode = true,
+    };
+    try testing.expectEqual(transcriptWindowRows(14, .{ .bottom_margin_rows = @as(usize, 2), .transcript_line_spacing = @as(usize, 1) }), transcriptWindowRows(14, small_options));
 }
 
 test "transcriptVisualRows applies configured line spacing" {
@@ -3307,6 +3839,187 @@ test "renderPromptFooter shows compact shortcuts in the redesigned footer" {
     try testing.expect(std.mem.indexOf(u8, buf.items(), "? shortcuts") == null);
 }
 
+const TestFooterOptions = struct {
+    yolo_mode: bool,
+    status_approval_mode: []const u8,
+    status_sandbox: []const u8,
+    status_show_safety: bool,
+    status_show_workspace: bool,
+    status_show_model: bool,
+    status_show_tokens: bool,
+    status_show_hint: bool,
+    color_enabled: bool,
+    enable_thinking_summary: bool,
+    live_permission_mode: permission_decision.Mode,
+};
+
+fn testFooterOptionsWithMode(live_mode: permission_decision.Mode) TestFooterOptions {
+    return .{
+        .yolo_mode = false,
+        .status_approval_mode = @as([]const u8, "acceptEdits"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_safety = false,
+        .status_show_workspace = false,
+        .status_show_model = false,
+        .status_show_tokens = false,
+        .status_show_hint = false,
+        .color_enabled = false,
+        .enable_thinking_summary = false,
+        .live_permission_mode = live_mode,
+    };
+}
+
+test "renderPromptFooter shows a persistent permission-mode chip for reference modes and stays silent on default" {
+    const TestMode = enum { execution, planning, brainstorm, review };
+
+    {
+        var buf = std_io.StringBuilder.init(testing.allocator);
+        defer buf.deinit();
+        try renderPromptFooter(buf.writer(), testFooterOptionsWithMode(.acceptEdits), TestMode.execution, 160, "");
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "accept edits on") != null);
+    }
+    {
+        var buf = std_io.StringBuilder.init(testing.allocator);
+        defer buf.deinit();
+        try renderPromptFooter(buf.writer(), testFooterOptionsWithMode(.plan), TestMode.execution, 160, "");
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "plan mode on") != null);
+    }
+    {
+        var buf = std_io.StringBuilder.init(testing.allocator);
+        defer buf.deinit();
+        try renderPromptFooter(buf.writer(), testFooterOptionsWithMode(.bypassPermissions), TestMode.execution, 160, "");
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "auto mode on") != null);
+    }
+    {
+        var buf = std_io.StringBuilder.init(testing.allocator);
+        defer buf.deinit();
+        try renderPromptFooter(buf.writer(), testFooterOptionsWithMode(.default), TestMode.execution, 160, "");
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "accept edits on") == null);
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "plan mode on") == null);
+        try testing.expect(std.mem.indexOf(u8, buf.items(), "auto mode on") == null);
+    }
+}
+
+test "renderStatusPanel renders Title-Case section headers and Label: value rows, not snake_case keys" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const version_fields = [_]StatusField{
+        .{ .label = "Version", .value = "0.12.50" },
+    };
+    const provider_fields = [_]StatusField{
+        .{ .label = "Provider", .value = "anthropic" },
+        .{ .label = "Model", .value = "claude-sonnet-5" },
+    };
+    const sections = [_]StatusSection{
+        .{ .title = "Version", .fields = version_fields[0..] },
+        .{ .title = "Provider", .fields = provider_fields[0..] },
+    };
+    try renderStatusPanel(buf.writer(), "zcode status", sections[0..], false);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "Version") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Provider: anthropic") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Model: claude-sonnet-5") != null);
+    // No leftover snake_case dump style.
+    try testing.expect(std.mem.indexOf(u8, out, "provider=") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "version=") == null);
+}
+
+test "renderStatusPanel skips empty sections" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+    const empty_fields = [_]StatusField{};
+    const filled_fields = [_]StatusField{.{ .label = "Sandbox", .value = "workspace-write" }};
+    const sections = [_]StatusSection{
+        .{ .title = "Empty Section", .fields = empty_fields[0..] },
+        .{ .title = "Safety", .fields = filled_fields[0..] },
+    };
+    try renderStatusPanel(buf.writer(), "zcode status", sections[0..], false);
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "Empty Section") == null);
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "Sandbox: workspace-write") != null);
+}
+
+const TestContextMetrics = struct {
+    last_budget_input: usize = 0,
+    last_prompt_tokens: usize = 0,
+};
+const TestContextMetricsProvider = struct {
+    ctx: ?*anyopaque = null,
+    get: *const fn (ctx: ?*anyopaque) TestContextMetrics,
+};
+
+fn testContextMetricsGet(ctx: ?*anyopaque) TestContextMetrics {
+    const m: *const TestContextMetrics = @ptrCast(@alignCast(ctx.?));
+    return m.*;
+}
+
+test "computeContextLowWarning fires once usage crosses the threshold and reports percent remaining" {
+    var metrics = TestContextMetrics{ .last_budget_input = 100_000, .last_prompt_tokens = 92_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+    };
+    var buf: [80]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.startsWith(u8, warning, "Context low (8% remaining)"));
+    try testing.expect(std.mem.indexOf(u8, warning, "Run /compact to compact & continue") != null);
+}
+
+test "computeContextLowWarning stays silent comfortably below the threshold" {
+    var metrics = TestContextMetrics{ .last_budget_input = 100_000, .last_prompt_tokens = 40_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+    };
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("", computeContextLowWarning(&buf, options));
+}
+
+test "computeContextLowWarning falls back to status_model_context_window when last_budget_input is unset" {
+    var metrics = TestContextMetrics{ .last_budget_input = 0, .last_prompt_tokens = 95_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 100_000),
+    };
+    var buf: [80]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.startsWith(u8, warning, "Context low (5% remaining)"));
+}
+
+// repl-ux-missed-128/130: when auto-compaction is disabled, the reference
+// does not suggest a command that will not self-trigger -- it tells the
+// user auto-compact is off and where to turn it back on.
+test "computeContextLowWarning shows the auto-compact-off variant when autocompact_enabled is false" {
+    var metrics = TestContextMetrics{ .last_budget_input = 100_000, .last_prompt_tokens = 92_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+        .autocompact_enabled = false,
+    };
+    var buf: [96]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.startsWith(u8, warning, "Context low (8% remaining)"));
+    try testing.expect(std.mem.indexOf(u8, warning, "auto-compact is off") != null);
+    try testing.expect(std.mem.indexOf(u8, warning, "/config to turn it on") != null);
+    // Must not ALSO suggest /compact -- that would not self-trigger.
+    try testing.expect(std.mem.indexOf(u8, warning, "Run /compact") == null);
+}
+
+// A caller with no `autocompact_enabled` field at all (every pre-existing
+// call site/test) keeps the original "/compact" wording unchanged.
+test "computeContextLowWarning defaults to the /compact wording when autocompact_enabled is absent" {
+    var metrics = TestContextMetrics{ .last_budget_input = 100_000, .last_prompt_tokens = 92_000 };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+    };
+    var buf: [96]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.indexOf(u8, warning, "Run /compact to compact & continue") != null);
+    try testing.expect(std.mem.indexOf(u8, warning, "auto-compact is off") == null);
+}
+
 test "classifyInputHighlightByte marks slash commands and @references" {
     var preview_buf: [256]u8 = undefined;
     const content = repl_input.formatInputPreview(">", "/model @src/main.zig", &preview_buf);
@@ -3413,6 +4126,338 @@ test "assistant transcript block suppresses inner spacing" {
     try testing.expectEqual(@as(usize, 4), transcriptVisualRows(&transcript, 80, options));
 }
 
+test "buildCondensedHeaderLines formats the product/version, model/provider, and cwd lines" {
+    const lines = try buildCondensedHeaderLines(testing.allocator, "0.12.50", "mock-agent", "mock", "/Users/zero/projects/zcode", 120);
+    defer for (lines) |line| testing.allocator.free(line);
+
+    try testing.expectEqualStrings("zcode v0.12.50", lines[0]);
+    try testing.expectEqualStrings("mock-agent \xc2\xb7 mock", lines[1]);
+    try testing.expectEqualStrings("/Users/zero/projects/zcode", lines[2]);
+}
+
+test "buildCondensedHeaderLines truncates the model/provider line to the available width" {
+    const lines = try buildCondensedHeaderLines(testing.allocator, "0.12.50", "a-very-long-model-identifier-that-does-not-fit", "some-provider", "/tmp", 30);
+    defer for (lines) |line| testing.allocator.free(line);
+
+    // text_width = max(30-15, 20) = 20; the combined "model · provider"
+    // string is far longer than that, so it must have been clipped.
+    try testing.expect(lines[1].len <= 20);
+    try testing.expect(std.mem.endsWith(u8, lines[1], "..."));
+}
+
+test "buildCondensedHeaderLines middle-truncates a long cwd, keeping the leading and trailing segments" {
+    const lines = try buildCondensedHeaderLines(testing.allocator, "0.12.50", "m", "p", "/Users/zero/projects/very/deeply/nested/workspace/zcode", 40);
+    defer for (lines) |line| testing.allocator.free(line);
+
+    try testing.expect(lines[2].len < "/Users/zero/projects/very/deeply/nested/workspace/zcode".len);
+    try testing.expect(std.mem.startsWith(u8, lines[2], "/Users"));
+    try testing.expect(std.mem.endsWith(u8, lines[2], "zcode"));
+}
+
+test "renderComposerBorder (default) draws a plain rule with no title or hint text" {
+    var top_buf = std_io.StringBuilder.init(testing.allocator);
+    defer top_buf.deinit();
+    var bottom_buf = std_io.StringBuilder.init(testing.allocator);
+    defer bottom_buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+        .ui_leader_key = @as([]const u8, "ctrl+x"),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderComposerBorder(top_buf.writer(), 60, true, TestMode.execution, options);
+    try renderComposerBorder(bottom_buf.writer(), 60, false, TestMode.execution, options);
+
+    try testing.expect(std.mem.indexOf(u8, top_buf.items(), "ask zcode") == null);
+    try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), "Enter submit") == null);
+    try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), "? shortcuts") == null);
+}
+
+test "renderComposerBorder (default) draws a full-width rule with no corner glyphs (r4-prompt-01)" {
+    // Reference: PromptInput.tsx borderStyle="round" borderLeft={false}
+    // borderRight={false} -- with both side borders off there is no edge
+    // left to anchor a rounded corner to, so the rule is bare BOX_H run
+    // to run, not BOX_TL/.../BOX_TR.
+    var top_buf = std_io.StringBuilder.init(testing.allocator);
+    defer top_buf.deinit();
+    var bottom_buf = std_io.StringBuilder.init(testing.allocator);
+    defer bottom_buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+        .ui_leader_key = @as([]const u8, "ctrl+x"),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderComposerBorder(top_buf.writer(), 60, true, TestMode.execution, options);
+    try renderComposerBorder(bottom_buf.writer(), 60, false, TestMode.execution, options);
+
+    try testing.expect(std.mem.indexOf(u8, top_buf.items(), repl_markdown.BOX_TL) == null);
+    try testing.expect(std.mem.indexOf(u8, top_buf.items(), repl_markdown.BOX_TR) == null);
+    try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), repl_markdown.BOX_BL) == null);
+    try testing.expect(std.mem.indexOf(u8, bottom_buf.items(), repl_markdown.BOX_BR) == null);
+    try testing.expectEqual(@as(usize, 60), std.mem.count(u8, top_buf.items(), repl_markdown.BOX_H));
+    try testing.expectEqual(@as(usize, 60), std.mem.count(u8, bottom_buf.items(), repl_markdown.BOX_H));
+}
+
+test "renderMultiLineInput (default) omits the left/right BOX_V pipes around the prompt content" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+    };
+    try renderMultiLineInput(buf.writer(), ">", "", 60, 1, 1, true, options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_V) == null);
+    try testing.expect(std.mem.indexOf(u8, out, ">") != null);
+    try testing.expect(std.mem.indexOf(u8, out, PROMPT_PLACEHOLDER) != null);
+}
+
+test "renderMultiLineInput (default) places the prompt at column 1, no leading pad space (r4-prompt-01)" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+    };
+    try renderMultiLineInput(buf.writer(), ">", "hello", 60, 1, 1, false, options);
+
+    const out = buf.items();
+    const marker = "\x1b[2K";
+    const start = (std.mem.indexOf(u8, out, marker) orelse return error.TestUnexpectedResult) + marker.len;
+    // The very next byte after the clear-line escape is the prompt
+    // character itself -- no pad space pushing it to column 2.
+    try testing.expectEqualStrings(">", out[start .. start + 1]);
+}
+
+test "renderMultiLineInput (legacy_footer=true) keeps the left/right BOX_V pipes" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = true,
+        .color_enabled = false,
+    };
+    try renderMultiLineInput(buf.writer(), ">", "", 60, 1, 1, true, options);
+
+    const out = buf.items();
+    const first_pipe = std.mem.indexOf(u8, out, repl_markdown.BOX_V) orelse return error.TestUnexpectedResult;
+    const last_pipe = std.mem.lastIndexOf(u8, out, repl_markdown.BOX_V) orelse return error.TestUnexpectedResult;
+    try testing.expect(first_pipe != last_pipe);
+}
+
+test "renderComposerBorder (legacy_footer=true) keeps the embedded title and hint text" {
+    var top_buf = std_io.StringBuilder.init(testing.allocator);
+    defer top_buf.deinit();
+
+    const options = .{
+        .legacy_footer = true,
+        .color_enabled = false,
+        .ui_leader_key = @as([]const u8, "ctrl+x"),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderComposerBorder(top_buf.writer(), 60, true, TestMode.execution, options);
+
+    try testing.expect(std.mem.indexOf(u8, top_buf.items(), "ask zcode") != null);
+}
+
+test "renderPromptFooter (default) shows only the shortcuts hint, not the legacy actions row" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+        .live_permission_mode = permission_decision.Mode.default,
+        .queued_prompt_notice = @as([]const u8, ""),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderPromptFooter(buf.writer(), options, TestMode.execution, 160, "a draft the user is typing");
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "? for shortcuts") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "actions") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "draft") == null);
+}
+
+test "renderPromptFooter (default) right-aligns the permission-mode chip" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = false,
+        .color_enabled = false,
+        .live_permission_mode = permission_decision.Mode.acceptEdits,
+        .queued_prompt_notice = @as([]const u8, ""),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    const cols: usize = 60;
+    try renderPromptFooter(buf.writer(), options, TestMode.execution, cols, "");
+
+    const out = buf.items();
+    const chip = "\xe2\x8f\xb5\xe2\x8f\xb5 accept edits on";
+    try testing.expect(std.mem.indexOf(u8, out, "? for shortcuts") != null);
+    const chip_at = std.mem.indexOf(u8, out, chip) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(cols, chip_at + chip.len);
+}
+
+test "renderPromptFooter (legacy_footer=true) preserves the old actions row" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = true,
+        .yolo_mode = false,
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_safety = true,
+        .color_enabled = false,
+        .live_permission_mode = permission_decision.Mode.default,
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderPromptFooter(buf.writer(), options, TestMode.execution, 160, "");
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "actions") != null);
+}
+
+test "renderStatusLine is a no-op by default (folded into renderPromptFooter)" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{ .legacy_footer = false };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderStatusLine(buf.writer(), options, TestMode.execution, 0, 0, "", 80);
+    try testing.expectEqual(@as(usize, 0), buf.items().len);
+}
+
+test "renderStatusLine (legacy_footer=true) keeps rendering the old ready/version row" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .legacy_footer = true,
+        .color_enabled = false,
+        .status_provider = @as([]const u8, "mock"),
+        .status_model = @as([]const u8, "mock-agent"),
+        .status_workspace = @as([]const u8, ""),
+        .status_branch = @as([]const u8, ""),
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_workspace = false,
+        .status_show_model = true,
+        .status_show_safety = false,
+        .status_show_tokens = false,
+        .status_show_hint = false,
+        .show_scroll_hint = false,
+        .app_version = @as([]const u8, "test"),
+        .status_identity_provider = null,
+        .status_dynamic_provider = null,
+        .status_circuit_state = @as([]const u8, ""),
+        .status_agent_name = @as([]const u8, ""),
+    };
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderStatusLine(buf.writer(), options, TestMode.execution, 0, 0, "", 120);
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "ready") != null);
+}
+
+test "config-layout-16: a configured statusLine command's output replaces the default '? for shortcuts' hint" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    try renderDefaultFooterLine(buf.writer(), .{
+        .status_line_text = @as([]const u8, "hi"),
+        .color_enabled = false,
+    }, 80);
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "hi") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "? for shortcuts") == null);
+}
+
+test "config-layout-16: '? for shortcuts' still shows when no statusLine is configured" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    try renderDefaultFooterLine(buf.writer(), .{
+        .status_line_text = @as([]const u8, ""),
+        .color_enabled = false,
+    }, 80);
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "? for shortcuts") != null);
+}
+
+test "config-layout-16: the context-low warning still outranks a configured statusLine" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const StatusMetrics = @import("repl.zig").StatusMetrics;
+    const StatusMetricsProvider = @import("repl.zig").StatusMetricsProvider;
+    const Ctx = struct {
+        fn get(_: *anyopaque) StatusMetrics {
+            return .{ .last_prompt_tokens = 95, .last_budget_input = 100 };
+        }
+    };
+    var dummy: u8 = 0;
+    const provider = StatusMetricsProvider{ .ctx = @ptrCast(&dummy), .get = Ctx.get };
+
+    try renderDefaultFooterLine(buf.writer(), .{
+        .status_line_text = @as([]const u8, "hi"),
+        .color_enabled = false,
+        .status_metrics_provider = @as(?StatusMetricsProvider, provider),
+        .status_model_context_window = @as(usize, 0),
+    }, 80);
+
+    try testing.expect(std.mem.indexOf(u8, buf.items(), "Context low") != null);
+}
+
+test "config-layout-16: end to end -- a trusted ~/.zcode/settings.json statusLine command's rendered output reaches the footer" {
+    const rt_test = @import("zcode_runtime");
+    const status_line_mod = @import("../core/status_line.zig");
+    const env_mod = @import("../core/env.zig");
+    const test_helpers = @import("../core/test_helpers.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", cwd);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt_test.io, ".zcode");
+    try tmp.dir.writeFile(rt_test.io, .{
+        .sub_path = ".zcode/settings.json",
+        .data = "{\"statusLine\":{\"type\":\"command\",\"command\":\"echo hi\"}}",
+    });
+
+    var cfg = (try status_line_mod.readConfig(testing.allocator, cwd)).?;
+    defer cfg.deinit(testing.allocator);
+    try testing.expectEqualStrings("echo hi", cfg.command);
+
+    const rendered = try status_line_mod.run(testing.allocator, cfg, cwd, cwd, .{
+        .cwd = cwd,
+        .current_dir = cwd,
+        .project_dir = cwd,
+    }, 5000);
+    defer if (rendered) |r| testing.allocator.free(r);
+    try testing.expect(rendered != null);
+
+    var footer_buf = std_io.StringBuilder.init(testing.allocator);
+    defer footer_buf.deinit();
+    try renderDefaultFooterLine(footer_buf.writer(), .{
+        .status_line_text = rendered.?,
+        .color_enabled = false,
+    }, 80);
+
+    try testing.expect(std.mem.indexOf(u8, footer_buf.items(), "hi") != null);
+}
+
 test "assistant transcript block wraps to inner width" {
     var transcript = UiTranscript.init(testing.allocator, 10);
     defer transcript.deinit(testing.allocator);
@@ -3424,4 +4469,236 @@ test "assistant transcript block wraps to inner width" {
         .transcript_line_spacing = @as(usize, 0),
     };
     try testing.expectEqual(@as(usize, 5), transcriptVisualRows(&transcript, 4, options));
+}
+
+// ── r4-transcript-01/02: reference-style transcript rendering ──
+
+test "renderFullScreen (r4-transcript-01) draws the user turn as one '> text' line, no card" {
+    var transcript = UiTranscript.init(testing.allocator, 100);
+    defer transcript.deinit(testing.allocator);
+
+    var divider_buf: [96]u8 = undefined;
+    try transcript.appendLine(testing.allocator, formatTranscriptDivider(divider_buf[0..], "You"));
+    try transcript.appendLine(testing.allocator, transcriptUserBlockStartMarker());
+    try transcript.appendLine(testing.allocator, "hello");
+    try transcript.appendLine(testing.allocator, transcriptUserBlockEndMarker());
+
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .prompt_label = @as([]const u8, ">"),
+        .app_version = @as([]const u8, "test"),
+        .status_provider = @as([]const u8, "test-provider"),
+        .status_model = @as([]const u8, "test-model"),
+        .status_workspace = @as([]const u8, "/tmp"),
+        .status_branch = @as([]const u8, "main"),
+        .status_model_context_window = @as(usize, 100_000),
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_workspace = true,
+        .status_show_model = true,
+        .status_show_safety = true,
+        .status_show_tokens = false,
+        .status_show_hint = true,
+        .yolo_mode = false,
+        .color_enabled = false,
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+        .enable_fullscreen = true,
+        .enable_alt_screen = false,
+        .enable_spinner = false,
+        .enable_thinking_summary = false,
+        .transcript_max_lines = @as(usize, 20_000),
+        .show_scroll_hint = true,
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .status_metrics_provider = null,
+        .status_identity_provider = null,
+        .initial_prompt = null,
+        .ui_legacy_transcript = false,
+        // Also opt the composer into its own non-legacy look (r4-prompt-01)
+        // so its border doesn't contribute a stray BOX_V/BOX_TL of its own
+        // to the assertions below -- this test is about the transcript,
+        // not the composer.
+        .legacy_footer = false,
+    };
+
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderFullScreen(buf.writer(), &transcript, false, "", 0, "", TestMode.execution, options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "> hello") != null);
+    // No card rail (U+2502/U+2503) and no role-name heading.
+    try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_V) == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\xe2\x94\x83") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "You") == null);
+}
+
+test "renderFullScreen (r4-transcript-01, legacy) keeps the bordered 'You' card" {
+    var transcript = UiTranscript.init(testing.allocator, 100);
+    defer transcript.deinit(testing.allocator);
+
+    var divider_buf: [96]u8 = undefined;
+    try transcript.appendLine(testing.allocator, formatTranscriptDivider(divider_buf[0..], "You"));
+    try transcript.appendLine(testing.allocator, "> hello");
+
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .prompt_label = @as([]const u8, ">"),
+        .app_version = @as([]const u8, "test"),
+        .status_provider = @as([]const u8, "test-provider"),
+        .status_model = @as([]const u8, "test-model"),
+        .status_workspace = @as([]const u8, "/tmp"),
+        .status_branch = @as([]const u8, "main"),
+        .status_model_context_window = @as(usize, 100_000),
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_workspace = true,
+        .status_show_model = true,
+        .status_show_safety = true,
+        .status_show_tokens = false,
+        .status_show_hint = true,
+        .yolo_mode = false,
+        .color_enabled = false,
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+        .enable_fullscreen = true,
+        .enable_alt_screen = false,
+        .enable_spinner = false,
+        .enable_thinking_summary = false,
+        .transcript_max_lines = @as(usize, 20_000),
+        .show_scroll_hint = true,
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .status_metrics_provider = null,
+        .status_identity_provider = null,
+        .initial_prompt = null,
+        .ui_legacy_transcript = true,
+    };
+
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderFullScreen(buf.writer(), &transcript, false, "", 0, "", TestMode.execution, options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "You") != null);
+}
+
+test "renderFullScreen (r4-transcript-02) draws the assistant turn as '<bullet> text', no box" {
+    var transcript = UiTranscript.init(testing.allocator, 100);
+    defer transcript.deinit(testing.allocator);
+
+    var divider_buf: [96]u8 = undefined;
+    try transcript.appendLine(testing.allocator, formatTranscriptDivider(divider_buf[0..], "Assistant"));
+    try transcript.appendLine(testing.allocator, transcriptAssistantBlockStartMarker());
+    try transcript.appendLine(testing.allocator, "Git status collected. No further tools needed.");
+    try transcript.appendLine(testing.allocator, transcriptAssistantBlockEndMarker());
+
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .prompt_label = @as([]const u8, ">"),
+        .app_version = @as([]const u8, "test"),
+        .status_provider = @as([]const u8, "test-provider"),
+        .status_model = @as([]const u8, "test-model"),
+        .status_workspace = @as([]const u8, "/tmp"),
+        .status_branch = @as([]const u8, "main"),
+        .status_model_context_window = @as(usize, 100_000),
+        .status_approval_mode = @as([]const u8, "tiered-auto"),
+        .status_sandbox = @as([]const u8, "workspace-write"),
+        .status_show_workspace = true,
+        .status_show_model = true,
+        .status_show_safety = true,
+        .status_show_tokens = false,
+        .status_show_hint = true,
+        .yolo_mode = false,
+        .color_enabled = false,
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+        .enable_fullscreen = true,
+        .enable_alt_screen = false,
+        .enable_spinner = false,
+        .enable_thinking_summary = false,
+        .transcript_max_lines = @as(usize, 20_000),
+        .show_scroll_hint = true,
+        .bottom_margin_rows = @as(usize, 2),
+        .transcript_line_spacing = @as(usize, 1),
+        .status_metrics_provider = null,
+        .status_identity_provider = null,
+        .initial_prompt = null,
+        .ui_legacy_transcript = false,
+        // See the r4-transcript-01 test above: keep the composer out of
+        // its own legacy look so its border glyphs can't contaminate the
+        // BOX_TL/BOX_BL absence assertions below.
+        .legacy_footer = false,
+    };
+
+    const TestMode = enum { execution, planning, brainstorm, review };
+    try renderFullScreen(buf.writer(), &transcript, false, "", 0, "", TestMode.execution, options);
+
+    const out = buf.items();
+    var expected_buf: [96]u8 = undefined;
+    const expected = std.fmt.bufPrint(&expected_buf, "{s} Git status collected. No further tools needed.", .{figures.toolCallGlyph()}) catch unreachable;
+    try testing.expect(std.mem.indexOf(u8, out, expected) != null);
+    try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_TL) == null);
+    try testing.expect(std.mem.indexOf(u8, out, repl_markdown.BOX_BL) == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Assistant") == null);
+}
+
+test "renderAssistantWrappedLineRows (r4-transcript-02) indents a wrapped continuation by 2 spaces" {
+    var md_state = repl_markdown.MarkdownRenderState{};
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .color_enabled = false,
+        .ui_legacy_transcript = false,
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+    };
+    // cols=9 -> inner width 7 ("cols - 2"): row0 "one two", row1 "three".
+    try renderAssistantWrappedLineRows(buf.writer(), "one two three", 9, 0, 2, .plain, &md_state, options, true);
+
+    const out = buf.items();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    const first = lines.next() orelse return error.TestUnexpectedResult;
+    const second = lines.next() orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, first, figures.toolCallGlyph()));
+    try testing.expect(std.mem.startsWith(u8, second, "  "));
+    try testing.expect(!std.mem.startsWith(u8, second, figures.toolCallGlyph()));
+}
+
+test "renderUserWrappedLineRows (r4-transcript-01) draws the pointer only on the very first row" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = .{
+        .color_enabled = false,
+        .ui_legacy_transcript = false,
+        .prompt_label = @as([]const u8, ">"),
+        .highlight_links = false,
+        .highlight_paths = false,
+        .color_lists = false,
+        .highlight_code_blocks = false,
+    };
+    // cols=9 -> inner width 7: row0 "hello w", row1 "orld".
+    try renderUserWrappedLineRows(buf.writer(), "hello world", 9, 0, 2, options, true);
+
+    const out = buf.items();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    const first = lines.next() orelse return error.TestUnexpectedResult;
+    const second = lines.next() orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("> hello w", first);
+    try testing.expectEqualStrings("  orld", second);
 }

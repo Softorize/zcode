@@ -13,11 +13,17 @@ const settings_sources = @import("settings_sources.zig");
 const session_env = @import("session_env.zig");
 const hook_exec_prompt = @import("hook_exec_prompt.zig");
 const hook_exec_http = @import("hook_exec_http.zig");
+const hook_exec_mcp_tool = @import("hook_exec_mcp_tool.zig");
+const mcp_client = @import("../mcp/client.zig");
 const async_hook_registry = @import("async_hook_registry.zig");
 const hooks_snapshot = @import("hooks_snapshot.zig");
 const session_hooks = @import("session_hooks.zig");
 const hook_events = @import("hook_events.zig");
 const plugin_hooks = @import("plugin_hooks.zig");
+/// cli-flags-14: scoped so `-d, --debug hooks` (or `api,hooks`) can select
+/// hook-execution traces specifically -- see providers/common.zig's `log_api`
+/// for the matching `.api` half of the reference's own example filter.
+const log_hooks = std.log.scoped(.hooks);
 
 /// The live dispatch layer now routes every lifecycle event through the full
 /// reference event set (`hook_event.Event`) rather than the old 3-variant enum.
@@ -45,6 +51,12 @@ pub fn computeTimeoutMs(hook_type: hook_config.HookType, timeout_s: ?u32) u64 {
         .prompt => hook_exec_prompt.PROMPT_TIMEOUT_MS,
         .agent => hook_exec_prompt.AGENT_TIMEOUT_MS,
         .http => hook_exec_http.HTTP_TIMEOUT_MS,
+        // hooks-permissions-missed-163: a script file is a local process, same
+        // default budget as a command.
+        .script => COMMAND_HOOK_TIMEOUT_MS,
+        // hooks-permissions-06: an MCP tool call is a network round-trip to an
+        // already-connected server; matches the http hook default.
+        .mcp_tool => hook_exec_http.HTTP_TIMEOUT_MS,
     };
 }
 
@@ -90,36 +102,132 @@ pub const HookContext = struct {
     // payload as `task_id`/`task_subject`; the matcher tests against the subject.
     task_id: []const u8 = "",
     task_subject: []const u8 = "",
+    // hooks-permissions-10: Notification's required, separate category field
+    // (distinct from `message`, the free-text body). See hook_io.LifecycleFields'
+    // doc comment.
+    notification_type: []const u8 = "",
+    // hooks-permissions-09: the reference's always-present base fields (`Se`
+    // schema: session_id/transcript_path/permission_mode/agent_id/prompt_id on
+    // EVERY hook call). Populated by the two owned emission-point files
+    // (agent_runtime.zig / agent_tools.zig); every other caller (including
+    // every pre-existing test) leaves these at their zero value, which
+    // `hook_io.writeBaseFields` treats as "omit the field" so no existing
+    // payload shape changes.
+    session_id: []const u8 = "",
+    transcript_path: []const u8 = "",
+    permission_mode: []const u8 = "",
+    agent_id: []const u8 = "",
+    prompt_id: []const u8 = "",
+    // hooks-permissions-09: per-event tool extensions. `tool_use_id` is
+    // documented on every tool-shaped event (pre/post/post-failure/
+    // permission-request/permission-denied); `duration_ms` on
+    // post-tool-use/post-tool-use-failure only (the caller simply never sets
+    // it for other events).
+    tool_use_id: []const u8 = "",
+    duration_ms: ?u64 = null,
+    // hooks-permissions-04: `PostToolBatch`-only. A pre-built, already-valid
+    // JSON array literal -- see `hook_io.buildPostToolBatchPayload`'s doc
+    // comment for why the caller (not this module) assembles each element.
+    tool_calls_json: []const u8 = "",
+    // hooks-permissions-03: the remaining lifecycle events' discriminating
+    // fields (verified against the reference's zod schemas). `source` above
+    // already covers SessionStart AND ConfigChange (same JSON key, different
+    // enum values). `file_path` is shared by ConfigChange (optional),
+    // InstructionsLoaded (required), and FileChanged (required).
+    file_path: []const u8 = "",
+    // InstructionsLoaded only.
+    memory_type: []const u8 = "",
+    load_reason: []const u8 = "",
+    // CwdChanged: the cwd BEFORE the change. The "new" cwd is `ctx.cwd`
+    // itself (every event's payload already carries the current cwd there).
+    old_cwd: []const u8 = "",
+    // FileChanged only: "change" | "add" | "unlink".
+    file_change_event: []const u8 = "",
+    // TeammateIdle only.
+    teammate_name: []const u8 = "",
+    team_name: []const u8 = "",
+    // WorktreeCreate only (the worktree's logical name).
+    worktree_name: []const u8 = "",
+    // WorktreeRemove only (the removed worktree's absolute path).
+    worktree_path: []const u8 = "",
+    // hooks-permissions-02 (corrected semantics): StopFailure fields -- see
+    // `hook_io.LifecycleFields`'s doc comment and agent_runtime.zig's
+    // `fireStopFailureHook` for the full correction from the original gap
+    // guess ("a Stop hook's own execution failed") to the reference's actual
+    // semantics ("fires instead of Stop when an API error ended the turn").
+    error_message: []const u8 = "",
+    error_details: []const u8 = "",
+    last_assistant_message: []const u8 = "",
+    /// hooks-permissions-06: an opaque handle to the live, already-connected
+    /// MCP client registry (`mcp.Client`), threaded through so an `mcp_tool`
+    /// hook can actually invoke the configured server/tool instead of always
+    /// degrading to "no bridge is connected". Cast back to `*mcp.Client` by
+    /// `mcpToolInvoker` below. Kept `*anyopaque` (rather than importing the
+    /// concrete type into every `HookContext` field list) so the vast
+    /// majority of call sites that never fire an `mcp_tool` hook stay
+    /// unaffected. Null at every call site with no live client (most unit
+    /// tests) -- `processDef` then falls back to the documented non-blocking
+    /// error, exactly as before this field existed.
+    mcp_ctx: ?*anyopaque = null,
 };
 
-/// True for the 3 tool events that have an on-disk `.sh` file form and a
-/// `tool_name`/`tool_args` payload. Everything else is a non-tool lifecycle
-/// event that dispatches purely via settings.json and matches on a single
+/// True for the tool-shaped events: the 3 original events with an on-disk
+/// `.sh` file form and a `tool_name`/`tool_args` payload, plus (hooks-
+/// permissions-01) `PermissionRequest`/`PermissionDenied`, which the
+/// reference documents as matching on "Tool name" exactly like PreToolUse/
+/// PostToolUse (bundled hooks doc table) even though they have no on-disk
+/// file form of their own. Everything else is a non-tool lifecycle event
+/// that dispatches purely via settings.json and matches on a single
 /// discriminating field instead of a tool name.
 fn isToolEvent(event: HookEvent) bool {
     return switch (event) {
-        .pre_tool_use, .post_tool_use, .post_tool_use_failure => true,
+        .pre_tool_use, .post_tool_use, .post_tool_use_failure, .permission_request, .permission_denied => true,
         else => false,
     };
 }
 
 /// The single field value a non-tool event's `matcher` is tested against
 /// (`hook_matcher.matchesField`). SessionStart matches its `source`,
-/// UserPromptSubmit its `prompt`, Notification its `message`, PreCompact its
-/// `trigger`, SessionEnd its `reason`. Events without a meaningful
-/// discriminator return "" (which `matchesField` treats as "match unless the
-/// matcher is a concrete value").
+/// UserPromptSubmit its `prompt`, Notification its `notification_type`
+/// (hooks-permissions-10 -- the reference's documented matcher target, not
+/// the free-text `message`), PreCompact its `trigger`, SessionEnd its
+/// `reason`. Events without a meaningful discriminator return "" (which
+/// `matchesField` treats as "match unless the matcher is a concrete value").
 fn matchFieldFor(ctx: HookContext) []const u8 {
     return switch (ctx.event) {
         .session_start => ctx.source,
         .user_prompt_submit => ctx.prompt,
-        .notification => ctx.message,
+        .notification => ctx.notification_type,
         .pre_compact => ctx.trigger,
         .session_end => ctx.reason,
         // TaskCreated / TaskCompleted match against the task subject so a hook
         // can scope itself with a matcher (swarm-tasks-15).
         .task_created, .task_completed => ctx.task_subject,
+        // hooks-permissions-03: reference matchFieldFor (bundle offset
+        // ~20940163) -- ConfigChange matches `source`, InstructionsLoaded
+        // matches `load_reason`, FileChanged matches `file_path`.
+        // CwdChanged/TeammateIdle/WorktreeCreate/WorktreeRemove are not in
+        // that switch (fall to its `default: return` -- no discriminator),
+        // matching this function's own `else => ""` below.
+        .config_change => ctx.source,
+        .instructions_loaded => ctx.load_reason,
+        .file_changed => ctx.file_path,
+        // hooks-permissions-02 (corrected): StopFailure matches `error`.
+        .stop_failure => ctx.error_message,
         else => "",
+    };
+}
+
+/// hooks-permissions-09: assemble `ctx`'s always-present base fields into the
+/// shape both builders share. Shared by the tool and lifecycle branches below
+/// so the two payload shapes stay in sync.
+fn baseFieldsFor(ctx: HookContext) hook_io.HookBaseFields {
+    return .{
+        .session_id = ctx.session_id,
+        .transcript_path = ctx.transcript_path,
+        .permission_mode = ctx.permission_mode,
+        .agent_id = ctx.agent_id,
+        .prompt_id = ctx.prompt_id,
     };
 }
 
@@ -128,15 +236,40 @@ fn matchFieldFor(ctx: HookContext) []const u8 {
 /// discriminating field(s).
 fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
     const name = hook_event.canonicalName(ctx.event);
+    // hooks-permissions-04: PostToolBatch has neither a single tool_name/
+    // tool_input pair (it is NOT `isToolEvent`, matched like Setup/
+    // StopFailure on an empty discriminator) nor a lifecycle-style single
+    // field -- its own `tool_calls` array shape, built separately.
+    if (ctx.event == .post_tool_batch) {
+        return hook_io.buildPostToolBatchPayload(allocator, ctx.cwd, ctx.tool_calls_json, baseFieldsFor(ctx));
+    }
     if (isToolEvent(ctx.event)) {
         // PostToolUse / PostToolUseFailure carry the tool's response on stdin so
         // hooks can inspect it (reference: hooks.ts:3465 `tool_response`). PreToolUse
-        // has no response yet, so pass null (no `tool_response` field emitted).
+        // (and PermissionRequest/PermissionDenied, which fire before/without a
+        // tool result) have no response yet, so pass null.
         const response: ?[]const u8 = switch (ctx.event) {
             .post_tool_use, .post_tool_use_failure => ctx.tool_output,
             else => null,
         };
-        return hook_io.buildToolEventPayloadFull(allocator, name, ctx.tool_name, ctx.tool_args, ctx.cwd, response, ctx.tool_success);
+        // hooks-permissions-09: duration_ms is documented only for
+        // PostToolUse/PostToolUseFailure ("Tool execution time in
+        // milliseconds"); every other tool-shaped event never sets it.
+        const duration_ms: ?u64 = switch (ctx.event) {
+            .post_tool_use, .post_tool_use_failure => ctx.duration_ms,
+            else => null,
+        };
+        return hook_io.buildToolEventPayloadFull(
+            allocator,
+            name,
+            ctx.tool_name,
+            ctx.tool_args,
+            ctx.cwd,
+            response,
+            ctx.tool_success,
+            baseFieldsFor(ctx),
+            .{ .tool_use_id = ctx.tool_use_id, .reason = ctx.reason, .duration_ms = duration_ms },
+        );
     }
     var fields: hook_io.LifecycleFields = .{};
     switch (ctx.event) {
@@ -145,6 +278,7 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
         .notification => {
             fields.message = nonEmptyOrNull(ctx.message);
             fields.title = nonEmptyOrNull(ctx.title);
+            fields.notification_type = nonEmptyOrNull(ctx.notification_type);
         },
         .pre_compact => fields.trigger = nonEmptyOrNull(ctx.trigger),
         .session_end => fields.reason = nonEmptyOrNull(ctx.reason),
@@ -152,9 +286,51 @@ fn buildEventPayload(allocator: std.mem.Allocator, ctx: HookContext) ![]u8 {
             fields.task_id = nonEmptyOrNull(ctx.task_id);
             fields.task_subject = nonEmptyOrNull(ctx.task_subject);
         },
+        // hooks-permissions-03: Elicitation/ElicitationResult carry the raw
+        // MCP `elicitation/create` request params / response JSON as
+        // `message` -- see agent_runtime.fireElicitationHook's doc comment
+        // for why this reuses the generic carrier rather than a dedicated
+        // field.
+        .elicitation, .elicitation_result => fields.message = nonEmptyOrNull(ctx.message),
+        // hooks-permissions-03: the remaining lifecycle events, wired at
+        // their real runtime trigger points in agent_runtime.zig /
+        // agent_tools.zig (see each fire*Hook helper's doc comment).
+        .teammate_idle => {
+            fields.teammate_name = nonEmptyOrNull(ctx.teammate_name);
+            fields.team_name = nonEmptyOrNull(ctx.team_name);
+        },
+        .config_change => {
+            fields.source = nonEmptyOrNull(ctx.source);
+            fields.file_path = nonEmptyOrNull(ctx.file_path);
+        },
+        .instructions_loaded => {
+            fields.file_path = nonEmptyOrNull(ctx.file_path);
+            fields.memory_type = nonEmptyOrNull(ctx.memory_type);
+            fields.load_reason = nonEmptyOrNull(ctx.load_reason);
+        },
+        .cwd_changed => {
+            fields.old_cwd = nonEmptyOrNull(ctx.old_cwd);
+            // The "new" cwd is the event's own top-level `cwd` (ctx.cwd),
+            // which the reference also names `new_cwd` -- see
+            // buildLifecycleEventPayload's CwdChanged handling.
+            fields.new_cwd = nonEmptyOrNull(ctx.cwd);
+        },
+        .file_changed => {
+            fields.file_path = nonEmptyOrNull(ctx.file_path);
+            fields.change_event = nonEmptyOrNull(ctx.file_change_event);
+        },
+        .worktree_create => fields.worktree_name = nonEmptyOrNull(ctx.worktree_name),
+        .worktree_remove => fields.worktree_path = nonEmptyOrNull(ctx.worktree_path),
+        // hooks-permissions-02 (corrected semantics): StopFailure -- see
+        // agent_runtime.fireStopFailureHook's doc comment for the correction.
+        .stop_failure => {
+            fields.@"error" = nonEmptyOrNull(ctx.error_message);
+            fields.error_details = nonEmptyOrNull(ctx.error_details);
+            fields.last_assistant_message = nonEmptyOrNull(ctx.last_assistant_message);
+        },
         else => {},
     }
-    return hook_io.buildLifecycleEventPayload(allocator, name, ctx.cwd, fields);
+    return hook_io.buildLifecycleEventPayload(allocator, name, ctx.cwd, fields, baseFieldsFor(ctx));
 }
 
 fn nonEmptyOrNull(s: []const u8) ?[]const u8 {
@@ -351,6 +527,24 @@ pub fn runTaskCreatedHook(
     return .{ .blocked = true, .message = try allocator.dupe(u8, reason) };
 }
 
+/// hooks-permissions-02: fire the `TaskCompleted` lifecycle hook when a task
+/// transitions into a resolved (done/completed) status. Unlike
+/// `runTaskCreatedHook` (which can veto the just-created task, mirroring the
+/// reference's create-then-maybe-delete flow), `TaskCompleted` has no
+/// documented block-and-undo semantics of its own -- the task has already
+/// finished, there is nothing left to unwind -- so this is fire-and-forget:
+/// callers do not act on the result, matching `runSetupHook`/
+/// `runStopFailureHook` below.
+pub fn runTaskCompletedHook(allocator: std.mem.Allocator, cwd: []const u8, task_id: []const u8, task_subject: []const u8) void {
+    var result = run(allocator, .{
+        .event = .task_completed,
+        .cwd = cwd,
+        .task_id = task_id,
+        .task_subject = task_subject,
+    }) catch return;
+    result.deinit(allocator);
+}
+
 pub fn run(allocator: std.mem.Allocator, ctx: HookContext) !HookRunResult {
     const hooks = try list(allocator, ctx.cwd);
     defer freeList(allocator, hooks);
@@ -370,6 +564,7 @@ pub fn run(allocator: std.mem.Allocator, ctx: HookContext) !HookRunResult {
             };
         }
         ran = true;
+        log_hooks.debug("running {s} hook {s} for event {s}", .{ scopeName(hook.scope), hook.path, eventName(ctx.event) });
         var result = try runSingle(allocator, hook.path, ctx);
         defer result.deinit(allocator);
 
@@ -559,6 +754,37 @@ fn runConfiguredFromSources(allocator: std.mem.Allocator, ctx: HookContext) !Hoo
     return .{ .ran = ran, .blocked = false, .output = last_output };
 }
 
+/// hooks-permissions-06: `hook_exec_mcp_tool.Invoker` adapter onto the real,
+/// live MCP client registry. `ctx` is `HookContext.mcp_ctx` cast back to its
+/// concrete type -- this is the one place in the hooks package that knows
+/// what that opaque handle actually is. `mcp.Client.invoke` has no per-call
+/// timeout knob today, so `timeout_ms` (the hook's configured/default
+/// timeout, already computed by `computeTimeoutMs`) is accepted but not yet
+/// enforced here; a stuck server tool call blocks for as long as the
+/// client's own transport-level timeout allows, same as a direct model-
+/// facing `mcp_invoke` tool call today.
+fn mcpToolInvoker(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    server: []const u8,
+    tool: []const u8,
+    input_json: []const u8,
+    timeout_ms: u64,
+) anyerror!hook_exec_mcp_tool.InvokeResult {
+    _ = timeout_ms;
+    const client: *mcp_client.Client = @ptrCast(@alignCast(ctx));
+    const output = try client.invoke(server, tool, input_json);
+    // `Client.invoke` already degrades transport/protocol failures to a
+    // descriptive text result (mirroring the model-facing `mcp_invoke` tool)
+    // rather than a distinct Zig error, so there is no separate "is_error"
+    // signal to plumb through here; `allocator` here is expected to be the
+    // same underlying allocator as `client.allocator` in every real
+    // (non-test) construction, so the caller's `allocator.free(result.output)`
+    // frees the same allocation `invoke` made.
+    _ = allocator;
+    return .{ .output = output, .is_error = false };
+}
+
 /// Process a single hook def for the current event. Returns a non-null
 /// `HookRunResult` when this def produced a short-circuiting outcome the caller
 /// must return immediately (a block, a contract signal, or a prompt/http
@@ -610,6 +836,14 @@ fn processDef(
         return null;
     }
 
+    // cli-flags-14: `-d, --debug hooks` (or `api,hooks`) trace point for the
+    // settings.json/`.claude`/`.zcode` JSON-contract hook path -- the one
+    // most users actually configure (contrast the legacy per-event `.sh`
+    // file path in `run()` above, which has its own `log_hooks.debug` call).
+    log_hooks.debug("dispatching hook (type={s} matcher={s}) for event {s}", .{
+        @tagName(def.hook_type), def.matcher, eventName(engine_event),
+    });
+
     const payload = buildEventPayload(allocator, ctx) catch return null;
     defer allocator.free(payload);
 
@@ -627,12 +861,11 @@ fn processDef(
         if (path) |p| removeOnceHook(allocator, p, engine_event, def) catch {};
     }
 
-    // Task 6 (hooks-02): dispatch by hook type. command runs locally;
-    // prompt/agent query an LLM with the payload as `$ARGUMENTS`; http
-    // is wired in Task 7 (skipped here, so a settings.json http hook is
-    // a no-op rather than a crash until that task lands).
+    // Task 6 (hooks-02): dispatch by hook type. command/script run locally;
+    // prompt/agent query an LLM with the payload as `$ARGUMENTS`; http POSTs
+    // it; mcp_tool invokes an already-configured MCP server's tool.
     switch (def.hook_type) {
-        .command => {},
+        .command, .script => {},
         .prompt, .agent => {
             ran.* = true;
             var outcome = (if (def.hook_type == .agent)
@@ -649,11 +882,60 @@ fn processDef(
                 const reason = outcome.reason orelse "";
                 allocator.free(last_output.*);
                 last_output.* = try allocator.dupe(u8, reason);
+                // hooks-permissions-08: `continueOnBlock` (prompt hooks only)
+                // downgrades a block into a continuable signal -- the turn
+                // proceeds with the reason surfaced as additional context
+                // instead of stopping.
+                const continue_on_block = def.hook_type == .prompt and def.continue_on_block;
+                return .{
+                    .ran = true,
+                    .blocked = !continue_on_block,
+                    .output = last_output.*,
+                    .continue_run = if (continue_on_block) true else null,
+                    .stop_reason = try dupeOpt(allocator, reason),
+                    .additional_context = if (continue_on_block) try dupeOpt(allocator, reason) else null,
+                };
+            }
+            return null;
+        },
+        .mcp_tool => {
+            // hooks-permissions-06: invoke an already-configured MCP server's
+            // tool. When `ctx.mcp_ctx` carries a live client (every real,
+            // non-test call site -- see agent_tools.zig/agent_runtime.zig's
+            // HookContext construction), this actually calls the server/tool
+            // via `mcpToolInvoker`. With no live client wired (most unit
+            // tests), it degrades to the documented non-blocking error
+            // instead of silently doing nothing -- but the type is fully
+            // parsed/dispatched either way, unlike before where it was
+            // silently dropped at parse time.
+            ran.* = true;
+            const fields = [_]hook_exec_mcp_tool.Field{
+                .{ .path = "tool_name", .value = ctx.tool_name },
+                .{ .path = "tool_input", .value = ctx.tool_args },
+            };
+            const mcp_timeout_ms = computeTimeoutMs(def.hook_type, def.timeout_s);
+            const invoker: ?hook_exec_mcp_tool.Invoker = if (ctx.mcp_ctx != null) mcpToolInvoker else null;
+            var outcome = hook_exec_mcp_tool.runMcpToolHook(allocator, def, &fields, mcp_timeout_ms, invoker, ctx.mcp_ctx) catch return null;
+            defer outcome.deinit(allocator);
+            if (outcome.blocked) {
+                const reason = outcome.reason orelse "";
+                allocator.free(last_output.*);
+                last_output.* = try allocator.dupe(u8, reason);
                 return .{
                     .ran = true,
                     .blocked = true,
                     .output = last_output.*,
                     .stop_reason = try dupeOpt(allocator, reason),
+                };
+            }
+            if (outcome.additional_context) |ac| {
+                allocator.free(last_output.*);
+                last_output.* = try allocator.dupe(u8, "");
+                return .{
+                    .ran = true,
+                    .blocked = false,
+                    .output = last_output.*,
+                    .additional_context = try dupeOpt(allocator, ac),
                 };
             }
             return null;
@@ -732,7 +1014,34 @@ fn processDef(
     // non-blocking error (continue to the next hook), matching the
     // reference's cancelled/abort outcome.
     const cmd_timeout_ms = computeTimeoutMs(def.hook_type, def.timeout_s);
-    const run_res = runCommandWithStdin(allocator, def.body, ctx.cwd, zcode_home, payload, engine_event, cmd_timeout_ms) catch return null;
+    // hooks-permissions-07 / -missed-163: a `script` hook, or a `command` hook
+    // carrying exec-form `args`, is spawned directly (no shell) so its args
+    // are never re-parsed by a shell -- see runCommandWithStdin's doc comment.
+    const direct_spawn = def.hook_type == .script or def.args.len > 0;
+    // hooks-permissions-missed-163: an inline `script:` hook (no `file` key)
+    // has no on-disk path to exec -- `def.body` is raw script SOURCE TEXT,
+    // not a path, and would fail at spawn time as an invalid executable path
+    // if handed to `exec` as-is. Materialize it as a fresh, executable temp
+    // file (deleted after the run) and exec THAT instead, exactly like a
+    // `file`-based script hook already does. `command` hooks and file-based
+    // script hooks are unaffected: `command_path` just aliases `def.body`.
+    var inline_script_path: ?[]u8 = null;
+    defer if (inline_script_path) |p| {
+        std.Io.Dir.cwd().deleteFile(rt.io, p) catch {};
+        allocator.free(p);
+    };
+    const command_path: []const u8 = blk: {
+        if (def.hook_type == .script and def.script_inline) {
+            const p = writeInlineScriptTempFile(allocator, zcode_home, def.body) catch |err| {
+                log_hooks.debug("failed to materialize inline script hook: {s}", .{@errorName(err)});
+                return null;
+            };
+            inline_script_path = p;
+            break :blk p;
+        }
+        break :blk def.body;
+    };
+    const run_res = runCommandWithStdin(allocator, command_path, def.args, direct_spawn, ctx.cwd, zcode_home, payload, engine_event, cmd_timeout_ms) catch return null;
     defer allocator.free(run_res.stdout);
     if (run_res.timed_out) {
         // Task 16: a timed-out hook reports a `cancelled` response (reference
@@ -878,15 +1187,25 @@ fn onceEntryMatches(entry: std.json.Value, def: hook_config.HookDef, group_match
         .prompt => "prompt",
         .http => "http",
         .agent => "agent",
+        .mcp_tool => "mcp_tool",
+        .script => "script",
     };
     if (!std.mem.eql(u8, type_str, want_type)) return false;
-    const body_key = switch (def.hook_type) {
-        .command => "command",
-        .http => "url",
-        .prompt, .agent => "prompt",
-    };
-    const body_str = jsonStr(entry.object.get(body_key), "");
-    if (!std.mem.eql(u8, body_str, def.body)) return false;
+    if (def.hook_type == .mcp_tool) {
+        // mcp_tool has no single "body" string; match on server+tool identity.
+        if (!std.mem.eql(u8, jsonStr(entry.object.get("server"), ""), def.mcp_server)) return false;
+        if (!std.mem.eql(u8, jsonStr(entry.object.get("tool"), ""), def.mcp_tool)) return false;
+    } else {
+        const body_key = switch (def.hook_type) {
+            .command => "command",
+            .http => "url",
+            .prompt, .agent => "prompt",
+            .script => if (entry.object.get("file") != null) "file" else "script",
+            .mcp_tool => unreachable,
+        };
+        const body_str = jsonStr(entry.object.get(body_key), "");
+        if (!std.mem.eql(u8, body_str, def.body)) return false;
+    }
     if (!std.mem.eql(u8, jsonStr(entry.object.get("if"), ""), def.if_cond)) return false;
     if (!std.mem.eql(u8, group_matcher, def.matcher)) return false;
     return true;
@@ -922,16 +1241,46 @@ fn writeSettingsAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []
 
 const CommandResult = struct { exit_code: u8, stdout: []u8, timed_out: bool = false };
 
-/// Run `sh -c "<command> < <tmp>"` with `payload` written to the temp file so
-/// the hook receives it on stdin. Uses the one-shot runner (captures stdout,
-/// no manual pipe pumping). Temp file uses a hex-only name so no shell quoting
-/// is needed; it is removed afterward.
+/// hooks-permissions-missed-163: write an inline `script:` hook's raw source
+/// text to a fresh, executable temp file under `home`, so `runCommandWithStdin`
+/// can `exec` it exactly like a `file`-based script hook's already-real path.
+/// Uses the same hex-named-under-`home` convention as the stdin payload temp
+/// file (`.hook-input-*`) so no shell quoting is needed for the path. Caller
+/// deletes the file and frees the returned path (see `processDef`'s
+/// `inline_script_path` defer).
+fn writeInlineScriptTempFile(allocator: std.mem.Allocator, home: []const u8, script_source: []const u8) ![]u8 {
+    const nonce = clock.nowNanos();
+    const path = try std.fmt.allocPrint(allocator, "{s}/.hook-script-{x}", .{ home, nonce });
+    errdefer allocator.free(path);
+    const file = try std.Io.Dir.cwd().createFile(rt.io, path, .{ .truncate = true, .permissions = std.Io.File.Permissions.fromMode(0o700) });
+    defer file.close(rt.io);
+    try file.writeStreamingAll(rt.io, script_source);
+    return path;
+}
+
+/// Run a command hook with `payload` written to a temp file so the hook
+/// receives it on stdin. Uses the one-shot runner (captures stdout, no manual
+/// pipe pumping). Temp file uses a hex-only name so no shell quoting is
+/// needed; it is removed afterward.
+///
+/// Two spawn forms, selected by `direct`:
+///   - `direct == false` (the default `command` form): `sh -c "<command> <
+///     <tmp>"` -- `command` is a full shell string.
+///   - `direct == true` (hooks-permissions-07's exec form, and every `script`
+///     hook): `command` is resolved as an executable and spawned with `args`
+///     as its argv, delivered via `sh -c 'exec "$0" "$@" < <tmp>' <command>
+///     <args...>`. Each of `command`/`args` is bound to `sh`'s positional
+///     parameters as a literal argv element -- never interpolated into the
+///     script text -- so quotes/$/backticks in an argument never reach the
+///     shell parser (the documented exec-form security property). `sh` is
+///     still the process spawned (so the stdin-redirect trick keeps working
+///     unchanged), but it never re-parses `command`/`args` as script text.
 ///
 /// Task 8 (hooks-08): `timeout_ms` bounds the wall-clock the hook may take. On
 /// expiry `std.process.run` reaps the child internally (CLAUDE.md: do NOT
 /// `wait()` after a kill) and returns `error.Timeout`, which we surface as a
 /// `timed_out` result (a non-blocking outcome, not a block).
-fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: []const u8, home: []const u8, payload: []const u8, event: HookEvent, timeout_ms: u64) !CommandResult {
+fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, args: []const []const u8, direct: bool, cwd: []const u8, home: []const u8, payload: []const u8, event: HookEvent, timeout_ms: u64) !CommandResult {
     const nonce = clock.nowNanos();
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.hook-input-{x}.json", .{ home, nonce });
     defer allocator.free(tmp_path);
@@ -947,8 +1296,20 @@ fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: [
     // which would otherwise split the redirect target and inject a stray argv.
     // PRD #534 review fix. (A single quote in the home path is not escaped, but
     // that is vanishingly rare and would only fail the hook, not misbehave.)
-    const full = try std.fmt.allocPrint(allocator, "{s} < '{s}'", .{ command, tmp_path });
+    const full = if (direct)
+        try std.fmt.allocPrint(allocator, "exec \"$0\" \"$@\" < '{s}'", .{tmp_path})
+    else
+        try std.fmt.allocPrint(allocator, "{s} < '{s}'", .{ command, tmp_path });
     defer allocator.free(full);
+
+    var argv_storage: std.ArrayList([]const u8) = .empty;
+    defer argv_storage.deinit(allocator);
+    if (direct) {
+        try argv_storage.appendSlice(allocator, &.{ "sh", "-c", full, command });
+        try argv_storage.appendSlice(allocator, args);
+    } else {
+        try argv_storage.appendSlice(allocator, &.{ "sh", "-c", full });
+    }
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
@@ -972,7 +1333,7 @@ fn runCommandWithStdin(allocator: std.mem.Allocator, command: []const u8, cwd: [
     // already reaped the killed child (no manual wait); surface it as a
     // non-blocking timed_out result so a hung hook cannot stall the agent.
     const result = std.process.run(allocator, rt.io, .{
-        .argv = &.{ "sh", "-c", full },
+        .argv = argv_storage.items,
         .cwd = .{ .path = cwd },
         .environ_map = &env_map,
         .stdout_limit = .limited(64 * 1024),
@@ -2131,4 +2492,551 @@ test "Task 16: command hook broadcasts started + response and statusMessage" {
     // The hook's statusMessage reached the spinner callback.
     try testing.expectEqual(@as(usize, 1), EventCapture.status);
     try testing.expectEqualStrings("booting", EventCapture.lastStatus());
+}
+
+// ── hooks-permissions-03 / hooks-permissions-02 (corrected): the seven
+// remaining lifecycle events, engine-level (runEvent dispatches the right
+// stdin payload and honors each event's matcher). The real runtime trigger
+// points (teammate.zig has no live idle-detection loop today -- see
+// agent_runtime.zig's `fireCwdChangedHook` neighborhood for the others) are
+// covered by hooks_runtime_wire_test.zig.
+
+test "hooks-permissions-03: ConfigChange carries source and matches on it" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "config_change.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"ConfigChange":[{{"matcher":"skills","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{ .event = .config_change, .cwd = cwd, .source = "skills" });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ConfigChange", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("skills", parsed.value.object.get("source").?.string);
+
+    // A matcher for a different source does not fire.
+    var miss = try runEvent(alloc, .{ .event = .config_change, .cwd = cwd, .source = "user_settings" });
+    defer miss.deinit(alloc);
+    try testing.expect(!miss.ran);
+}
+
+test "hooks-permissions-03: InstructionsLoaded carries file_path/memory_type/load_reason" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "instructions_loaded.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"InstructionsLoaded":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .instructions_loaded,
+        .cwd = cwd,
+        .file_path = "/repo/ZCODE.md",
+        .memory_type = "Project",
+        .load_reason = "session_start",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo/ZCODE.md", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("Project", parsed.value.object.get("memory_type").?.string);
+    try testing.expectEqualStrings("session_start", parsed.value.object.get("load_reason").?.string);
+}
+
+test "hooks-permissions-03: CwdChanged carries old_cwd and the current cwd as new_cwd" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "cwd_changed.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"CwdChanged":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{ .event = .cwd_changed, .cwd = cwd, .old_cwd = "/repo" });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/repo", parsed.value.object.get("old_cwd").?.string);
+    try testing.expectEqualStrings(cwd, parsed.value.object.get("new_cwd").?.string);
+}
+
+test "hooks-permissions-03: FileChanged carries file_path/event and matches on file_path" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "file_changed.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"FileChanged":[{{"matcher":"*.zig","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .file_changed,
+        .cwd = cwd,
+        .file_path = "src/a.zig",
+        .file_change_event = "add",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("src/a.zig", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("add", parsed.value.object.get("event").?.string);
+}
+
+test "hooks-permissions-03: WorktreeCreate carries name, WorktreeRemove carries worktree_path" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const create_sentinel = try std.fs.path.join(alloc, &.{ root, "worktree_create.json" });
+    defer alloc.free(create_sentinel);
+    const remove_sentinel = try std.fs.path.join(alloc, &.{ root, "worktree_remove.json" });
+    defer alloc.free(remove_sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"WorktreeCreate":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}],"WorktreeRemove":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{ create_sentinel, remove_sentinel });
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var create_result = try runEvent(alloc, .{ .event = .worktree_create, .cwd = cwd, .worktree_name = "feature-x" });
+    defer create_result.deinit(alloc);
+    try testing.expect(create_result.ran);
+    const create_data = try std.Io.Dir.cwd().readFileAlloc(rt.io, create_sentinel, alloc, .limited(4096));
+    defer alloc.free(create_data);
+    var create_parsed = try std.json.parseFromSlice(std.json.Value, alloc, create_data, .{});
+    defer create_parsed.deinit();
+    try testing.expectEqualStrings("feature-x", create_parsed.value.object.get("name").?.string);
+
+    var remove_result = try runEvent(alloc, .{ .event = .worktree_remove, .cwd = cwd, .worktree_path = "/repo/../feature-x" });
+    defer remove_result.deinit(alloc);
+    try testing.expect(remove_result.ran);
+    const remove_data = try std.Io.Dir.cwd().readFileAlloc(rt.io, remove_sentinel, alloc, .limited(4096));
+    defer alloc.free(remove_data);
+    var remove_parsed = try std.json.parseFromSlice(std.json.Value, alloc, remove_data, .{});
+    defer remove_parsed.deinit();
+    try testing.expectEqualStrings("/repo/../feature-x", remove_parsed.value.object.get("worktree_path").?.string);
+}
+
+test "hooks-permissions-03: TeammateIdle carries teammate_name/team_name" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "teammate_idle.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"TeammateIdle":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{ .event = .teammate_idle, .cwd = cwd, .teammate_name = "worker", .team_name = "alpha" });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("worker", parsed.value.object.get("teammate_name").?.string);
+    try testing.expectEqualStrings("alpha", parsed.value.object.get("team_name").?.string);
+}
+
+test "hooks-permissions-02 (corrected): StopFailure carries error/error_details/last_assistant_message and matches on error" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "stop_failure.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"StopFailure":[{{"matcher":"RateLimited","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .stop_failure,
+        .cwd = cwd,
+        .error_message = "RateLimited",
+        .error_details = "Rate limited by the API provider.",
+        .last_assistant_message = "Working on it...",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+    // Observability-only: exit 0 from `cat` never blocks the (already-over)
+    // turn, matching hook_event.isBlockingCapable(.stop_failure) == false.
+    try testing.expect(!result.blocked);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("StopFailure", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("RateLimited", parsed.value.object.get("error").?.string);
+    try testing.expectEqualStrings("Rate limited by the API provider.", parsed.value.object.get("error_details").?.string);
+    try testing.expectEqualStrings("Working on it...", parsed.value.object.get("last_assistant_message").?.string);
+}
+
+test "hooks-permissions-06: an mcp_tool hook actually invokes the configured server/tool through a real MCP client" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    // A minimal stdio MCP server (mirrors mcp/client.zig's own python-
+    // transport test): one tool, "policy_check", that echoes the interpolated
+    // `tool` argument back in a stdout-contract "block" decision so this test
+    // can observe a real round trip end to end -- settings.json parse ->
+    // hooks.processDef's `.mcp_tool` branch -> `mcpToolInvoker` ->
+    // `mcp.Client.invoke` -> a REAL subprocess -> its REAL response --
+    // rather than the `hook_exec_mcp_tool.zig` unit tests' `FakeInvoker`.
+    try tmp.dir.createDirPath(rt.io, "mcp");
+    // The stdio transport speaks LSP-style `Content-Length:`-framed JSON, not
+    // newline-delimited JSON -- mirrors mcp/client.zig's own python-transport
+    // test's read_frame/write_frame helpers exactly.
+    try writeFileMakingDirs(tmp.dir, "mcp/mock_server.py",
+        \\import sys, json
+        \\def read_frame():
+        \\    header = b""
+        \\    while b"\r\n\r\n" not in header:
+        \\        c = sys.stdin.buffer.read(1)
+        \\        if not c:
+        \\            return None
+        \\        header += c
+        \\    length = 0
+        \\    for line in header.decode("utf-8", errors="replace").split("\r\n"):
+        \\        if line.lower().startswith("content-length:"):
+        \\            length = int(line.split(":",1)[1].strip())
+        \\            break
+        \\    body = sys.stdin.buffer.read(length)
+        \\    return json.loads(body.decode("utf-8"))
+        \\def write_frame(obj):
+        \\    body = json.dumps(obj).encode("utf-8")
+        \\    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+        \\    sys.stdout.buffer.write(body)
+        \\    sys.stdout.buffer.flush()
+        \\while True:
+        \\    msg = read_frame()
+        \\    if msg is None:
+        \\        break
+        \\    method = msg.get("method", "")
+        \\    if method == "initialize":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0"}}})
+        \\    elif method == "notifications/initialized":
+        \\        pass
+        \\    elif method == "tools/list":
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"tools":[{"name":"policy_check","description":"","inputSchema":{"type":"object"}}]}})
+        \\    elif method == "tools/call":
+        \\        args = msg.get("params", {}).get("arguments", {})
+        \\        reason = "blocked because tool=" + str(args.get("tool", ""))
+        \\        payload = json.dumps({"decision":"block","reason":reason})
+        \\        write_frame({"jsonrpc":"2.0","id":msg.get("id"),"result":{"content":[{"type":"text","text":payload}]}})
+    );
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "mcp/servers.json", .data = "[]" });
+    const script = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "mcp/mock_server.py");
+    defer alloc.free(script);
+    const registry = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "mcp/servers.json");
+    defer alloc.free(registry);
+
+    var client = try mcp_client.Client.init(alloc, registry);
+    defer client.deinit();
+    const transport = try std.fmt.allocPrint(alloc, "python3 '{s}'", .{script});
+    defer alloc.free(transport);
+    try client.add("policy", transport);
+
+    const settings_json =
+        \\{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"mcp_tool","server":"policy","tool":"policy_check","input":{"tool":"${tool_name}"}}]}]}}
+    ;
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings_json);
+
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"rm -rf /\"}",
+        .mcp_ctx = @ptrCast(&client),
+    });
+    defer result.deinit(alloc);
+
+    try testing.expect(result.ran);
+    try testing.expect(result.blocked);
+    // "tool=Bash" only appears if the real subprocess actually received the
+    // interpolated `${tool_name}` value and echoed it back -- proving the
+    // wiring is live, not degrading to the "no bridge is connected" message.
+    try testing.expect(std.mem.indexOf(u8, result.output, "tool=Bash") != null);
+}
+
+test "hooks-permissions-06: an mcp_tool hook degrades to a non-blocking error with no live client wired" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const settings_json =
+        \\{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"mcp_tool","server":"policy","tool":"policy_check"}]}]}}
+    ;
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings_json);
+
+    // No `.mcp_ctx` set (the default, matching every call site with no live
+    // client -- most unit tests, or a hook fired before the client binds).
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"ls\"}",
+    });
+    defer result.deinit(alloc);
+
+    try testing.expect(result.ran);
+    try testing.expect(!result.blocked);
+}
+
+test "hooks-permissions-07: a command hook's exec-form args reach argv literally, defeating shell-metacharacter injection" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const captured = try std.fs.path.join(alloc, &.{ root, "argv_capture.txt" });
+    defer alloc.free(captured);
+
+    // `command` is "/bin/sh" itself (always present+executable, so this needs
+    // no chmod dance) and `args` is what the exec form hands it as argv --
+    // this is exactly the reference's exec-form contract: `command` is
+    // resolved as an executable and spawned directly with `args`, never
+    // re-parsed by an intermediate shell. The inner `sh -c` script we
+    // deliberately chose to run then references its OWN positional
+    // parameter (`$1`) rather than interpolating the untrusted value into
+    // script text, so `$(whoami)` is captured byte-for-byte rather than
+    // being evaluated as a command substitution at any layer.
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf '%s' \\\"$1\\\" > '{s}'\",\"argv0-placeholder\",\"$(whoami)\"]}}]}}]}}}}",
+        .{captured},
+    );
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"echo hi\"}",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+    try testing.expect(!result.blocked);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(4096)) catch |err| {
+        std.debug.print("exec-form args hook did not run: {s} ({any})\n", .{ captured, err });
+        return error.ExecFormHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+    // The literal 9-byte string "$(whoami)" -- NOT an expanded username --
+    // proves the argument reached argv unexpanded by any shell, at any layer.
+    try testing.expectEqualStrings("$(whoami)", bytes);
+}
+
+test "hooks-permissions-missed-163: an inline script: hook (no file key) is materialized to a temp file and actually runs" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const captured = try std.fs.path.join(alloc, &.{ root, "inline_script_ran.txt" });
+    defer alloc.free(captured);
+
+    // No "file" key -- this is the inline-content form. Before this fix
+    // `def.body` (this raw source text) was handed directly to `exec` as a
+    // path and would fail with "not a valid path"; the fix writes it to a
+    // fresh executable temp file first.
+    const script_source = try std.fmt.allocPrint(
+        alloc,
+        "#!/bin/sh\necho ran > '{s}'\n",
+        .{captured},
+    );
+    defer alloc.free(script_source);
+    var settings_buf: std.Io.Writer.Allocating = .init(alloc);
+    defer settings_buf.deinit();
+    try settings_buf.writer.writeAll("{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"script\",\"script\":");
+    try std.json.Stringify.encodeJsonString(script_source, .{}, &settings_buf.writer);
+    try settings_buf.writer.writeAll("}]}]}}");
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings_buf.written());
+
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"echo hi\"}",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+    try testing.expect(!result.blocked);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(4096)) catch |err| {
+        std.debug.print("inline script: hook did not run: {s} ({any})\n", .{ captured, err });
+        return error.InlineScriptHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+    try testing.expectEqualStrings("ran\n", bytes);
+}
+
+test "hooks-permissions-missed-163: a file-based script hook still runs a real script path unchanged" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try @import("test_helpers.zig").tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const captured = try std.fs.path.join(alloc, &.{ root, "file_script_ran.txt" });
+    defer alloc.free(captured);
+    const script_body = try std.fmt.allocPrint(alloc, "#!/bin/sh\necho ran > '{s}'\n", .{captured});
+    defer alloc.free(script_body);
+    try writeFileMakingDirs(tmp.dir, "scripts/hook.sh", script_body);
+    const script_path = try @import("test_helpers.zig").tmpDirPath(alloc, &tmp, "scripts/hook.sh");
+    defer alloc.free(script_path);
+    {
+        const file = try std.Io.Dir.cwd().openFile(rt.io, script_path, .{});
+        defer file.close(rt.io);
+        try file.setPermissions(rt.io, std.Io.File.Permissions.fromMode(0o700));
+    }
+
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"script\",\"file\":\"{s}\"}}]}}]}}}}",
+        .{script_path},
+    );
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    var result = try runEvent(alloc, .{
+        .event = .pre_tool_use,
+        .cwd = cwd,
+        .tool_name = "Bash",
+        .tool_args = "{\"command\":\"echo hi\"}",
+    });
+    defer result.deinit(alloc);
+    try testing.expect(result.ran);
+    try testing.expect(!result.blocked);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(rt.io, captured, alloc, .limited(4096)) catch |err| {
+        std.debug.print("file-based script: hook did not run: {s} ({any})\n", .{ captured, err });
+        return error.FileScriptHookDidNotRun;
+    };
+    defer alloc.free(bytes);
+    try testing.expectEqualStrings("ran\n", bytes);
 }

@@ -47,6 +47,8 @@ pub const repl_footer_mod = @import("repl_footer.zig");
 const figures = @import("../core/figures.zig");
 const thinking_render = @import("../core/thinking_render.zig");
 const memory_mod = @import("../core/memory.zig");
+const status_line_mod = @import("../core/status_line.zig");
+const paths_mod = @import("../core/paths.zig");
 const trust_mod = @import("../core/trust.zig");
 const trust_capabilities_mod = @import("../core/trust_capabilities.zig");
 const feedback_survey_mod = @import("../core/feedback_survey.zig");
@@ -157,7 +159,21 @@ pub const Options = struct {
     status_workspace: []const u8 = "",
     status_branch: []const u8 = "",
     status_model_context_window: usize = 0,
+    /// repl-ux-missed-128/130: mirrors `Config.auto_compact_enabled`.
+    /// Consulted by `repl_render.computeContextLowWarning` to pick the
+    /// reference's "auto-compact is off · /config to turn it on" wording
+    /// instead of suggesting `/compact` once context is low, when the
+    /// user has turned auto-compaction off. Defaults true so every
+    /// existing `Options` literal (tests included) keeps the prior
+    /// "/compact" wording unless it opts in.
+    autocompact_enabled: bool = true,
     status_approval_mode: []const u8 = "tiered-auto",
+    /// repl-ux-01: the live reference permission mode (default/acceptEdits/
+    /// plan/bypassPermissions/dontAsk), refreshed every render tick from the
+    /// REPL's Shift+Tab-cyclable `permission_mode` var. Only meaningful when
+    /// `permission_mode_active` (a reference mode name was configured); the
+    /// footer renders a persistent chip for every value except `.default`.
+    live_permission_mode: permission_decision.Mode = .default,
     status_sandbox: []const u8 = "workspace-write",
     status_show_workspace: bool = true,
     status_show_model: bool = true,
@@ -188,9 +204,38 @@ pub const Options = struct {
     enable_spinner: bool = true,
     enable_thinking_summary: bool = true,
     brief_mode: bool = false,
+    /// commands-16: /focus -- a second, distinct transcript view-mode
+    /// toggle from brief_mode (reference: "Toggle focus view: just your
+    /// prompt, summary, and response"). Session-only.
+    focus_mode: bool = false,
     ui_density: UiDensity = .full,
     ui_leader_key: []const u8 = "ctrl+x",
-    show_top_bar: bool = true,
+    /// r3-chrome-02: the persistent top-of-screen status bar ("zcode
+    /// \xe2\x88\x99 exec full \xe2\x88\x99 repo ... \xe2\x88\x99 model ...")
+    /// is legacy zcode chrome the 2.1.261 reference does not have (its
+    /// composer + footer are the only persistent chrome). Defaults to
+    /// false so a fresh session opens on the condensed startup banner
+    /// instead; `ui_show_top_bar = true` in config restores it.
+    show_top_bar: bool = false,
+    /// r3-chrome-01: renders the pre-2.1.261-parity welcome surface (a
+    /// bordered "terminal workbench" card plus a "Quick reference" tips
+    /// list) instead of the condensed glyph + version/model/cwd header.
+    /// Sourced from config `ui_legacy_banner` (default false).
+    legacy_banner: bool = false,
+    /// r3-chrome-03/04: renders the pre-2.1.261-parity composer border
+    /// labels ("ask zcode ...", "Enter submit ...") and the two-row
+    /// "actions ..." / "\xe2\x97\x8f ready ..." footer instead of the
+    /// reference's plain rules and single "? for shortcuts" + mode-chip
+    /// line. Sourced from config `ui_legacy_footer` (default false).
+    legacy_footer: bool = false,
+    /// r4-transcript-01/02: renders the pre-2.1.261-parity transcript --
+    /// a bordered "You"/"Assistant" divider card -- instead of the
+    /// reference's plain "> text" / "⏺ text" single-line rows. Also
+    /// controls whether bare `/help` opens the new tabbed overlay dialog
+    /// (r4-help-01) or keeps appending the old flat command dump to the
+    /// transcript. Sourced from config `ui_legacy_transcript` (default
+    /// false).
+    ui_legacy_transcript: bool = false,
     shortcuts_panel_enabled: bool = true,
     shortcuts_panel_visible: bool = false,
     vim_mode_enabled: bool = false,
@@ -199,6 +244,15 @@ pub const Options = struct {
     prompt_suggestion: []const u8 = "",
     inline_ghost_text: []const u8 = "",
     queued_prompt_notice: []const u8 = "",
+    /// config-layout-16: the last successfully rendered output of a
+    /// user-configured `statusLine.command` (settings.json), refreshed on
+    /// the same cadence as the other footer_* fields below. Empty when no
+    /// `statusLine` object is configured, the command has not produced any
+    /// non-blank output yet, or it failed/timed out. When non-empty,
+    /// `renderDefaultFooterLine` shows this instead of the static "? for
+    /// shortcuts" hint (mirroring the reference: the hint is hidden only
+    /// when a custom statusLine command is configured).
+    status_line_text: []const u8 = "",
     prompt_strip_items: []const repl_footer_mod.StripItem = &.{},
     prompt_strip_selection: ?usize = null,
     footer_rows: []const repl_footer_mod.Row = &.{},
@@ -973,11 +1027,65 @@ fn leaveAltScreen(writer: anytype) !void {
     return repl_render_mod.leaveAltScreen(writer);
 }
 
-fn appendInputLine(allocator: std.mem.Allocator, transcript: *UiTranscript, prompt_label: []const u8, line: []const u8) !void {
-    var buf: [16 * 1024]u8 = undefined;
-    const rendered = formatInputPreview(prompt_label, line, &buf);
+/// commands-12: writes "(leave the alt screen, if `use_fullscreen`) then
+/// (the command's own output)", in that order. `leaveAltScreen` emits
+/// `\x1b[?1049l`, which tells the terminal to discard the alt-screen buffer
+/// and restore the one underneath it -- so anything written to `writer`
+/// BEFORE that escape (the order `/background`/`/bg` used before this fix)
+/// is content the terminal throws away along with the rest of the alt
+/// screen, and never actually becomes visible. `/exit` has always gotten
+/// this order right; this is a pure writer-in/writer-out extraction of the
+/// same shape so the ordering invariant is unit-testable without a real
+/// TTY (`use_fullscreen`'s own detection requires one).
+fn writeAltScreenThenOutput(writer: anytype, use_fullscreen: bool, output: ?[]const u8) !void {
+    if (use_fullscreen) try leaveAltScreen(writer);
+    if (output) |o| {
+        try writer.writeAll(o);
+        if (!std.mem.endsWith(u8, o, "\n")) try writer.writeByte('\n');
+    }
+}
+
+test "writeAltScreenThenOutput leaves the alt screen before writing output (commands-12)" {
+    var out = std_io.StringBuilder.init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeAltScreenThenOutput(out.writer(), true, "started background session\tpid=123\n");
+
+    const bytes = out.items();
+    // The alt-screen-leave escape must appear, and it must come BEFORE the
+    // command's own output text -- otherwise the terminal has already
+    // discarded the alt-screen buffer by the time the hint would land in
+    // it, and the user never sees it (the bug this test guards against).
+    const leave_idx = std.mem.indexOf(u8, bytes, "\x1b[?1049l") orelse return error.TestUnexpectedResult;
+    const output_idx = std.mem.indexOf(u8, bytes, "started background session") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(leave_idx < output_idx);
+}
+
+test "writeAltScreenThenOutput writes nothing extra when not in fullscreen" {
+    var out = std_io.StringBuilder.init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeAltScreenThenOutput(out.writer(), false, "hello\n");
+    try std.testing.expectEqualStrings("hello\n", out.items());
+}
+
+fn appendInputLine(allocator: std.mem.Allocator, transcript: *UiTranscript, prompt_label: []const u8, line: []const u8, legacy_transcript: bool) !void {
     try appendTranscriptDivider(allocator, transcript, "You");
-    try transcript.appendLine(allocator, rendered);
+    if (legacy_transcript) {
+        var buf: [16 * 1024]u8 = undefined;
+        const rendered = formatInputPreview(prompt_label, line, &buf);
+        try transcript.appendLine(allocator, rendered);
+        return;
+    }
+    // r4-transcript-01: echo the raw prompt text bounded by user-block
+    // markers instead of baking a literal "> " prefix into the transcript
+    // line -- the renderer draws the pointer itself (repl_render.zig's
+    // renderUserWrappedLineRows), so a prompt that happens to start with
+    // "> " text of its own is never misread as a markdown blockquote by
+    // the general transcript renderer (the bug this gap replaces).
+    try transcript.appendLine(allocator, repl_render_mod.transcriptUserBlockStartMarker());
+    try transcript.appendText(allocator, line);
+    try transcript.appendLine(allocator, repl_render_mod.transcriptUserBlockEndMarker());
 }
 
 fn appendTranscriptDivider(allocator: std.mem.Allocator, transcript: *UiTranscript, label: []const u8) !void {
@@ -1179,8 +1287,16 @@ fn buildMessageActionsData(allocator: std.mem.Allocator, transcript: *const UiTr
             continue;
         }
         if (std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockStartMarker()) or
-            std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockEndMarker()))
+            std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockEndMarker()) or
+            std.mem.eql(u8, line, repl_render_mod.transcriptUserBlockStartMarker()) or
+            std.mem.eql(u8, line, repl_render_mod.transcriptUserBlockEndMarker()))
         {
+            // r4-transcript-01: the non-legacy transcript wraps the user's
+            // raw echoed prompt in these markers instead of baking a
+            // literal "> " prefix into the content line (see
+            // appendInputLine) -- skip them here exactly like the
+            // assistant-block markers above so they never leak into a
+            // message-actions item's copied/edited content.
             continue;
         }
         if (current_label == null) continue;
@@ -1209,7 +1325,9 @@ fn buildTranscriptOverlayText(allocator: std.mem.Allocator, transcript: *const U
             continue;
         }
         if (std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockStartMarker()) or
-            std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockEndMarker()))
+            std.mem.eql(u8, line, repl_render_mod.transcriptAssistantBlockEndMarker()) or
+            std.mem.eql(u8, line, repl_render_mod.transcriptUserBlockStartMarker()) or
+            std.mem.eql(u8, line, repl_render_mod.transcriptUserBlockEndMarker()))
         {
             continue;
         }
@@ -2056,6 +2174,93 @@ fn computePromptSuggestion(example_prompt: ?[]const u8, input_text: []const u8, 
     if (input_text.len != 0) return "";
     if (submitted_prompt_count > 0) return "";
     return example_prompt orelse "";
+}
+
+/// commands-17: the /tui reply text, factored out for unit testing
+/// (the interactive line-processing loop that calls this isn't
+/// unit-testable directly). `requested` is the trimmed argument after
+/// `/tui` ("" for the bare form); `use_fullscreen` is the session's
+/// actual active renderer, decided once at startup.
+pub fn buildTuiCommandMessage(buf: []u8, requested: []const u8, use_fullscreen: bool) []const u8 {
+    const active_name: []const u8 = if (use_fullscreen) "fullscreen" else "default";
+    if (requested.len == 0) {
+        return std.fmt.bufPrint(buf, "tui renderer: {s}", .{active_name}) catch "tui renderer status unavailable";
+    }
+    if (!std.mem.eql(u8, requested, "default") and !std.mem.eql(u8, requested, "fullscreen")) {
+        return std.fmt.bufPrint(buf, "usage: /tui [default|fullscreen] (active: {s})", .{active_name}) catch "usage: /tui [default|fullscreen]";
+    }
+    if (std.mem.eql(u8, requested, active_name)) {
+        return std.fmt.bufPrint(buf, "tui renderer already {s}", .{active_name}) catch "tui renderer unchanged";
+    }
+    return std.fmt.bufPrint(
+        buf,
+        "switching the tui renderer mid-session isn't supported yet -- relaunch {s} --no-fullscreen to use the {s} renderer",
+        .{ if (std.mem.eql(u8, requested, "default")) "with" else "without", requested },
+    ) catch "switching the tui renderer mid-session isn't supported yet";
+}
+
+/// repl-ux-missed-129 / sessions-storage-11: what a given idle-composer
+/// Escape press should do, and the press-count carried into the next
+/// press. Pure so the double-tap detection/branching is unit-testable
+/// without driving the interactive key-read loop.
+pub const IdleEscapeOutcome = enum { none, show_hint, clear_input, open_rewind };
+pub const IdleEscapeDecision = struct {
+    outcome: IdleEscapeOutcome,
+    next_press_count: usize,
+};
+
+/// `now_ms`/`last_escape_ms` reset the double-tap window after 3s of
+/// inactivity, mirroring the spinner's own mid-turn escape-press counter
+/// (repl_spinner.zig) so both surfaces agree on how fast a "double tap"
+/// must be. A second press within the window either clears a non-empty
+/// draft or, when the composer is already empty, opens the rewind
+/// picker; a first press against a non-empty draft shows the "Esc again
+/// to clear" discoverability hint (edualc usePromptInputPlaceholder.ts;
+/// cc_strings.txt key:"escape-again-to-clear").
+pub fn classifyIdleEscapePress(now_ms: i64, last_escape_ms: i64, press_count_before: usize, input_is_empty: bool) IdleEscapeDecision {
+    const press_count: usize = if (now_ms - last_escape_ms > 3000) 1 else press_count_before + 1;
+    if (press_count >= 2) {
+        return .{ .outcome = if (input_is_empty) .open_rewind else .clear_input, .next_press_count = 0 };
+    }
+    return .{ .outcome = if (input_is_empty) .none else .show_hint, .next_press_count = press_count };
+}
+
+/// repl-ux-05: cap on how many once-per-second ticks the "Press up to edit
+/// queued messages" discoverability hint is shown before falling back to
+/// the normal placeholder, mirroring the reference's budgeted
+/// `queuedCommandUpHintCount` (cc_strings.txt) without needing a new
+/// persisted config key -- the budget is per-session here, reset to 0 at
+/// the start of every REPL launch.
+const QUEUED_UP_HINT_TICK_CAP: usize = 5;
+
+/// repl-ux-05 / repl-ux-09: choose the dim in-box placeholder shown while
+/// the composer is empty. Priority order:
+///  1. "Press up to edit queued messages" (edualc
+///     usePromptInputPlaceholder.ts:50-54) while there is an editable
+///     queued message and the hint hasn't exhausted its per-session budget
+///     -- beats the starter suggestion so the user learns Up recalls it.
+///  2. A "start"-tagged example prompt, wrapped in `Try "..."` the same
+///     way the one-time startup banner tip already is (cc_strings.txt:
+///     `` `Try "${sample}"` ``) -- previously shown as the bare example
+///     text with no quoting.
+///  3. A "recent"-tagged real recalled prompt shown as-is: it is an
+///     actual past prompt, not a hypothetical example, so it is not
+///     wrapped in the "Try" framing.
+fn computeIdlePlaceholder(
+    buf: []u8,
+    has_editable_queued_prompt: bool,
+    up_hint_shown_ticks: usize,
+    starter_text: []const u8,
+    starter_tag: []const u8,
+) []const u8 {
+    if (has_editable_queued_prompt and up_hint_shown_ticks < QUEUED_UP_HINT_TICK_CAP) {
+        return "Press up to edit queued messages";
+    }
+    if (starter_text.len == 0) return "";
+    if (std.mem.eql(u8, starter_tag, "start")) {
+        return std.fmt.bufPrint(buf, "Try \"{s}\"", .{starter_text}) catch starter_text;
+    }
+    return starter_text;
 }
 
 fn insertPromptAttachmentToken(
@@ -5469,10 +5674,79 @@ fn ingestTaskNotifications(
     }
 }
 
+/// r3-chrome-01: the default 2.1.261-style startup header for the
+/// fullscreen transcript -- edualc src/components/LogoV2/CondensedLogo.tsx,
+/// the layout the reference renders whenever there is nothing more urgent
+/// to say (`!hasReleaseNotes && !showOnboarding`): the three-row mascot
+/// glyph (figures.CONDENSED_LOGO_ROWS) beside "zcode vX", "<model> \xc2\xb7
+/// <provider>", and the cwd -- no card border, no "Quick reference" tips
+/// list. The project-onboarding "/init" nudge survives as a single dim
+/// line beneath the header instead of the legacy card's whole "Quick
+/// reference" section. `options.legacy_banner` (config `ui_legacy_banner`,
+/// default false) opts back into `appendWelcomeBannerLegacy` below for
+/// anyone who preferred the old card.
+fn appendWelcomeBanner(allocator: std.mem.Allocator, transcript: *UiTranscript, options: Options) !void {
+    if (options.legacy_banner) return appendWelcomeBannerLegacy(allocator, transcript, options);
+
+    const color = shouldUseColor(options);
+    const cols = repl_spinner_mod.terminalCols();
+    const lines = try repl_render_mod.buildCondensedHeaderLines(
+        allocator,
+        options.app_version,
+        options.status_model,
+        options.status_provider,
+        options.status_workspace,
+        cols,
+    );
+    defer for (lines) |line| allocator.free(line);
+
+    try transcript.appendLine(allocator, "");
+    // Row 0 ("zcode vX") reads as the product identity and is bolded, the
+    // same way the reference bolds "Claude Code" in its first info line;
+    // rows 1-2 (model/provider, cwd) are dimmed secondary detail.
+    const row_is_bold = [3]bool{ true, false, false };
+    for (0..3) |i| {
+        const glyph_row = figures.CONDENSED_LOGO_ROWS[i];
+        const rendered = if (color)
+            try std.fmt.allocPrint(allocator, "  {s}{s}{s}  {s}{s}{s}", .{
+                repl_markdown_mod.brandAccentAnsi(options),
+                glyph_row,
+                ANSI_RESET,
+                if (row_is_bold[i]) ANSI_BOLD else ANSI_DIM,
+                lines[i],
+                ANSI_RESET,
+            })
+        else
+            try std.fmt.allocPrint(allocator, "  {s}  {s}", .{ glyph_row, lines[i] });
+        defer allocator.free(rendered);
+        try transcript.appendLine(allocator, rendered);
+    }
+
+    // Same shouldShowProjectOnboarding gate as the legacy card: the nudge
+    // graduates after 4 views or once onboarding is marked complete.
+    if (options.status_workspace.len > 0 and onboarding_mod.shouldShowProjectOnboarding(allocator, options.status_workspace)) {
+        onboarding_mod.incrementSeenCount(allocator, options.status_workspace);
+        const nudge = if (color)
+            try std.fmt.allocPrint(allocator, "  {s}" ++ figures.ARROW_HOOK ++ "{s} {s}run /init to create ZCODE.md for this workspace{s}", .{
+                repl_markdown_mod.brandAccentAnsi(options), ANSI_RESET, ANSI_DIM, ANSI_RESET,
+            })
+        else
+            try allocator.dupe(u8, "  " ++ figures.ARROW_HOOK ++ " run /init to create ZCODE.md for this workspace");
+        defer allocator.free(nudge);
+        try transcript.appendLine(allocator, nudge);
+    }
+
+    try transcript.appendLine(allocator, "");
+}
+
 /// Render the launch dashboard into the fullscreen transcript. It follows
 /// modern TUI practice: a compact identity card, explicit context chips,
 /// and task-oriented commands instead of a long static help paragraph.
-fn appendWelcomeBanner(allocator: std.mem.Allocator, transcript: *UiTranscript, options: Options) !void {
+///
+/// r3-chrome-01: kept as an opt-in (`options.legacy_banner` /
+/// config `ui_legacy_banner = true`) alternative to the condensed
+/// `appendWelcomeBanner` above, which is now the 2.1.261-parity default.
+fn appendWelcomeBannerLegacy(allocator: std.mem.Allocator, transcript: *UiTranscript, options: Options) !void {
     const color = shouldUseColor(options);
     try transcript.appendLine(allocator, "");
 
@@ -5718,11 +5992,88 @@ fn appendWelcomeTip(allocator: std.mem.Allocator, transcript: *UiTranscript, col
     try transcript.appendLine(allocator, line);
 }
 
-/// Write a compact welcome header for the non-fullscreen / piped-output
-/// path. Same content as the fullscreen banner but collapsed to a single
-/// accent line and three info rows so it stays readable when redirected
-/// to a log or pager.
+fn writeWelcomeHeaderRow(writer: anytype, color: bool, label: []const u8, value: []const u8) !void {
+    if (value.len == 0) return;
+    if (color) {
+        try writer.print("    {s}\xe2\x94\x82{s}   {s}{s: <9}{s}  {s}\n", .{ ANSI_DIM, ANSI_RESET, ANSI_DIM, label, ANSI_RESET, value });
+    } else {
+        try writer.print("    |   {s: <9}  {s}\n", .{ label, value });
+    }
+}
+
+fn writeWelcomeHeaderCommand(writer: anytype, color: bool, options: Options, command: []const u8, description: []const u8) !void {
+    if (color) {
+        try writer.print("      {s}{s: <10}{s}  {s}{s}{s}\n", .{
+            repl_markdown_mod.brandAccentBoldAnsi(options), command, ANSI_RESET, ANSI_DIM, description, ANSI_RESET,
+        });
+    } else {
+        try writer.print("      {s: <10}  {s}\n", .{ command, description });
+    }
+}
+
+/// r3-chrome-01: the non-fullscreen / piped-output twin of the condensed
+/// `appendWelcomeBanner` above -- same three-row glyph + info-line layout,
+/// same single-line onboarding nudge, no card border or "Quick reference"
+/// list. `options.legacy_banner` opts back into `writeWelcomeHeaderLegacy`.
 fn writeWelcomeHeader(allocator: std.mem.Allocator, writer: anytype, options: Options) !void {
+    if (options.legacy_banner) return writeWelcomeHeaderLegacy(allocator, writer, options);
+
+    const color = shouldUseColor(options);
+    const cols = repl_spinner_mod.terminalCols();
+    const lines = try repl_render_mod.buildCondensedHeaderLines(
+        allocator,
+        options.app_version,
+        options.status_model,
+        options.status_provider,
+        options.status_workspace,
+        cols,
+    );
+    defer for (lines) |line| allocator.free(line);
+
+    try writer.writeAll("\n");
+    const row_is_bold = [3]bool{ true, false, false };
+    for (0..3) |i| {
+        const glyph_row = figures.CONDENSED_LOGO_ROWS[i];
+        if (color) {
+            try writer.print("  {s}{s}{s}  {s}{s}{s}\n", .{
+                repl_markdown_mod.brandAccentAnsi(options),
+                glyph_row,
+                ANSI_RESET,
+                if (row_is_bold[i]) ANSI_BOLD else ANSI_DIM,
+                lines[i],
+                ANSI_RESET,
+            });
+        } else {
+            try writer.print("  {s}  {s}\n", .{ glyph_row, lines[i] });
+        }
+    }
+
+    const needs_instruction_file = options.status_workspace.len > 0 and
+        onboarding_mod.shouldShowProjectOnboarding(allocator, options.status_workspace);
+    if (needs_instruction_file) {
+        onboarding_mod.incrementSeenCount(allocator, options.status_workspace);
+        if (color) {
+            try writer.print("  {s}" ++ figures.ARROW_HOOK ++ "{s} {s}run /init to create ZCODE.md for this workspace{s}\n", .{
+                repl_markdown_mod.brandAccentAnsi(options), ANSI_RESET, ANSI_DIM, ANSI_RESET,
+            });
+        } else {
+            try writer.writeAll("  " ++ figures.ARROW_HOOK ++ " run /init to create ZCODE.md for this workspace\n");
+        }
+    }
+    try writer.writeAll("\n");
+}
+
+/// Write the welcome header for the non-fullscreen / piped-output path.
+/// repl-ux-10: previously a plain 4-line dump with none of the fullscreen
+/// banner's card border, "Quick reference" section, or git-history `Try
+/// "..."` tip; now ports that same structure so every real terminal
+/// session (including one downgraded from fullscreen, e.g. a small
+/// terminal) sees a consistent welcome surface.
+///
+/// r3-chrome-01: kept as an opt-in (`options.legacy_banner` / config
+/// `ui_legacy_banner = true`) alternative to the condensed
+/// `writeWelcomeHeader` above, which is now the 2.1.261-parity default.
+fn writeWelcomeHeaderLegacy(allocator: std.mem.Allocator, writer: anytype, options: Options) !void {
     const color = shouldUseColor(options);
     // Same shouldShowProjectOnboarding gate as the fullscreen banner: the
     // nudge graduates after 4 views or once onboarding is marked complete.
@@ -5731,12 +6082,18 @@ fn writeWelcomeHeader(allocator: std.mem.Allocator, writer: anytype, options: Op
     if (needs_instruction_file) {
         onboarding_mod.incrementSeenCount(allocator, options.status_workspace);
     }
+
+    var model_value_buf: [160]u8 = undefined;
+    const model_value = std.fmt.bufPrint(&model_value_buf, "{s}/{s}", .{ options.status_provider, options.status_model }) catch options.status_model;
+
+    try writer.writeAll("\n");
     if (color) {
-        try writer.print("\n  {s}{s}{s} {s}zcode{s} {s}v{s}{s}  {s}terminal workbench for agentic code tasks{s}\n", .{
-            repl_markdown_mod.brandAccentAnsi(options),
-            figures.BLACK_DIAMOND,
+        try writer.print("    {s}\xe2\x95\xad" ++ ("\xe2\x94\x80" ** 66) ++ "\xe2\x95\xae{s}\n", .{ repl_markdown_mod.brandAccentDimAnsi(options), ANSI_RESET });
+        try writer.print("    {s}\xe2\x94\x82{s}  {s}{s} zcode{s} {s}v{s}{s}  {s}terminal workbench for agentic code{s}\n", .{
+            repl_markdown_mod.brandAccentDimAnsi(options),
             ANSI_RESET,
-            ANSI_BOLD,
+            repl_markdown_mod.brandAccentBoldAnsi(options),
+            figures.BLACK_DIAMOND,
             ANSI_RESET,
             ANSI_DIM,
             options.app_version,
@@ -5744,24 +6101,64 @@ fn writeWelcomeHeader(allocator: std.mem.Allocator, writer: anytype, options: Op
             ANSI_DIM,
             ANSI_RESET,
         });
-        try writer.print("  {s}workspace{s} {s}\n", .{ ANSI_DIM, ANSI_RESET, options.status_workspace });
-        try writer.print("  {s}model    {s} {s}/{s}\n", .{ ANSI_DIM, ANSI_RESET, options.status_provider, options.status_model });
-        try writer.print("  {s}safety   {s} {s}\n\n", .{ ANSI_DIM, ANSI_RESET, options.status_approval_mode });
-        if (needs_instruction_file) {
+    } else {
+        try writer.print("    +" ++ ("-" ** 66) ++ "+\n", .{});
+        try writer.print("    |  * zcode v{s}  terminal workbench for agentic code\n", .{options.app_version});
+    }
+    try writeWelcomeHeaderRow(writer, color, "workspace", options.status_workspace);
+    try writeWelcomeHeaderRow(writer, color, "model", model_value);
+    try writeWelcomeHeaderRow(writer, color, "safety", options.status_approval_mode);
+    if (color) {
+        try writer.print("    {s}\xe2\x95\xb0" ++ ("\xe2\x94\x80" ** 66) ++ "\xe2\x95\xaf{s}\n\n", .{ repl_markdown_mod.brandAccentDimAnsi(options), ANSI_RESET });
+    } else {
+        try writer.print("    +" ++ ("-" ** 66) ++ "+\n\n", .{});
+    }
+
+    if (color) {
+        try writer.print("    {s}{s}{s} {s}Quick reference{s}\n", .{ repl_markdown_mod.brandAccentAnsi(options), figures.BLOCKQUOTE_BAR, ANSI_RESET, ANSI_BOLD, ANSI_RESET });
+    } else {
+        try writer.print("    {s} Quick reference\n", .{figures.BLOCKQUOTE_BAR});
+    }
+    try writeWelcomeHeaderCommand(writer, color, options, "type", "ask a task in plain English, then press Enter");
+    try writeWelcomeHeaderCommand(writer, color, options, "@file", "attach a file as context");
+    try writeWelcomeHeaderCommand(writer, color, options, "/", "browse commands; / + i for /init, / + h for help");
+    try writeWelcomeHeaderCommand(writer, color, options, options.ui_leader_key, "command palette (h), pick model (m), sessions (s)");
+    try writeWelcomeHeaderCommand(writer, color, options, "Esc Esc", "cancel turn  \xe2\x80\xa2  Ctrl+C x3 to exit");
+
+    // Same git-history example tip as the fullscreen banner
+    // (core/example_commands.zig). Best-effort: silently skipped when
+    // unavailable (no git repo, no candidates, etc).
+    if (options.status_workspace.len > 0) {
+        const example_commands = @import("../core/example_commands.zig");
+        if (example_commands.getExamplePrompt(allocator, options.status_workspace) catch null) |prompt| {
+            defer allocator.free(prompt);
+            var tip_buf: [512]u8 = undefined;
+            const tip = std.fmt.bufPrint(&tip_buf, "Try \"{s}\"", .{prompt}) catch "";
+            if (tip.len > 0) {
+                if (color) {
+                    try writer.print("      {s}" ++ figures.BULLET ++ "{s} {s}{s}{s}\n", .{ repl_markdown_mod.brandAccentAnsi(options), ANSI_RESET, ANSI_DIM, tip, ANSI_RESET });
+                } else {
+                    try writer.print("      " ++ figures.BULLET ++ " {s}\n", .{tip});
+                }
+            }
+        }
+    }
+    try writer.writeAll("\n");
+
+    if (needs_instruction_file) {
+        if (color) {
             try writer.print(
-                "  {s}" ++ figures.ARROW_HOOK ++ "{s} {s}run /init to create ZCODE.md for this workspace (/onboarding shows setup help){s}\n",
+                "  {s}" ++ figures.ARROW_HOOK ++ "{s} {s}run /init to create ZCODE.md for this workspace (/onboarding shows setup help){s}\n\n",
                 .{ repl_markdown_mod.brandAccentAnsi(options), ANSI_RESET, ANSI_DIM, ANSI_RESET },
             );
+        } else {
+            try writer.print("  " ++ figures.ARROW_HOOK ++ " run /init to create ZCODE.md for this workspace (/onboarding shows setup help)\n\n", .{});
         }
+    }
+
+    if (color) {
         try writer.print("  {s}Enter submit  " ++ figures.BULLET_OPERATOR ++ "  Shift+Enter newline  " ++ figures.BULLET_OPERATOR ++ "  Ctrl+X H palette  " ++ figures.BULLET_OPERATOR ++ "  ? shortcuts{s}\n\n", .{ ANSI_DIM, ANSI_RESET });
     } else {
-        try writer.print("\n  * zcode v{s}  terminal workbench for agentic code tasks\n", .{options.app_version});
-        try writer.print("  workspace: {s}\n", .{options.status_workspace});
-        try writer.print("      model: {s}/{s}\n", .{ options.status_provider, options.status_model });
-        try writer.print("     safety: {s}\n\n", .{options.status_approval_mode});
-        if (needs_instruction_file) {
-            try writer.print("  " ++ figures.ARROW_HOOK ++ " run /init to create ZCODE.md for this workspace (/onboarding shows setup help)\n", .{});
-        }
         try writer.print("  Enter submit | Shift+Enter newline | Ctrl+X H palette | ? shortcuts\n\n", .{});
     }
 }
@@ -5811,6 +6208,38 @@ fn emitTurnProgressClear(writer: anytype) void {
 /// `false` when the workspace is already trusted, the user accepted, or there
 /// was nothing to show. On accept, trust is persisted via `trust.allow` so a
 /// trusted repo never re-prompts.
+// repl-ux-08: reference-style trust-gate copy (cc_strings.txt: "Accessing
+// workspace:" title; "Quick safety check: Is this a project you created or
+// one you trust? (Like your own code, a well-known open source project, or
+// work from your team). If not, take a moment to review what's in this
+// folder first." opening sentence; "These will apply without asking. Only
+// proceed if you trust this configuration." closing caveat; "Yes, I trust
+// this folder" affirmative option) -- factored into named constants and a
+// pure body-line composer so the copy is unit-testable without driving the
+// interactive overlay loop.
+const TRUST_GATE_TITLE: []const u8 = "Accessing workspace:";
+const TRUST_GATE_INTRO: []const u8 =
+    "Quick safety check: Is this a project you created or one you trust? " ++
+    "(Like your own code, a well-known open source project, or work from " ++
+    "your team). If not, take a moment to review what's in this folder first.";
+const TRUST_GATE_CLOSING: []const u8 = "These will apply without asking. Only proceed if you trust this configuration.";
+const TRUST_GATE_CHOICES = [_][]const u8{ "No, exit", "Yes, I trust this folder" };
+
+/// Assemble the trust-gate body: the safety-check intro, a blank line, the
+/// per-capability bullet lines (or a fallback line when there are none),
+/// a blank line, then the closing "applies without asking" caveat.
+fn buildTrustGateBodyLines(list: *std.array_list.Managed([]const u8), capability_lines: []const []const u8) void {
+    list.append(TRUST_GATE_INTRO) catch {};
+    list.append("") catch {};
+    if (capability_lines.len == 0) {
+        list.append("No project MCP servers, hooks, or command helpers detected.") catch {};
+    } else {
+        for (capability_lines) |l| list.append(l) catch {};
+    }
+    list.append("") catch {};
+    list.append(TRUST_GATE_CLOSING) catch {};
+}
+
 fn runTrustGate(allocator: std.mem.Allocator, cwd: []const u8, bottom_margin_rows: usize) !bool {
     // Fast path: a workspace already in the user trust store never re-prompts
     // (the `checkHasTrustDialogAccepted` equivalent).
@@ -5835,17 +6264,12 @@ fn runTrustGate(allocator: std.mem.Allocator, cwd: []const u8, bottom_margin_row
     // Build the borrowed const view the overlay expects.
     var body_view = std.array_list.Managed([]const u8).init(allocator);
     defer body_view.deinit();
-    if (body_lines.len == 0) {
-        body_view.append("No project MCP servers, hooks, or command helpers detected.") catch {};
-    } else {
-        for (body_lines) |l| body_view.append(l) catch {};
-    }
+    buildTrustGateBodyLines(&body_view, body_lines);
 
-    const choices = [_][]const u8{ "No, exit", "Yes, proceed" };
     const selected = repl_overlay_mod.runTrustGateOverlayLoop(
-        "Do you trust the files in this folder?",
+        TRUST_GATE_TITLE,
         body_view.items,
-        &choices,
+        &TRUST_GATE_CHOICES,
         bottom_margin_rows,
     ) catch return true; // a read error on the gate declines (safe default).
 
@@ -5941,7 +6365,7 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
     var trust_declined = false;
     defer if (trust_declined) {
         const msg = "zcode: exited without starting -- this folder is not trusted.\n" ++
-            "  Run zcode again and choose \"Yes, proceed\" to trust it for future sessions,\n" ++
+            "  Run zcode again and choose \"Yes, I trust this folder\" to trust it for future sessions,\n" ++
             "  or trust it up front with: zcode trust allow .\n";
         _ = std.c.write(std.Io.File.stderr().handle, msg.ptr, msg.len);
     };
@@ -6152,6 +6576,34 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
     var footer_tmux_state_buf: [48]u8 = undefined;
     var footer_worktree_state_buf: [48]u8 = undefined;
     var footer_state_refresh_at_ms: i64 = 0;
+    // config-layout-16: a `statusLine` object anywhere in the settings.json
+    // cascade (read once at session start -- it does not change mid-session
+    // without a restart, matching how the rest of `options` is seeded from
+    // `cfg`). By the time `run()` reaches here the workspace-trust gate
+    // above has already accepted or exited on any project-scope settings
+    // source, so running the configured command needs no further trust
+    // check of its own (the same assumption other workspace-provided
+    // executable content, like hooks, already relies on post-trust-gate).
+    var status_line_cfg: ?status_line_mod.StatusLineConfig = status_line_mod.readConfig(allocator, options.status_workspace) catch null;
+    defer if (status_line_cfg) |*c| c.deinit(allocator);
+    var status_line_paths: ?paths_mod.PathSet = if (status_line_cfg != null) (paths_mod.resolve(allocator) catch null) else null;
+    defer if (status_line_paths) |*p| p.deinit(allocator);
+    var status_line_text_owned: ?[]u8 = null;
+    defer if (status_line_text_owned) |b| allocator.free(b);
+    var status_line_next_refresh_ms: i64 = 0;
+    // repl-ux-05: once-per-session budget for the "Press up to edit queued
+    // messages" placeholder hint, ticked at most once per second (piggy-
+    // backing the existing footer-state refresh cadence below) and only
+    // while the hint is actually the one being shown.
+    var queued_up_hint_ticks: usize = 0;
+    // repl-ux-missed-129 / sessions-storage-11: idle-composer double-Escape
+    // state. Mirrors the 3-second reset window the spinner's own mid-turn
+    // escape-press counter already uses (repl_spinner.zig), kept as a
+    // separate counter since these two gate different actions (clear the
+    // draft vs. cancel an in-flight turn) and this one only fires when the
+    // prompt is idle and empty of any overlay/selection.
+    var idle_escape_press_count: usize = 0;
+    var idle_last_escape_ms: i64 = 0;
     var prompt_surface_selection: ?usize = null;
     var prompt_frame_current = false;
 
@@ -6219,6 +6671,11 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             }
         } else if (use_fullscreen) {
             while (true) {
+                // repl-ux-01: keep the footer's persistent permission-mode
+                // chip in sync with the live cycle var every render tick
+                // (Shift+Tab in the idle composer, or inside the approval
+                // overlay via the shared pointer, can change it between ticks).
+                options.live_permission_mode = permission_mode;
                 var merged_hint_buf: [320]u8 = undefined;
                 var default_input_hint_buf: [128]u8 = undefined;
                 const live_input_hint = if (input_hint_len > 0)
@@ -6257,6 +6714,41 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                 const now_ms = clock.nowMillis();
                 if (now_ms >= footer_state_refresh_at_ms) {
                     footer_state_refresh_at_ms = now_ms + 1000;
+                    // repl-ux-05: tick the "Press up to edit queued messages"
+                    // hint budget once per second, only while it is the hint
+                    // actually being shown (queue non-empty, input empty) --
+                    // matches the reference's budgeted-then-fades behavior
+                    // without redrawing-the-frame-is-a-tick semantics, which
+                    // would exhaust the budget in well under a second.
+                    if (queued_prompt_backlog.count() > 0 and input_buf.items().len == 0) {
+                        queued_up_hint_ticks += 1;
+                    }
+                    if (status_line_cfg) |cfg| {
+                        if (status_line_paths) |paths_set| {
+                            if (now_ms >= status_line_next_refresh_ms) {
+                                const refresh_s: i64 = if (cfg.refresh_interval_s) |r| @max(r, 1) else 1;
+                                status_line_next_refresh_ms = now_ms + refresh_s * 1000;
+                                const rendered = status_line_mod.run(
+                                    allocator,
+                                    cfg,
+                                    options.status_workspace,
+                                    paths_set.zcode_home,
+                                    .{
+                                        .cwd = options.status_workspace,
+                                        .current_dir = options.status_workspace,
+                                        .project_dir = options.status_workspace,
+                                        .model_id = options.status_model,
+                                        .model_display_name = options.status_model,
+                                        .version = options.app_version,
+                                    },
+                                    2000,
+                                ) catch null;
+                                if (status_line_text_owned) |old| allocator.free(old);
+                                status_line_text_owned = rendered;
+                                options.status_line_text = status_line_text_owned orelse "";
+                            }
+                        }
+                    }
                     options.footer_tasks_state = fetchCompactFooterState(allocator, handler, "__tasks_footer_state", footer_tasks_state_buf[0..]);
                     options.footer_teams_state = fetchCompactFooterState(allocator, handler, "__teams_footer_state", footer_teams_state_buf[0..]);
                     options.footer_bridge_state = fetchCompactFooterState(allocator, handler, "__bridge_footer_state", footer_bridge_state_buf[0..]);
@@ -6310,7 +6802,12 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                     appendReferenceFooterRows(&footer_rows, reference_suggestions.visible(), reference_suggestion_selection);
                 } else if (slash_suggestion_count > 0) {
                     appendCommandFooterRows(&footer_rows, command_suggestions.visible(), slash_suggestion_selection);
-                } else {
+                } else if (starter_suggestions.count > 1) {
+                    // repl-ux-09: with exactly one starter suggestion, this
+                    // footer row would duplicate the in-box ghost placeholder
+                    // below verbatim. Only show the dropdown once there is a
+                    // second option (the recent-history suggestion) actually
+                    // worth picking between.
                     appendStarterFooterRows(&footer_rows, starter_suggestions.visible(), starter_suggestion_selection);
                 }
                 if (prompt_surface_selection) |selected_idx| {
@@ -6333,10 +6830,14 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                     queued_prompt_restore_to_editor,
                     plan_approved_pending,
                 );
-                options.prompt_suggestion = if (starter_suggestions.count > 0)
-                    starter_suggestions.items[@min(starter_suggestion_selection, starter_suggestions.count - 1)].text
-                else
-                    "";
+                var idle_placeholder_buf: [220]u8 = undefined;
+                options.prompt_suggestion = computeIdlePlaceholder(
+                    &idle_placeholder_buf,
+                    queued_prompt_backlog.count() > 0 and input_buf.items().len == 0,
+                    queued_up_hint_ticks,
+                    if (starter_suggestions.count > 0) starter_suggestions.items[@min(starter_suggestion_selection, starter_suggestions.count - 1)].text else "",
+                    if (starter_suggestions.count > 0) starter_suggestions.items[@min(starter_suggestion_selection, starter_suggestions.count - 1)].tag else "",
+                );
                 options.prompt_placeholder = "";
                 var inline_ghost_buf: [256]u8 = undefined;
                 options.inline_ghost_text = if (reference_suggestion_count > 0)
@@ -6521,6 +7022,64 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                             }
                             syncVimUiState(&options, &vim_state, &input_buf, &input_cursor);
                             setHint(&input_hint_buf, &input_hint_len, options.input_mode_label);
+                            resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
+                            resetReferenceSuggestionSelection(&reference_suggestion_selection, &reference_suggestion_selection_touched);
+                            continue;
+                        }
+
+                        // repl-ux-missed-129 / sessions-storage-11: a second
+                        // Escape within 3s at the idle, non-overlay composer
+                        // either clears a non-empty draft (matching the
+                        // reference's "double tap esc to clear input" /
+                        // "Esc again to clear" pair) or, when the composer is
+                        // already empty, opens the rewind picker (the
+                        // reference's primary "Double-tap esc to rewind the
+                        // conversation to a previous point in time" discovery
+                        // path), independent of typing `/rewind`.
+                        const escape_now_ms = clock.nowMillis();
+                        const escape_decision = classifyIdleEscapePress(
+                            escape_now_ms,
+                            idle_last_escape_ms,
+                            idle_escape_press_count,
+                            input_buf.items().len == 0,
+                        );
+                        idle_escape_press_count = escape_decision.next_press_count;
+                        idle_last_escape_ms = escape_now_ms;
+
+                        switch (escape_decision.outcome) {
+                            .none => {},
+                            .show_hint => setHint(&input_hint_buf, &input_hint_len, "Esc again to clear"),
+                            .clear_input => {
+                                try prompt_undo.snapshot(allocator, input_buf.items(), input_cursor);
+                                input_buf.clearRetainingCapacity();
+                                input_cursor = 0;
+                                syncVimUiState(&options, &vim_state, &input_buf, &input_cursor);
+                                prompt_history.resetBrowse(allocator);
+                                clearHint(&input_hint_len);
+                                queued_prompt_restored_draft = false;
+                            },
+                            .open_rewind => {
+                                if (use_fullscreen and handler.command != null) {
+                                    try runRewindSelectorUi(
+                                        allocator,
+                                        writer,
+                                        &transcript,
+                                        &input_buf,
+                                        &input_cursor,
+                                        &prompt_attachments,
+                                        &prompt_history,
+                                        &prompt_undo,
+                                        &input_hint_buf,
+                                        &input_hint_len,
+                                        &runtime_hint_buf,
+                                        &runtime_hint_len,
+                                        scroll_offset,
+                                        mode,
+                                        options,
+                                        handler,
+                                    );
+                                }
+                            },
                         }
                         resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
                         resetReferenceSuggestionSelection(&reference_suggestion_selection, &reference_suggestion_selection_touched);
@@ -6792,23 +7351,58 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                         }
                         if (reference_suggestion_count > 0) {
                             try prompt_undo.snapshot(allocator, input_buf.items(), input_cursor);
-                            if (try acceptSelectedReferenceSuggestion(&input_buf, &input_cursor, &reference_suggestions, reference_suggestion_selection)) {
-                                prompt_history.resetBrowse(allocator);
-                                clearHint(&input_hint_len);
-                            }
+                            const changed = try acceptSelectedReferenceSuggestion(&input_buf, &input_cursor, &reference_suggestions, reference_suggestion_selection);
                             resetReferenceSuggestionSelection(&reference_suggestion_selection, &reference_suggestion_selection_touched);
                             resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
-                            continue;
-                        }
-                        if (slash_suggestion_count > 0) {
-                            if (try acceptSelectedCommandSuggestion(&input_buf, &input_cursor, &command_suggestions, slash_suggestion_selection)) {
+                            if (changed) {
                                 prompt_history.resetBrowse(allocator);
                                 clearHint(&input_hint_len);
+                                continue;
                             }
+                            // r3-mock-01: `changed == false` means the buffer
+                            // already exactly equals the selected reference
+                            // (nothing left to complete) -- fall through to the
+                            // same submit below instead of looping on `continue`
+                            // forever. See the slash_suggestion_count branch
+                            // below for the full explanation.
+                        } else if (slash_suggestion_count > 0) {
+                            const changed = try acceptSelectedCommandSuggestion(&input_buf, &input_cursor, &command_suggestions, slash_suggestion_selection);
                             resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
+                            if (changed) {
+                                prompt_history.resetBrowse(allocator);
+                                clearHint(&input_hint_len);
+                                continue;
+                            }
+                            // r3-mock-01: while any command/reference/starter
+                            // suggestion is visible, `prompt_context` resolves to
+                            // `.PromptSuggestions` (see the `prompt_context` blk
+                            // above) whose default "enter" binding is
+                            // `.prompt_open`, not `.submit` -- so a fully-typed
+                            // slash command NEVER reaches the `.submit` case's
+                            // dispatch pipeline while its own suggestion row is
+                            // still showing. Since a command's suggestion text
+                            // matches the typed command itself, that row never
+                            // goes away on its own, so every previous Enter press
+                            // here just called `acceptSelectedCommandSuggestion`
+                            // (a no-op once the text already matches: it returns
+                            // `false` and leaves the buffer untouched) and
+                            // `continue`d -- meaning commands like `/exit` or
+                            // `/help` could never actually run: each Enter press
+                            // silently re-affirmed the identical suggestion
+                            // forever. `changed == false` is exactly the signal
+                            // that there is nothing left to accept, so treat this
+                            // Enter as a real submit instead, through the same
+                            // `owned_line` -> `line` pipeline every other submit
+                            // path (queued prompts, bound commands, the
+                            // non-fullscreen fallback) already uses.
+                        } else {
                             continue;
                         }
-                        continue;
+                        owned_line = try allocator.dupe(u8, input_buf.items());
+                        input_buf.clearRetainingCapacity();
+                        input_cursor = 0;
+                        prompt_history.resetBrowse(allocator);
+                        break;
                     },
                     .backspace => {
                         if (vim_state.enabled and vim_state.mode == .normal) {
@@ -6997,10 +7591,30 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                         continue;
                     },
                     .toggle_mode => {
-                        mode = togglePrimaryMode(mode);
-                        var hint_buf: [128]u8 = undefined;
-                        const hint = std.fmt.bufPrint(&hint_buf, "mode switched to {s}", .{modeLabel(mode)}) catch "mode switched";
-                        setHint(&input_hint_buf, &input_hint_len, hint);
+                        // repl-ux-01: Claude Code's idle-composer Shift+Tab
+                        // cycles the persistent permission-mode chip
+                        // (default -> accept edits on -> plan mode on ->
+                        // auto mode on -> default), not a session mode. Give
+                        // it that reference behavior whenever the session has
+                        // opted into reference-style permission modes
+                        // (permission_mode_active); legacy tiered-auto/
+                        // manual/strict sessions keep zcode's own
+                        // execution/planning/brainstorm/review toggle
+                        // unchanged (still reachable via `/mode <name>`).
+                        if (permission_mode_active) {
+                            const permission_mode_cycle = @import("../core/permission_mode_cycle.zig");
+                            permission_mode = permission_mode_cycle.getNext(permission_mode, options.yolo_mode);
+                            options.live_permission_mode = permission_mode;
+                            pushPermissionModeToRuntime(handler, allocator, permission_mode);
+                            var hint_buf: [128]u8 = undefined;
+                            const hint = std.fmt.bufPrint(&hint_buf, "permission mode: {s}", .{permission_mode_cycle.shortLabel(permission_mode)}) catch "permission mode switched";
+                            setHint(&input_hint_buf, &input_hint_len, hint);
+                        } else {
+                            mode = togglePrimaryMode(mode);
+                            var hint_buf: [128]u8 = undefined;
+                            const hint = std.fmt.bufPrint(&hint_buf, "mode switched to {s}", .{modeLabel(mode)}) catch "mode switched";
+                            setHint(&input_hint_buf, &input_hint_len, hint);
+                        }
                         resetSlashSuggestionSelection(&slash_suggestion_selection, &slash_suggestion_selection_touched);
                         continue;
                     },
@@ -7914,9 +8528,46 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                 synthetic_prompt = try std.fmt.allocPrint(allocator, "{s} [yolo] auto-approved plan -> executing", .{options.prompt_label});
                 try transcript.appendLine(allocator, synthetic_prompt.?);
             } else {
-                try appendInputLine(allocator, &transcript, options.prompt_label, line);
+                try appendInputLine(allocator, &transcript, options.prompt_label, line, options.ui_legacy_transcript);
             }
             try renderFullScreen(writer, &transcript, false, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+        }
+
+        // commands-12: `/background` (alias `/bg`) sends this session
+        // detached and frees the terminal, matching the reference's
+        // local-jsx command of the same name. Dispatched through the normal
+        // command callback (repl_commands_parity.zig actually spawns the
+        // detached re-`--resume`'d process and builds the pid/logs/kill
+        // hint), then this REPL loop tears down exactly like `/exit` --
+        // minus the worktree-cleanup prompt and goodbye line, which are
+        // `/exit`-specific and not relevant to a session that keeps running.
+        if (std.mem.eql(u8, line, "/background") or std.mem.startsWith(u8, line, "/background ") or
+            std.mem.eql(u8, line, "/bg") or std.mem.startsWith(u8, line, "/bg "))
+        {
+            if (handler.command) |cmd_cb| {
+                const maybe_output = cmd_cb(handler.ctx, allocator, line) catch |err| {
+                    try writer.print("error: {s}\n", .{@errorName(err)});
+                    continue;
+                };
+                defer if (maybe_output) |output| allocator.free(output);
+                if (use_fullscreen) {
+                    fullscreen_active = false;
+                    raw_mode.disable();
+                }
+                // commands-12 fix: leave the alt screen BEFORE printing the
+                // pid/logs/kill hint, matching /exit's own convention just
+                // below -- see `writeAltScreenThenOutput`'s doc comment for
+                // why the previous (output-then-leave) order silently
+                // dropped the hint.
+                try writeAltScreenThenOutput(writer, use_fullscreen, maybe_output);
+                return;
+            }
+            if (use_fullscreen) {
+                fullscreen_active = false;
+                raw_mode.disable();
+                try leaveAltScreen(writer);
+            }
+            return;
         }
 
         if (std.mem.eql(u8, line, "/exit") or std.mem.eql(u8, line, "/quit")) {
@@ -7967,7 +8618,27 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             // custom commands and skills so they are discoverable without first
             // running /help commands. status_workspace is the workspace root.
             const help_cwd = if (options.status_workspace.len > 0) options.status_workspace else ".";
-            if (use_fullscreen) {
+            if (use_fullscreen and !options.ui_legacy_transcript) {
+                // r4-help-01: HelpV2.tsx's tabbed dialog ("<product>
+                // v<version>" title, general | commands | custom-commands
+                // tabs) instead of a flat ~100-row dump appended to the
+                // scrolling transcript. `ui_legacy_transcript = true`
+                // keeps the old flat dump reachable below.
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const arena_alloc = arena.allocator();
+                const command_lines = repl_help_mod.buildHelpOverlayCommandLines(arena_alloc) catch &[_]repl_help_mod.HelpOverlayLine{};
+                const custom_lines = repl_help_mod.buildHelpOverlayCustomLines(arena_alloc, help_cwd) catch &[_]repl_help_mod.HelpOverlayLine{};
+                const help_data = repl_overlay_mod.HelpOverlayData{
+                    .app_name = "zcode",
+                    .app_version = options.app_version,
+                    .general_lines = repl_help_mod.helpOverlayGeneralLines(),
+                    .command_lines = command_lines,
+                    .custom_lines = custom_lines,
+                };
+                repl_overlay_mod.runHelpOverlayLoop(help_data, options.keybindings) catch {};
+                try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+            } else if (use_fullscreen) {
                 var help_buf = std_io.StringBuilder.init(allocator);
                 defer help_buf.deinit();
                 try repl_help_mod.writeOverviewScreen(help_buf.writer(), false);
@@ -8005,6 +8676,23 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                 try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
             } else {
                 try repl_help_mod.writeHelpScreenWithDynamic(writer, allocator, help_cwd, shouldUseColor(options));
+            }
+            continue;
+        }
+
+        // commands-37: /help all -- the same catalog, but also including the
+        // zcode-only extras (and non-canonical spellings) the default
+        // catalog above hides. Every one of them still dispatches normally;
+        // this only restores their listing.
+        if (std.mem.eql(u8, line, "/help all")) {
+            const help_cwd = if (options.status_workspace.len > 0) options.status_workspace else ".";
+            if (use_fullscreen) {
+                const help_plain = try repl_help_mod.buildPlaintextWithDynamicAll(allocator, help_cwd);
+                defer allocator.free(help_plain);
+                try appendTranscriptSectionText(allocator, &transcript, "Help Commands (all)", help_plain);
+                try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+            } else {
+                try repl_help_mod.writeHelpScreenWithDynamicAll(writer, allocator, help_cwd, shouldUseColor(options));
             }
             continue;
         }
@@ -8172,6 +8860,46 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             continue;
         }
 
+        // commands-16: /focus, a second, distinct view-mode toggle from
+        // zcode's existing /brief (cc_commands_full.json: "Toggle focus
+        // view: just your prompt, summary, and response"). Session-only
+        // (unlike /brief it is not persisted to config), handled inline
+        // the same way /mode is: no repl_commands.zig dispatch needed.
+        if (std.mem.eql(u8, line, "/focus")) {
+            options.focus_mode = !options.focus_mode;
+            var msg_buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "focus view: {s}", .{if (options.focus_mode) "on" else "off"}) catch "focus view toggled";
+            if (use_fullscreen) {
+                try transcript.appendLine(allocator, msg);
+                try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+            } else {
+                try writer.print("{s}\n", .{msg});
+            }
+            continue;
+        }
+
+        // commands-17: /tui [default|fullscreen] -- "Set the terminal UI
+        // renderer (default | fullscreen)". `use_fullscreen` is decided
+        // once at startup from --no-fullscreen/config/terminal capability
+        // and threads through the whole session (raw single-byte reads +
+        // alt-screen vs. buffered line reads), so a genuine live swap mid-
+        // session is out of scope for this pass; `/tui` reports the active
+        // renderer accurately and, when asked for the other one, says so
+        // plainly (with the flag to relaunch with) rather than silently
+        // no-oping or pretending to switch.
+        if (std.mem.eql(u8, line, "/tui") or std.mem.startsWith(u8, line, "/tui ")) {
+            const requested = if (line.len > "/tui".len) std.mem.trim(u8, line["/tui".len..], " \t") else "";
+            var msg_buf: [256]u8 = undefined;
+            const msg = buildTuiCommandMessage(&msg_buf, requested, use_fullscreen);
+            if (use_fullscreen) {
+                try transcript.appendLine(allocator, msg);
+                try renderFullScreen(writer, &transcript, true, "", scroll_offset, runtime_hint_buf[0..runtime_hint_len], mode, options);
+            } else {
+                try writer.print("{s}\n", .{msg});
+            }
+            continue;
+        }
+
         if (std.mem.eql(u8, line, "/model") and use_fullscreen and handler.command != null) {
             try runModelPickerUi(
                 allocator,
@@ -8245,7 +8973,8 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
             continue;
         }
 
-        if ((std.mem.eql(u8, line, "/rewind") or std.mem.eql(u8, line, "/checkpoint")) and use_fullscreen and handler.command != null) {
+        // sessions-storage-10: /undo is the reference's alias for /rewind.
+        if ((std.mem.eql(u8, line, "/rewind") or std.mem.eql(u8, line, "/checkpoint") or std.mem.eql(u8, line, "/undo")) and use_fullscreen and handler.command != null) {
             try runRewindSelectorUi(
                 allocator,
                 writer,
@@ -8934,6 +9663,17 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
                     mode = parsed;
                 }
             }
+            // commands-34 (/goal): end-of-turn check for an active goal.
+            // Auto-queues another turn (via the existing queued_prompt
+            // mechanism -- the same one restore-on-interrupt and cron use)
+            // until the model reports the condition met, `/goal clear` runs,
+            // or the handler's own safety cap trips. Never overrides a
+            // prompt something else already queued this round.
+            if (queued_prompt == null) {
+                if (cmd_cb(handler.ctx, allocator, "__goal_nudge") catch null) |nudge| {
+                    queued_prompt = nudge;
+                }
+            }
         }
         defer allocator.free(output);
 
@@ -9081,6 +9821,7 @@ pub fn run(allocator: std.mem.Allocator, _: anytype, writer: anytype, handler: H
 }
 
 const testing = std.testing;
+const test_helpers = @import("../core/test_helpers.zig");
 
 test "autoModeConfigWrites make_default persists opt-in and default mode" {
     // ui-dialogs-03: the accept-default branch must both mark the opt-in as seen
@@ -9199,6 +9940,180 @@ test "deriveThinkingTopicTitle maps common progress text" {
     var out: [96]u8 = undefined;
     const topic = deriveThinkingTopicTitle("calling model deepseek/deepseek-chat", &out);
     try testing.expectEqualStrings("Calling Model", topic);
+}
+
+test "writeWelcomeHeader (legacy_banner=true) matches the fullscreen banner's card border and Quick reference section" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    // Empty workspace: skips the git-history tip and the /init nudge (both
+    // gated on status_workspace.len > 0), so the test stays hermetic and
+    // focuses on the always-present structure this gap is about.
+    const options = Options{
+        .app_version = "test",
+        .status_provider = "anthropic",
+        .status_model = "claude",
+        .status_workspace = "",
+        .status_approval_mode = "tiered-auto",
+        .color_enabled = false,
+        .legacy_banner = true,
+    };
+    try writeWelcomeHeader(testing.allocator, buf.writer(), options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "+----") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Quick reference") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "type") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "@file") != null);
+}
+
+test "writeWelcomeHeader (default) shows the condensed glyph header and no terminal-workbench card" {
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    const options = Options{
+        .app_version = "0.12.50",
+        .status_provider = "mock",
+        .status_model = "mock-agent",
+        .status_workspace = "",
+        .status_approval_mode = "tiered-auto",
+        .color_enabled = false,
+    };
+    try writeWelcomeHeader(testing.allocator, buf.writer(), options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "zcode v0.12.50") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mock-agent \xc2\xb7 mock") != null);
+    // The mascot glyph's five-wide filled body row.
+    try testing.expect(std.mem.indexOf(u8, out, figures.CONDENSED_LOGO_ROWS[1]) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "terminal workbench") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Quick reference") == null);
+}
+
+// identity-leak: zcode must never claim to be Claude Code or Anthropic in
+// any USER-VISIBLE surface. Source comments explaining parity intent are
+// fine (and plentiful, deliberately, throughout this file); what must
+// never appear is a rendered string a real session would print. Locks in
+// the every welcome-banner variant (condensed default, legacy inline,
+// and the fullscreen-transcript equivalents) plus the sectioned
+// /status-style panel this package owns, rather than relying solely on a
+// point-in-time grep.
+test "identity-leak: welcome banners never self-identify as Claude Code or Anthropic" {
+    const allocator = testing.allocator;
+
+    const assertClean = struct {
+        fn check(text: []const u8) !void {
+            try testing.expect(std.mem.indexOf(u8, text, "Claude Code") == null);
+            try testing.expect(std.mem.indexOf(u8, text, "Anthropic") == null);
+        }
+    }.check;
+
+    // Non-fullscreen: condensed (2.1.261-parity default) and legacy banner.
+    inline for (.{ false, true }) |legacy| {
+        var buf = std_io.StringBuilder.init(allocator);
+        defer buf.deinit();
+        const options = Options{
+            .app_version = "0.12.50",
+            .status_provider = "anthropic",
+            .status_model = "claude-opus-4-6",
+            .status_workspace = "",
+            .status_approval_mode = "tiered-auto",
+            .color_enabled = false,
+            .legacy_banner = legacy,
+        };
+        try writeWelcomeHeader(allocator, buf.writer(), options);
+        try assertClean(buf.items());
+    }
+
+    // Fullscreen-transcript equivalents (appendWelcomeBanner{,Legacy}).
+    inline for (.{ false, true }) |legacy| {
+        var transcript = UiTranscript.init(allocator, 200);
+        defer transcript.deinit(allocator);
+        const options = Options{
+            .app_version = "0.12.50",
+            .status_provider = "anthropic",
+            .status_model = "claude-opus-4-6",
+            .status_workspace = "",
+            .status_approval_mode = "tiered-auto",
+            .color_enabled = false,
+            .legacy_banner = legacy,
+        };
+        try appendWelcomeBanner(allocator, &transcript, options);
+        for (transcript.lines.items) |line| try assertClean(line);
+    }
+}
+
+test "writeWelcomeHeader (default) shows a one-line /init nudge instead of the legacy Quick-reference card" {
+    // regression fix: `writeWelcomeHeader` -> `onboarding.shouldShowProjectOnboarding`
+    // resolves the REAL `$HOME/.zcode/state.json` (paths.resolve reads the
+    // process's actual HOME) to decide whether the seen-count cap has been
+    // hit. Without a HOME override this test raced every other zcode
+    // process on the machine (including concurrent `zig build test` runs in
+    // sibling worktrees) reading/writing that SAME shared file, making the
+    // "seen_count >= 4 => hide the nudge" check flip nondeterministically
+    // (a verifier-reported flake). Point HOME at a private, empty tmp dir --
+    // matching the established `setOverride("HOME", root)` pattern already
+    // used elsewhere in this file -- so this test's state.json is nobody
+    // else's.
+    const env_mod = @import("../core/env.zig");
+    var home_tmp = testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const fake_home = try test_helpers.tmpDirCwd(testing.allocator, &home_tmp);
+    defer testing.allocator.free(fake_home);
+    try env_mod.setOverride("HOME", fake_home);
+    defer env_mod.clearOverrides();
+
+    var buf = std_io.StringBuilder.init(testing.allocator);
+    defer buf.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const options = Options{
+        .app_version = "0.12.50",
+        .status_provider = "mock",
+        .status_model = "mock-agent",
+        .status_workspace = cwd,
+        .status_approval_mode = "tiered-auto",
+        .color_enabled = false,
+    };
+    try writeWelcomeHeader(testing.allocator, buf.writer(), options);
+
+    const out = buf.items();
+    try testing.expect(std.mem.indexOf(u8, out, "run /init to create ZCODE.md") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Quick reference") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "terminal workbench") == null);
+}
+
+test "trust gate copy matches the reference's Quick-safety-check framing and I-trust-this-folder option" {
+    try testing.expectEqualStrings("Accessing workspace:", TRUST_GATE_TITLE);
+    try testing.expectEqualStrings("No, exit", TRUST_GATE_CHOICES[0]);
+    try testing.expectEqualStrings("Yes, I trust this folder", TRUST_GATE_CHOICES[1]);
+
+    var list = std.array_list.Managed([]const u8).init(testing.allocator);
+    defer list.deinit();
+    const caps = [_][]const u8{"This folder pre-approves 2 tool permission(s)"};
+    buildTrustGateBodyLines(&list, &caps);
+
+    try testing.expectEqualStrings(TRUST_GATE_INTRO, list.items[0]);
+    try testing.expect(std.mem.indexOf(u8, TRUST_GATE_INTRO, "Quick safety check") != null);
+    try testing.expectEqualStrings("This folder pre-approves 2 tool permission(s)", list.items[2]);
+    try testing.expectEqualStrings(TRUST_GATE_CLOSING, list.items[list.items.len - 1]);
+    try testing.expect(std.mem.indexOf(u8, TRUST_GATE_CLOSING, "apply without asking") != null);
+}
+
+test "trust gate body falls back to a no-capabilities line when none are detected" {
+    var list = std.array_list.Managed([]const u8).init(testing.allocator);
+    defer list.deinit();
+    const no_caps = [_][]const u8{};
+    buildTrustGateBodyLines(&list, &no_caps);
+    var found = false;
+    for (list.items) |line| {
+        if (std.mem.eql(u8, line, "No project MCP servers, hooks, or command helpers detected.")) found = true;
+    }
+    try testing.expect(found);
 }
 
 test "togglePrimaryMode cycles all three modes" {
@@ -9480,6 +10395,90 @@ test "appendStarterFooterRows marks the selected starter row" {
     try testing.expectEqualStrings("second", footer_rows.visible()[1].primary);
 }
 
+test "buildTuiCommandMessage reports the active renderer for the bare form" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("tui renderer: fullscreen", buildTuiCommandMessage(&buf, "", true));
+    try testing.expectEqualStrings("tui renderer: default", buildTuiCommandMessage(&buf, "", false));
+}
+
+test "buildTuiCommandMessage confirms a no-op when the requested renderer is already active" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("tui renderer already fullscreen", buildTuiCommandMessage(&buf, "fullscreen", true));
+    try testing.expectEqualStrings("tui renderer already default", buildTuiCommandMessage(&buf, "default", false));
+}
+
+test "buildTuiCommandMessage explains that switching mid-session isn't supported, with a relaunch hint" {
+    var buf: [256]u8 = undefined;
+    const msg = buildTuiCommandMessage(&buf, "fullscreen", false);
+    try testing.expect(std.mem.indexOf(u8, msg, "isn't supported yet") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "--no-fullscreen") != null);
+}
+
+test "buildTuiCommandMessage rejects an unknown argument with a usage line" {
+    var buf: [256]u8 = undefined;
+    const msg = buildTuiCommandMessage(&buf, "bogus", true);
+    try testing.expect(std.mem.indexOf(u8, msg, "usage: /tui") != null);
+}
+
+test "classifyIdleEscapePress shows the clear hint on the first press, then clears on the second" {
+    const first = classifyIdleEscapePress(1_000, 0, 0, false);
+    try testing.expectEqual(IdleEscapeOutcome.show_hint, first.outcome);
+    try testing.expectEqual(@as(usize, 1), first.next_press_count);
+
+    const second = classifyIdleEscapePress(1_500, 1_000, first.next_press_count, false);
+    try testing.expectEqual(IdleEscapeOutcome.clear_input, second.outcome);
+    try testing.expectEqual(@as(usize, 0), second.next_press_count);
+}
+
+test "classifyIdleEscapePress opens the rewind picker on a double-tap with an empty composer" {
+    const first = classifyIdleEscapePress(1_000, 0, 0, true);
+    try testing.expectEqual(IdleEscapeOutcome.none, first.outcome);
+    try testing.expectEqual(@as(usize, 1), first.next_press_count);
+
+    const second = classifyIdleEscapePress(1_200, 1_000, first.next_press_count, true);
+    try testing.expectEqual(IdleEscapeOutcome.open_rewind, second.outcome);
+}
+
+test "classifyIdleEscapePress resets the count once the window has elapsed" {
+    const first = classifyIdleEscapePress(1_000, 0, 0, false);
+    try testing.expectEqual(@as(usize, 1), first.next_press_count);
+
+    // Second press arrives 5s later (window is 3s) -- treated as a fresh
+    // first press, not the completion of a double-tap.
+    const late = classifyIdleEscapePress(6_000, 1_000, first.next_press_count, false);
+    try testing.expectEqual(IdleEscapeOutcome.show_hint, late.outcome);
+    try testing.expectEqual(@as(usize, 1), late.next_press_count);
+}
+
+test "computeIdlePlaceholder shows the queued-message hint before its budget is exhausted" {
+    var buf: [220]u8 = undefined;
+    const shown = computeIdlePlaceholder(&buf, true, 0, "fix lint errors", "start");
+    try testing.expectEqualStrings("Press up to edit queued messages", shown);
+
+    const still_shown = computeIdlePlaceholder(&buf, true, QUEUED_UP_HINT_TICK_CAP - 1, "fix lint errors", "start");
+    try testing.expectEqualStrings("Press up to edit queued messages", still_shown);
+}
+
+test "computeIdlePlaceholder falls back once the queued-message hint budget is exhausted or the queue is empty" {
+    var buf: [220]u8 = undefined;
+    const budget_exhausted = computeIdlePlaceholder(&buf, true, QUEUED_UP_HINT_TICK_CAP, "fix lint errors", "start");
+    try testing.expectEqualStrings("Try \"fix lint errors\"", budget_exhausted);
+
+    const queue_empty = computeIdlePlaceholder(&buf, false, 0, "fix lint errors", "start");
+    try testing.expectEqualStrings("Try \"fix lint errors\"", queue_empty);
+}
+
+test "computeIdlePlaceholder wraps a start-tagged example in Try quotes but leaves a recent prompt bare" {
+    var buf: [220]u8 = undefined;
+    const example = computeIdlePlaceholder(&buf, false, 0, "refactor src/core/format.zig", "start");
+    try testing.expectEqualStrings("Try \"refactor src/core/format.zig\"", example);
+
+    const recent = computeIdlePlaceholder(&buf, false, 0, "add a test for the parser", "recent");
+    try testing.expectEqualStrings("add a test for the parser", recent);
+
+    try testing.expectEqualStrings("", computeIdlePlaceholder(&buf, false, 0, "", ""));
+}
+
 test "extractReferenceToken finds active @file tokens" {
     const token = extractReferenceToken("inspect @src/main.zig now", "inspect @src/ma".len).?;
     try testing.expectEqual(@as(usize, 8), token.start);
@@ -9679,4 +10678,63 @@ test "inManagedWorktree detects zcode-managed worktree paths only" {
     try testing.expect(!inManagedWorktree("/home/u/proj/.zcode/sessions"));
     try testing.expect(!inManagedWorktree("/home/u/proj/worktrees/agent-x"));
     try testing.expect(!inManagedWorktree(""));
+}
+
+// ── r4-transcript-01: raw user-block markers never leak as content ──
+
+test "appendInputLine (non-legacy) wraps the raw prompt in user-block markers" {
+    const allocator = testing.allocator;
+    var transcript = UiTranscript.init(allocator, 100);
+    defer transcript.deinit(allocator);
+
+    try appendInputLine(allocator, &transcript, ">", "hello", false);
+
+    // divider, start marker, content, end marker -- exactly 4 lines, and
+    // the content line is the RAW text with no "> " baked in (the
+    // renderer draws the pointer itself).
+    try testing.expectEqual(@as(usize, 4), transcript.lines.items.len);
+    try testing.expectEqualStrings(repl_render_mod.transcriptUserBlockStartMarker(), transcript.lines.items[1]);
+    try testing.expectEqualStrings("hello", transcript.lines.items[2]);
+    try testing.expectEqualStrings(repl_render_mod.transcriptUserBlockEndMarker(), transcript.lines.items[3]);
+}
+
+test "appendInputLine (legacy) keeps the old baked-in '> text' single line" {
+    const allocator = testing.allocator;
+    var transcript = UiTranscript.init(allocator, 100);
+    defer transcript.deinit(allocator);
+
+    try appendInputLine(allocator, &transcript, ">", "hello", true);
+
+    try testing.expectEqual(@as(usize, 2), transcript.lines.items.len);
+    try testing.expectEqualStrings("> hello", transcript.lines.items[1]);
+}
+
+test "buildMessageActionsData never leaks the user-block marker strings into an item's content" {
+    const allocator = testing.allocator;
+    var transcript = UiTranscript.init(allocator, 100);
+    defer transcript.deinit(allocator);
+
+    try appendInputLine(allocator, &transcript, ">", "hello there", false);
+
+    var data = try buildMessageActionsData(allocator, &transcript, ">");
+    defer data.deinit();
+
+    try testing.expectEqual(@as(usize, 1), data.items.len);
+    try testing.expectEqual(MessageActionsItemKind.user, data.items[0].kind);
+    try testing.expectEqualStrings("hello there", data.items[0].content);
+    try testing.expect(std.mem.indexOf(u8, data.items[0].content, "[[user_block") == null);
+}
+
+test "buildTranscriptOverlayText never leaks the user-block marker strings" {
+    const allocator = testing.allocator;
+    var transcript = UiTranscript.init(allocator, 100);
+    defer transcript.deinit(allocator);
+
+    try appendInputLine(allocator, &transcript, ">", "hello there", false);
+
+    const text = try buildTranscriptOverlayText(allocator, &transcript);
+    defer allocator.free(text);
+
+    try testing.expect(std.mem.indexOf(u8, text, "hello there") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[[user_block") == null);
 }

@@ -5,6 +5,7 @@ const paths = @import("paths.zig");
 const config_parse = @import("config_parse.zig");
 const ui_theme = @import("ui_theme.zig");
 const managed_security = @import("managed_security.zig");
+const permission_decision = @import("permission_decision.zig");
 
 // Re-export parsing entry points so callers do not need to change.
 pub const load = config_parse.load;
@@ -63,6 +64,21 @@ pub const Config = struct {
     ui_density: []u8,
     ui_leader_key: []u8,
     ui_show_top_bar: bool,
+    /// r3-chrome-01: restores zcode's pre-2.1.261-parity bordered welcome
+    /// card ("terminal workbench" + "Quick reference") instead of the
+    /// condensed glyph header. Default false.
+    ui_legacy_banner: bool,
+    /// r3-chrome-03/04: restores zcode's pre-2.1.261-parity composer
+    /// border labels and two-row "actions"/"ready" footer instead of the
+    /// reference's plain rules + single "? for shortcuts" line. Default
+    /// false.
+    ui_legacy_footer: bool,
+    /// r4-transcript-01/02: restores zcode's pre-2.1.261-parity transcript
+    /// look -- a bordered "╭─ ❯ You ─..." card for the user's
+    /// turn and a "╭─ ◆ Assistant ─..." divider + bordered box for
+    /// the reply -- instead of the reference's plain "> text" / "⏺ text"
+    /// single-line rows. Default false.
+    ui_legacy_transcript: bool,
     ui_show_shortcuts_panel: bool,
     ui_prompt_label: []u8,
     ui_transcript_max_lines: usize,
@@ -132,6 +148,39 @@ pub const Config = struct {
     /// Gap (minutes) since the last assistant turn before the time-based
     /// microcompaction fires. 60 matches the server's 1h cache TTL.
     time_based_mc_gap_minutes: usize = 60,
+    /// config-layout-17: settings.json `alwaysThinkingEnabled` -- forces
+    /// extended thinking on for every turn regardless of the model's default
+    /// reasoning-effort heuristic (reference: "reserved reasoning budget
+    /// on"). Round-trippable via `/config` and the settings.json bridge
+    /// (`applySettingsJsonBridge`); not yet threaded into the request-
+    /// building pipeline that would actually force thinking on for a live
+    /// turn (a separate, larger wiring through prompt_engine.zig/
+    /// agent_history.zig).
+    always_thinking_enabled: bool = false,
+    /// config-layout-17: settings.json `autoCompactWindow` -- an explicit
+    /// token-count auto-compaction target ("auto", or a raw/shorthand count
+    /// like "500k" / 200000), overriding the percentage-based default
+    /// threshold. 0 means "auto" (unset; the existing percent-based default
+    /// in `types.BudgetPlan.CompactionThresholds` applies). Round-trippable;
+    /// not yet threaded into the live compaction-trigger math (a separate,
+    /// larger wiring across agent_history.zig/compaction.zig).
+    auto_compact_window: u32 = 0,
+    /// repl-ux-missed-128/130: settings.json `autoCompactEnabled` (default
+    /// true) -- whether auto-compaction is allowed to fire at all. Round-
+    /// trippable via `/config`/the settings.json bridge and consulted by
+    /// the proactive "Context low" footer warning (repl_render.zig) to
+    /// pick the reference's "auto-compact is off · /config to turn it on"
+    /// wording instead of suggesting `/compact` when it will not
+    /// self-trigger. Like `auto_compact_window` above, NOT YET threaded
+    /// into the live compaction-trigger math itself (reactive_compaction.zig/
+    /// compaction.zig, outside this package) -- setting it false today
+    /// changes the warning's wording, not whether compaction still fires.
+    auto_compact_enabled: bool = true,
+    /// config-layout-17: settings.json `includeCoAuthoredBy` (default true).
+    /// Gates the `Co-Authored-By: zcode <noreply@zcode.dev>` trailer
+    /// instruction the `/commit` slash command's prompt template tells the
+    /// model to append (repl_commands.zig).
+    include_co_authored_by: bool = true,
     max_tool_rounds: usize,
     /// Phase 22 (agent-loop-deep-11): per-turn USD budget ceiling. 0 (the
     /// default) disables the cap. When > 0, an agentic turn stops once its
@@ -277,6 +326,120 @@ pub const Config = struct {
     /// default. Default "auto".
     reasoning_effort: []u8,
 
+    // ── wp4-cli-flags: CLI-flag-carrier fields ──────────────────────────
+    //
+    // The following fields exist so a CLI flag has somewhere to land at
+    // parse time even though the *behavior* they drive is implemented by a
+    // different parity work package (permissions / sessions / sdk). Each
+    // comment below names which package reads it. wp4-cli-flags itself only
+    // guarantees: the flag parses, the value ends up here unmutated, and
+    // `validate()`/`init()` treat it as a normal field (default + freed).
+
+    /// `--permission-mode <acceptEdits|auto|bypassPermissions|manual|dontAsk|plan>`
+    /// (Claude Code's reference-spelled permission-mode flag). zcode's own
+    /// `--approval-mode`/`approval_mode` field already drives the live
+    /// approval engine end-to-end for these same reference spellings (see
+    /// `permission_decision.isReferenceModeName`); this field is the
+    /// separate, exactly-named carrier the "permissions" work package reads
+    /// when it wires a fuller `--permission-mode`-specific experience
+    /// (distinct messaging, `auto` classifier, etc). Empty = flag absent.
+    permission_mode: []u8,
+    /// `--allowedTools`/`--allowed-tools <tools...>`: comma-separated tool
+    /// names/patterns (e.g. "Bash(git *),Edit") the "permissions" package
+    /// applies as a positive allowlist for the primary session's own tool
+    /// registry. Empty = flag absent (no allowlist restriction).
+    allowed_tools: []u8,
+    /// `--disallowedTools`/`--disallowed-tools <tools...>`: comma-separated
+    /// tool names/patterns the "permissions" package denies for the primary
+    /// session's own tool registry. Empty = flag absent.
+    disallowed_tools: []u8,
+    /// `--tools <tools...>`: comma-separated list of the built-in tools to
+    /// expose at all (Claude's own wording: "" disables every tool, absent
+    /// (this field empty) or the literal "default" means unrestricted).
+    tools_allowlist: []u8,
+    /// cli-flags-04: true once `--tools` was actually passed on the command
+    /// line, even with an empty value. `tools_allowlist.len == 0` alone is
+    /// ambiguous between "flag absent" (unrestricted) and `--tools ""`
+    /// (disable every tool) -- this flag disambiguates the two per Claude's
+    /// own documented wording for `--tools`.
+    tools_flag_set: bool,
+    /// `--add-dir <dir>` (repeatable): comma-separated extra directories the
+    /// "permissions" package grants sandbox/tool access to for THIS
+    /// invocation only, distinct from the persisted, global
+    /// `core/workspace_dirs.zig` list that `/add-dir` writes. Empty = none.
+    additional_directories: []u8,
+    /// `--session-id <uuid>`: pins the session identifier for this run
+    /// instead of the auto-generated `<epoch>-<rand>` id. Validated to look
+    /// like a UUID at parse time; the "sessions" package threads it into
+    /// `session/store.zig`. Empty = auto-generate as today.
+    session_id: []u8,
+    /// `--no-session-persistence`: when true (only valid with --print, per
+    /// the reference), the "sessions" package routes session writes for
+    /// this run through a no-op/in-memory backend instead of the disk store.
+    no_session_persistence: bool,
+    /// `--await-initialize`: when true (only valid with
+    /// `--input-format stream-json`), the "sdk" package blocks the very
+    /// first stdin read until an `initialize` control_request line arrives,
+    /// applying its settings before the first turn runs.
+    await_initialize: bool,
+    /// `--permission-prompts <host|none>`: who answers permission prompts
+    /// under `--print`. "host" (default) keeps today's behavior (SDK host
+    /// relay / `--permission-prompt-tool`); "none" tells the "sdk" package
+    /// to auto-deny any ask-tier decision instead of ever relaying it.
+    /// Empty = flag absent, treated as "host".
+    permission_prompts: []u8,
+    /// `--allow-dangerously-skip-permissions`: distinct from
+    /// `--dangerously-skip-permissions` (which zcode maps directly onto
+    /// `-y/--yolo`, already fully wired). This one only *permits* bypass to
+    /// be turned on later via some other gated path; it must never itself
+    /// auto-approve anything. Consumed by the "permissions" package.
+    allow_dangerously_skip_permissions: bool,
+    /// `--verbose`/`-v` config-level default (missed-gap: the reference's
+    /// own help text calls `--verbose` an "override [of] verbose mode
+    /// setting from config", implying a persisted default the CLI flag
+    /// overrides for one run). zcode's CLI flag already sets
+    /// `CliOptions.verbose` unconditionally; this field is the persisted
+    /// default it can be layered over. Default false (matches today's
+    /// behavior when neither the flag nor this setting is present).
+    verbose: bool,
+    /// `--disable-slash-commands`: disable skills and custom `/`-prefixed
+    /// commands for this run (built-ins like /help remain available).
+    /// Claude's own help text names the flag after slash commands but
+    /// describes it as disabling skills; both readings are carried here.
+    /// No consumer wired yet (skills.zig/repl_commands.zig belong to a
+    /// different parity package).
+    disable_slash_commands: bool,
+    /// `--system-prompt <prompt>` / `--system-prompt-file <path>`: full
+    /// replacement for the default system prompt, distinct from
+    /// `--append-system-prompt` (which layers on top of the default
+    /// instead of replacing it). Empty = flag absent. No consumer wired yet
+    /// (system_prompt.zig/prompt_helpers.zig belong to a different parity
+    /// package).
+    system_prompt_override: []u8,
+    /// `--safe-mode`: for this run only, disable CLAUDE.md/ZCODE.md loading,
+    /// `.claude`/`.zcode` skills, plugins, hooks, MCP servers, custom
+    /// commands/agents, output styles, and keybindings, while leaving auth,
+    /// model selection, built-in tools, and permission prompting untouched.
+    /// Distinct from `--bare` (which restricts auth and disables
+    /// auto-memory instead). `src/cli/args.zig` also sets the
+    /// `ZCODE_SAFE_MODE`/`CLAUDE_CODE_SAFE_MODE` env-equivalent (mirroring
+    /// the `--bare`/`ZCODE_SIMPLE` pattern) for child-process visibility;
+    /// this field is the in-process carrier. Consulted by
+    /// `core/prompt_engine.zig`'s `build()` (drops CLAUDE.md/AGENTS.md/etc
+    /// instruction-file content and the skills listing, and forces the
+    /// default output style) and by `main.zig` (skips enabling MCP scoped
+    /// config). Plugins, hooks, custom commands/agents, and keybindings are
+    /// not yet gated -- a follow-on for whichever package owns each one.
+    safe_mode: bool,
+    /// `--brief`: enables the `SendUserMessage` tool (agent-to-user
+    /// proactive messaging), which is otherwise hidden from the advertised
+    /// tool set -- default OFF, matching Claude's own "Enable SendUserMessage
+    /// tool for agent-to-user communication" wording. Does not affect the
+    /// unrelated, pre-existing `AttachContext` file-attachment tool (that
+    /// tool used to be named `Brief`; a naming collision this flag's own
+    /// help text could be mistaken for, hence the callout).
+    brief: bool,
+
     /// Settings-sourced environment variables from a `[env]` table in any
     /// config layer (settings-02). Applied to spawned tools (shell, grep)
     /// with the same precedence as the rest of config: a later layer
@@ -320,7 +483,13 @@ pub const Config = struct {
             .ui_idle_return_never_ask = false,
             .ui_density = try allocator.dupe(u8, "full"),
             .ui_leader_key = try allocator.dupe(u8, "ctrl+x"),
-            .ui_show_top_bar = true,
+            // r3-chrome-02: the reference has no persistent top status
+            // bar; false matches the 2.1.261 default look. Existing zcode
+            // users who prefer the old bar can set ui_show_top_bar = true.
+            .ui_show_top_bar = false,
+            .ui_legacy_banner = false,
+            .ui_legacy_footer = false,
+            .ui_legacy_transcript = false,
             .ui_show_shortcuts_panel = true,
             .ui_prompt_label = try allocator.dupe(u8, ">"),
             .ui_transcript_max_lines = 20_000,
@@ -404,6 +573,22 @@ pub const Config = struct {
             .spinner_tips_custom = try allocator.dupe(u8, ""),
             .spinner_tips_exclude_default = false,
             .reasoning_effort = try allocator.dupe(u8, "auto"),
+            .permission_mode = try allocator.dupe(u8, ""),
+            .allowed_tools = try allocator.dupe(u8, ""),
+            .disallowed_tools = try allocator.dupe(u8, ""),
+            .tools_allowlist = try allocator.dupe(u8, ""),
+            .tools_flag_set = false,
+            .additional_directories = try allocator.dupe(u8, ""),
+            .session_id = try allocator.dupe(u8, ""),
+            .no_session_persistence = false,
+            .await_initialize = false,
+            .permission_prompts = try allocator.dupe(u8, ""),
+            .allow_dangerously_skip_permissions = false,
+            .verbose = false,
+            .disable_slash_commands = false,
+            .system_prompt_override = try allocator.dupe(u8, ""),
+            .safe_mode = false,
+            .brief = false,
             .settings_env = std.array_list.Managed(EnvPair).init(allocator),
         };
     }
@@ -456,6 +641,14 @@ pub const Config = struct {
         allocator.free(self.auto_memory_directory);
         allocator.free(self.spinner_tips_custom);
         allocator.free(self.reasoning_effort);
+        allocator.free(self.permission_mode);
+        allocator.free(self.allowed_tools);
+        allocator.free(self.disallowed_tools);
+        allocator.free(self.tools_allowlist);
+        allocator.free(self.additional_directories);
+        allocator.free(self.session_id);
+        allocator.free(self.permission_prompts);
+        allocator.free(self.system_prompt_override);
         for (self.settings_env.items) |pair| {
             allocator.free(pair.name);
             allocator.free(pair.value);
@@ -613,7 +806,13 @@ pub const Config = struct {
         for (known) |k| {
             if (std.ascii.eqlIgnoreCase(name, k)) return true;
         }
-        return false;
+        // cli-flags-01: Claude Code's own reference-spelled permission modes
+        // (acceptEdits, plan, bypassPermissions/bypass, dontAsk/dont-ask) are
+        // already fully implemented end-to-end by permission_decision.zig +
+        // approval.zig (see approval.evaluate's isReferenceModeName branch) --
+        // this validator was simply never told about them, so a perfectly
+        // functional `--approval-mode acceptEdits` was rejected at startup.
+        return permission_decision.isReferenceModeName(name);
     }
 
     fn isKnownUiDensity(name: []const u8) bool {
@@ -968,6 +1167,60 @@ test "validate accepts valid default config" {
     var cfg = try Config.init(allocator);
     defer cfg.deinit(allocator);
 
+    try cfg.validate();
+}
+
+test "validate accepts every Claude Code reference permission-mode spelling (cli-flags-01)" {
+    const allocator = testing.allocator;
+    const reference_modes = [_][]const u8{
+        "acceptEdits", "accept-edits", "plan", "bypassPermissions", "bypass", "dontAsk", "dont-ask",
+        // zcode's own legacy modes must keep validating too.
+        "tiered-auto", "manual", "strict",
+    };
+    for (reference_modes) |mode| {
+        var cfg = try Config.init(allocator);
+        defer cfg.deinit(allocator);
+        allocator.free(cfg.approval_mode);
+        cfg.approval_mode = try allocator.dupe(u8, mode);
+        cfg.validate() catch |err| {
+            std.debug.print("approval_mode '{s}' unexpectedly failed validate(): {s}\n", .{ mode, @errorName(err) });
+            return err;
+        };
+    }
+}
+
+test "validate rejects an approval_mode that is neither a zcode mode nor a reference mode" {
+    const allocator = testing.allocator;
+    var cfg = try Config.init(allocator);
+    defer cfg.deinit(allocator);
+    allocator.free(cfg.approval_mode);
+    cfg.approval_mode = try allocator.dupe(u8, "not-a-real-mode");
+    try testing.expectError(error.InvalidApprovalMode, cfg.validate());
+}
+
+test "init sets empty defaults for the new CLI-flag-carrier fields" {
+    const allocator = testing.allocator;
+    var cfg = try Config.init(allocator);
+    defer cfg.deinit(allocator);
+
+    try testing.expectEqualStrings("", cfg.permission_mode);
+    try testing.expectEqualStrings("", cfg.allowed_tools);
+    try testing.expectEqualStrings("", cfg.disallowed_tools);
+    try testing.expectEqualStrings("", cfg.tools_allowlist);
+    try testing.expect(!cfg.tools_flag_set);
+    try testing.expectEqualStrings("", cfg.additional_directories);
+    try testing.expectEqualStrings("", cfg.session_id);
+    try testing.expectEqualStrings("", cfg.permission_prompts);
+    try testing.expect(!cfg.no_session_persistence);
+    try testing.expect(!cfg.await_initialize);
+    try testing.expect(!cfg.allow_dangerously_skip_permissions);
+    try testing.expect(!cfg.verbose);
+    try testing.expect(!cfg.disable_slash_commands);
+    try testing.expectEqualStrings("", cfg.system_prompt_override);
+    try testing.expect(!cfg.safe_mode);
+    try testing.expect(!cfg.brief);
+
+    // Every field is independently freeable without touching the others.
     try cfg.validate();
 }
 

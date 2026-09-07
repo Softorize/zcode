@@ -12,6 +12,7 @@ const plugins = @import("plugins.zig");
 const plugin_settings = @import("plugin_settings.zig");
 const plugin_policy = @import("plugin_policy.zig");
 const plugin_flagging = @import("plugin_flagging.zig");
+const settings_sources = @import("settings_sources.zig");
 
 pub const EntryKind = enum {
     plugin,
@@ -146,7 +147,7 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8, filter: ?EntryKind) !
     defer allocator.free(workspace_path);
     try appendCatalogEntriesFromPath(allocator, &out, workspace_path, .workspace, filter);
 
-    const sources = try loadRegistrySources(allocator);
+    const sources = try loadRegistrySourcesWithExtras(allocator);
     defer freeRegistrySources(allocator, sources);
     for (sources) |source| {
         const cache_path = try cachePathForSource(allocator, source.name);
@@ -814,7 +815,7 @@ pub fn freeList(allocator: std.mem.Allocator, entries: []Entry) void {
 }
 
 pub fn listSources(allocator: std.mem.Allocator) ![]SourceEntry {
-    const registry = try loadRegistrySources(allocator);
+    const registry = try loadRegistrySourcesWithExtras(allocator);
     defer freeRegistrySources(allocator, registry);
 
     var out = std.array_list.Managed(SourceEntry).init(allocator);
@@ -1201,6 +1202,64 @@ fn loadRegistrySources(allocator: std.mem.Allocator) ![]RegistrySource {
         const force_remove = getBool(item.object, "force_remove_deleted") orelse false;
         try appendRegistrySource(allocator, &out, name, url, getString(item.object, "sha256"), force_remove);
     }
+    return out.toOwnedSlice();
+}
+
+/// config-layout-17: read `extraKnownMarketplaces` from the USER and POLICY
+/// (managed) settings.json scopes ONLY -- matching the reference's own
+/// restriction, verified against the bundle: "a marketplace on a network
+/// location must be declared under extraKnownMarketplaces in USER or managed
+/// settings (project/local scope cannot vouch for it)". Passing `""` for
+/// `cwd` is safe here: `settings_sources.readSource`'s `.user`/`.policy`
+/// branches never consult it (they read fixed home/OS-managed paths).
+/// Each declared marketplace maps `{source: {source: "git"|"github"|"url",
+/// repo|url: "..."}}` onto zcode's own `{name, url}` shape -- other source
+/// kinds (a `"settings"`-embedded plugin list, `"path"`) have no zcode-side
+/// analog and are skipped, matching this bridge's documented leniency
+/// elsewhere (an unmappable entry is dropped, not an error). Appended to
+/// `out`, skipping any name `out` already has (a native `marketplace add`
+/// entry, or an earlier scope's declaration, always wins).
+fn appendExtraKnownMarketplaces(allocator: std.mem.Allocator, out: *std.array_list.Managed(RegistrySource)) !void {
+    const scopes = [_]settings_sources.Source{ .user, .policy };
+    for (scopes) |scope| {
+        var parsed = (settings_sources.readSource(allocator, "", scope, null) catch null) orelse continue;
+        defer parsed.deinit();
+        const extra = settings_sources.getObject(parsed.value, "extraKnownMarketplaces") orelse continue;
+        var it = extra.object.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (findSourceIndex(out.items, name) != null) continue;
+            const decl = entry.value_ptr.*;
+            if (decl != .object) continue;
+            const source_obj = decl.object.get("source") orelse continue;
+            if (source_obj != .object) continue;
+            const url = getString(source_obj.object, "repo") orelse getString(source_obj.object, "url") orelse continue;
+            try appendRegistrySource(allocator, out, name, url, null, false);
+        }
+    }
+}
+
+/// config-layout-17: `loadRegistrySources` (the on-disk `sources.json`
+/// registry) plus any `extraKnownMarketplaces` declared in user/policy
+/// settings.json. Used ONLY by the two read-only display paths (`list`,
+/// `listSources`) -- every write path (`addSource`/`removeSource`/
+/// `detectAndUninstallDelisted`) deliberately keeps calling the plain
+/// `loadRegistrySources` so a settings-declared marketplace is never
+/// accidentally persisted into the user's own `sources.json` registry file
+/// by an unrelated `marketplace add`/`remove` round-trip.
+fn loadRegistrySourcesWithExtras(allocator: std.mem.Allocator) ![]RegistrySource {
+    const native = try loadRegistrySources(allocator);
+    defer freeRegistrySources(allocator, native);
+
+    var out = std.array_list.Managed(RegistrySource).init(allocator);
+    errdefer {
+        for (out.items) |*item| item.deinit(allocator);
+        out.deinit();
+    }
+    for (native) |item| {
+        try appendRegistrySource(allocator, &out, item.name, item.url, item.sha256, item.force_remove_deleted);
+    }
+    try appendExtraKnownMarketplaces(allocator, &out);
     return out.toOwnedSlice();
 }
 
@@ -1646,6 +1705,138 @@ test "localPathFromFileUrl rejects path traversal patterns" {
 
     // Non-file URL rejected outright.
     try testing.expectError(error.InvalidMarketplaceSource, localPathFromFileUrl(alloc, "https://example.com"));
+}
+
+test "config-layout-17: extraKnownMarketplaces in ~/.claude/settings.json appears in listSources without a native add" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data =
+        \\{"extraKnownMarketplaces":{"team-mp":{"source":{"source":"git","repo":"https://example.com/mp.git"}}}}
+        ,
+    });
+
+    const sources = try listSources(allocator);
+    defer freeSources(allocator, sources);
+
+    try testing.expectEqual(@as(usize, 1), sources.len);
+    try testing.expectEqualStrings("team-mp", sources[0].name);
+    try testing.expectEqualStrings("https://example.com/mp.git", sources[0].url);
+
+    const rendered = try renderSources(allocator);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "team-mp") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "https://example.com/mp.git") != null);
+}
+
+test "config-layout-17: extraKnownMarketplaces in a PROJECT-scope .claude/settings.json is correctly ignored (reference restricts to user/policy)" {
+    // config-layout-17 verifier repro: the acceptance test's literal example
+    // places `extraKnownMarketplaces` in a single `.claude/settings.json`,
+    // which reads as project scope when that file sits in a project repo.
+    // The reference bundle is explicit that this must NOT vouch for a
+    // marketplace: "a marketplace on a network location must be declared
+    // under extraKnownMarketplaces in USER or managed settings (project/local
+    // scope cannot vouch for it)". This test proves zcode matches that
+    // restriction: the identical JSON fragment at project scope contributes
+    // nothing, while the sibling test above proves the same fragment at user
+    // scope (~/.claude/settings.json) DOES appear. Together they pin the
+    // full, reference-correct behavior rather than leaving it as an
+    // undocumented gap.
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    // HOME and the project checkout must be genuinely distinct directories --
+    // otherwise a `.claude/settings.json` written "at project scope" would
+    // physically BE `~/.claude/settings.json` too, and the test would prove
+    // nothing. `home` has no .claude/settings.json at all, so user scope
+    // contributes nothing -- any source found below must have come from
+    // project scope.
+    try tmp.dir.createDirPath(rt.io, "home");
+    const home = try @import("test_helpers.zig").tmpDirPath(allocator, &tmp, "home");
+    defer allocator.free(home);
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const proj = try @import("test_helpers.zig").tmpDirPath(allocator, &tmp, "proj");
+    defer allocator.free(proj);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", home);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    // A project-scope settings.json (as if `proj` were a project checkout)
+    // declaring the exact same extraKnownMarketplaces fragment the sibling
+    // user-scope test uses.
+    try tmp.dir.createDirPath(rt.io, "proj/.claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = "proj/.claude/settings.json",
+        .data =
+        \\{"extraKnownMarketplaces":{"team-mp":{"source":{"source":"git","repo":"https://example.com/mp.git"}}}}
+        ,
+    });
+
+    // Sanity check: the file really is readable as project-scope settings
+    // (proves this is a "not consulted" gap, not a "file didn't parse" one).
+    var parsed = (try settings_sources.readSource(allocator, proj, .project, null)).?;
+    defer parsed.deinit();
+    try testing.expect(settings_sources.getObject(parsed.value, "extraKnownMarketplaces") != null);
+
+    const sources = try listSources(allocator);
+    defer freeSources(allocator, sources);
+    try testing.expectEqual(@as(usize, 0), sources.len);
+
+    const rendered = try renderSources(allocator);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "team-mp") == null);
+}
+
+test "config-layout-17: a native sources.json entry with the same name wins over extraKnownMarketplaces" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try @import("test_helpers.zig").tmpDirCwd(allocator, &tmp);
+    defer allocator.free(root);
+
+    const env_mod = @import("env.zig");
+    defer env_mod.clearOverrides();
+    try env_mod.setOverride("HOME", root);
+    try env_mod.setOverride("XDG_CONFIG_HOME", "");
+
+    try tmp.dir.createDirPath(rt.io, ".claude");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".claude/settings.json",
+        .data =
+        \\{"extraKnownMarketplaces":{"team-mp":{"source":{"source":"git","repo":"https://settings.example.com/mp.git"}}}}
+        ,
+    });
+    try tmp.dir.createDirPath(rt.io, ".zcode/marketplace");
+    try tmp.dir.writeFile(rt.io, .{
+        .sub_path = ".zcode/marketplace/sources.json",
+        .data =
+        \\[{"name":"team-mp","url":"https://native.example.com/mp.git"}]
+        ,
+    });
+
+    const sources = try listSources(allocator);
+    defer freeSources(allocator, sources);
+    try testing.expectEqual(@as(usize, 1), sources.len);
+    try testing.expectEqualStrings("https://native.example.com/mp.git", sources[0].url);
 }
 
 test "render list and install from workspace marketplace" {

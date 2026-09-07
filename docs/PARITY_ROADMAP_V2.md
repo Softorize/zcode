@@ -1,6 +1,6 @@
 # zcode Quality Plan
 
-Last updated: 2026-04-26
+Last updated: 2026-09-06
 
 This is the active product-quality roadmap for zcode. It supersedes
 `docs/PARITY_ROADMAP.md`, which is now historical.
@@ -308,6 +308,94 @@ Work items:
    VS Code extension consumes server-side event notifications without
    confusing them with request responses.
 
+## Claude Code 2.1.261 Parity Pass (2026-09-04 to 2026-09-06)
+
+A second parity program compared zcode against the *installed* Claude Code
+2.1.261 binary (its embedded bundle, `claude --help`, and a transcribed live
+system prompt) rather than the older TypeScript snapshot. It ran as an audit
+workflow (10 subsystem surveys, two adversarial verifiers each, a completeness
+critic: 229 confirmed gaps), four implementation rounds in per-package git
+worktrees merged one at a time behind a green `zig build test`, and an
+adversarial verification pass with per-package fixers. Test count went from
+4170 to 4734 (main suite) with 0 failures.
+
+Landed (see CHANGELOG "Unreleased" for the itemized list):
+
+- Slash commands: every 2.1.261 command and alias resolves (`/advisor`,
+  `/cd`, `/security-review`, `/marketplace` restored; `/terminal-setup` is
+  the canonical spelling; `/background`, `/stop`, `/list-agents`, `/subtask`,
+  `/goal`, `/bug`, `/import`, `/skill-doctor`, `/reload-skills`, `/loops`,
+  `/pause-memory`, `/recap`, `/focus`, `/tui`, `/daemon`, ... added). zcode-only
+  extras still work but are hidden from the default `/help`.
+- Tools: reference-exact model-facing names (`Agent`, `SendUserMessage`,
+  `ListMcpResourcesTool`, `ReadMcpResourceTool`, `ReadMcpResourceDirTool`,
+  per-server `mcp__<server>__<tool>` schemas), 2.1.261 descriptions and
+  parameter names for the core tools, and new tools `Monitor`,
+  `ScheduleWakeup`, `ListAgents`, `ReportFindings`, `SendUserFile`,
+  `PushNotification`, `EndConversation`, `REPL` (advertised).
+- System prompt: `# Delivering work`, `# Writing for the user`, the
+  autonomy / verified-vs-assumed / pronoun / hard-to-reverse paragraphs, and
+  the session-specific-guidance reminder, worded for zcode's own identity.
+- CLI: every `claude --help` flag spelling is accepted (`--permission-mode`,
+  `--dangerously-skip-permissions`, `--add-dir`, `--allowedTools`,
+  `--mcp-config`, `--session-id`, `--system-prompt`, `--safe-mode`,
+  `--debug`, `--effort`, `--fallback-model`, `--worktree`, ...) plus the
+  `attach`, `stop`, `logs`, `rm`, `respawn`, `project purge`, `import`, bare
+  `doctor` subcommands.
+- Config layout: `~/.claude` and `.claude` locations are read alongside
+  `.zcode` (settings.json incl. `permissions.*`, `env`, `model`, `statusLine`,
+  `enabledPlugins`; commands; agents as Markdown+frontmatter; skills;
+  plugins; output styles; keybindings; `~/.claude.json` MCP servers; managed
+  settings at the OS-standard paths); auto-memory lives under
+  `projects/<cwd-slug>/memory/`.
+- Hooks and permissions: all 28 hook events fire with the 2.1.261 stdin JSON
+  base fields; `command` exec-form `args`, `prompt`/`http`/`agent`/`script`/
+  `mcp_tool` hook types; permission modes `default|acceptEdits|plan|
+  bypassPermissions|dontAsk|auto|manual` with `permissions.defaultMode` and
+  `additionalDirectories` honored.
+- Headless: `--print --output-format json|stream-json` emits the 2.1.261 SDK
+  shapes (system/init fields, assistant/user/result records with UUIDs,
+  usage detail, `permission_denials`, `can_use_tool` with real input).
+- Sessions: UUIDv4 ids, Claude Code JSONL record schema, per-project
+  sharding with cross-project resume hints, `/clear` regenerates the id,
+  `/fork` is distinct from `/branch`, `--session-id` / `--fork-session`.
+- Bundled skills: `simplify`, `code-review`, `init`, `security-review`,
+  `update-config`, `keybindings-help`, `fewer-permission-prompts`, `loop`,
+  `schedule`, `claude-api`, `run`, `debug`, `explain-usage`, `batch`,
+  `run-skill-generator` (bodies written for zcode, not copied).
+- REPL: 2.1.261 startup header (mascot glyph, version, model · provider,
+  cwd), prompt box with `Try "..."` placeholder, `? for shortcuts` footer with
+  the permission-mode chip, flat `⏺ Tool(args)` / `⎿ result` transcript,
+  titled approval dialog, sectioned `/status`, trust-dialog copy, Esc-Esc
+  rewind, context-low warning, retry status in the spinner. The previous
+  chrome is available via `ui_show_top_bar`, `ui_legacy_banner`,
+  `ui_legacy_footer`.
+- Bugs fixed on the way: tests popped a real desktop notification;
+  `--no-fullscreen` startup failed with EndOfStream (stdin read); slash
+  commands never submitted on Enter in the fullscreen composer.
+
+Documented deviations (intentional, not gaps):
+
+- `Workflow` tool and `/workflows`: the reference runs JavaScript orchestration
+  scripts; zcode has no JS runtime. Not built.
+- `context: fork` skills run synchronously (the reference backgrounds them).
+- Permission mode `auto` behaves as tiered-auto: zcode has no cloud
+  classifier (`classifyAllShell` is accepted as a no-op key).
+- `TeammateIdle` has no production trigger in zcode's teammate model.
+- `/tui` cannot switch renderer mid-session (relaunch with
+  `--no-fullscreen`); `install <version>` cannot pin a version yet.
+- Cloud/auth-only surfaces (`/teleport`, `/remote-control`, `/desktop`,
+  `/mobile`, `/artifacts`, design tools, `RemoteTrigger`, Chrome) are stubs
+  that say what they would need.
+- `-p` stays `--provider` (use `--print`); `-v` stays `--verbose` (use `-V`).
+
+Re-running the comparison: extract the current Claude Code bundle strings
+with `strings -n 4 ~/.local/share/claude/versions/<ver>`, diff the command
+objects (`type:"local"|"local-jsx"|"prompt"` + `name:"..."`) and the tool
+constants against `src/repl_commands.zig`, `src/repl_commands_parity.zig`,
+and `src/tools/tool_schemas.zig`; `tools/similarity/score-*.py` still score
+against the older TypeScript snapshot (`ZCODE_CC_REF`).
+
 ## Active Backlog
 
 Use this as the next concrete execution queue:
@@ -356,3 +444,92 @@ records an optional `origin_cwd` breadcrumb on the session snapshot record
 when a session's `origin_cwd` differs from the current cwd. The breadcrumb is
 purely informational - it never blocks a resume, prompts a `cd`, or toggles
 between project scopes.
+
+### Workflow tool skipped (tools-07)
+
+The reference's `Workflow` tool executes a JS script that orchestrates
+subagents deterministically (`export const meta = {name, description,
+phases}`; API: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`,
+`args`, `budget`, `workflow()`). Running arbitrary orchestration scripts needs
+an embedded JS runtime; zcode has no such runtime and does not intend to
+depend on one for a single tool. `AgentRun`/`Agent` already covers ad hoc
+subagent delegation, and zcode's own `/loop` and `TaskCreate`/`TaskUpdate`
+family cover the recurring "run N steps against a plan" pattern the reference
+uses Workflow for. Documented as a deliberate gap, not silently missing.
+
+### Monitor / ScheduleWakeup / EndConversation: dispatchable but not fully wired (wp2-tools-surface)
+
+Three tools added for 2.1.261 name parity are real, dispatchable, and unit
+tested, but stop short of reaching into the agent's turn loop
+(`agent_runtime.zig`, outside `wp2-tools-surface`'s ownership) to change its
+control flow:
+
+- `Monitor` runs the given command via the same background-task runner
+  Bash's `run_in_background` uses (wake-up on exit), not the reference's
+  per-emitted-stdout-line push wakeup -- true per-line wakeups need the turn
+  loop to poll a growing output file and re-invoke the model mid-stream.
+- `ScheduleWakeup` validates and clamps `delaySeconds` to `[60, 3600]` and
+  returns the acknowledgment text, but does not reschedule zcode's actual
+  `/loop` dynamic-mode iteration timer.
+- `EndConversation` returns a fixed closing message plus an
+  `[end_conversation=true]` sentinel line, but nothing currently watches for
+  that sentinel to actually stop the REPL's turn loop.
+
+Each is a real, callable, tested tool today (a strict improvement over not
+existing at all) with the exact gap called out in its handler's doc comment
+in `src/tools/tool_dispatch.zig`. Wiring the remaining control-flow piece is
+a follow-up for whichever package owns `agent_runtime.zig`'s loop.
+
+### Agent tool: subagent_type accepted, but no dedicated `fork` mode or new built-in agent types (tools-23)
+
+The `Agent` tool's schema now advertises `subagent_type` as the reference-exact
+field name (with `agent` kept as an accepted alias), but zcode still resolves
+only its 4 existing specialists (`explore`, `plan`, `verify`, `reviewer`) plus
+whatever custom name the caller passes through `core/agents.zig` (not owned by
+`wp2-tools-surface`). The reference's `subagent_type: "fork"` (clone the
+caller's own transcript into a background agent pinned to the caller's model)
+and its `general-purpose`/`claude`/`claude-code-guide`/`statusline-setup`
+built-ins are not implemented -- registering new agent definitions and a
+transcript-forking spawn path is a larger, cross-cutting change belonging to
+whichever package owns `core/agents.zig` and the agent-spawn plumbing in
+`agent_runtime.zig`/`cli/repl.zig`.
+
+### CRUD "Task" tool kept under its original name, not renamed to "TaskAction" (tools-01)
+
+The reference's `Task` string is a *legacy alias for the Agent tool*, not a
+name for zcode's generic CRUD task-tracking tool (create/get/update/list/
+stop/output/run/poll/claim). Renaming zcode's CRUD tool's advertised schema
+name away from `"Task"` (e.g. to `"TaskAction"`) to fully resolve that naming
+collision was investigated but intentionally NOT done: the literal string
+`"Task"` is a load-bearing identifier in several other packages' security and
+UX logic outside `wp2-tools-surface`'s ownership -- `core/sandbox.zig`'s
+read-only-profile tool allowlist, `policy/policy.zig`'s risk-tier
+classification (a `Task` call with `action=run` is classified `.HIGH` because
+it can execute an arbitrary shell command via `TaskCreate`'s `command` field),
+and `cli/repl_edit.zig`'s approval-description rendering. Renaming the
+advertised name without also updating every one of those classification
+tables risked a model that adopts the new name silently escaping `.HIGH`-risk
+classification and sandbox restriction on that tool. `tool_name_map.zig`
+still correctly maps the reference's `Task` alias to `Agent` (see
+`core/tool_name_map.zig`'s alias table) for whenever alias-aware permission-rule
+matching is wired in; only the schema-visible rename of zcode's own unrelated
+CRUD tool was deferred, as a follow-up that should touch `sandbox.zig`,
+`policy.zig`, and `repl_edit.zig` together with the rename in the same change.
+
+### Fork-context skills stay synchronous (bundled-skills-18)
+
+The reference defaults a `context: fork` skill invocation to running as a
+background/async sub-agent: the invoking turn gets an immediate handle back
+and the forked skill's result streams in later. zcode's `context: fork`
+skills (see `agent_runtime.zig`'s `runForkedSkill`, gated by a depth guard)
+run as an isolated but SYNCHRONOUS sub-agent instead - the invoking turn
+blocks until the fork completes and its result is spliced back in directly,
+the same way a synchronous tool call resolves.
+
+This is a deliberate, not-yet-closed gap: zcode's background-agent
+infrastructure (the `Agent`/`AgentRun` tool, `background_threads`) already
+exists and is used by `batch`'s Phase 2 worker-spawning, but wiring a fork'd
+*skill* specifically onto that async path (rather than the tool-call path) is
+left for a follow-up pass. Until then, a `context: fork` skill is still
+correctly isolated (its own sub-agent, its own history) - it just is not yet
+non-blocking.

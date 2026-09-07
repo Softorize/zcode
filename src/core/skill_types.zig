@@ -70,6 +70,21 @@ pub const SkillSpec = struct {
     /// `agents.zig`'s `hooks_json` field and the reference's
     /// `parseHooksFromFrontmatter` (loadSkillsDir.ts:136-153).
     hooks_json: []u8,
+    /// bundled-skills-17: `disallowed-tools`/`disallowedTools` frontmatter --
+    /// tools the skill's author explicitly denies while it runs. Ignored when
+    /// `allowed_tools` is non-empty (an allow-list already fully determines the
+    /// tool surface, so a deny-list adds nothing). Empty = no explicit denials.
+    disallowed_tools: [][]u8,
+    /// bundled-skills-17: `argument-hint`/`argumentHint` frontmatter -- a short
+    /// usage hint for the skill's positional/flag arguments (e.g.
+    /// `[--fix] [<pr#>|<branch>|<path>]`), shown alongside the skill in a menu
+    /// or detail view. Empty = no hint declared.
+    argument_hint: []u8,
+    /// bundled-skills-17: the skill's `metadata:` frontmatter -- a free-form
+    /// JSON object for the skill author's own use (entitlement/catalog fields
+    /// the loader itself does not interpret), preserved opaquely the same way
+    /// `hooks_json` is. Empty string = no metadata declared.
+    metadata_json: []u8,
 
     pub fn deinit(self: *SkillSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -82,10 +97,13 @@ pub const SkillSpec = struct {
         allocator.free(self.agent);
         allocator.free(self.version);
         allocator.free(self.hooks_json);
+        allocator.free(self.argument_hint);
+        allocator.free(self.metadata_json);
         freeStrList(allocator, self.allowed_tools);
         freeStrList(allocator, self.arg_names);
         freeStrList(allocator, self.paths);
         freeStrList(allocator, self.aliases);
+        freeStrList(allocator, self.disallowed_tools);
     }
 };
 
@@ -133,32 +151,68 @@ pub fn clone(allocator: std.mem.Allocator, skill: *const SkillSpec) !SkillSpec {
         .version = try allocator.dupe(u8, skill.version),
         .aliases = try dupeStrList(allocator, skill.aliases),
         .hooks_json = try allocator.dupe(u8, skill.hooks_json),
+        .disallowed_tools = try dupeStrList(allocator, skill.disallowed_tools),
+        .argument_hint = try allocator.dupe(u8, skill.argument_hint),
+        .metadata_json = try allocator.dupe(u8, skill.metadata_json),
     };
 }
 
+/// Optional per-skill overrides for `makeBuiltin`. Every field defaults to
+/// exactly what `makeBuiltin` used to hardcode, so an existing call site that
+/// passes `.{}` behaves identically to before this struct existed.
+///
+/// Defined here (rather than accepting `bundled_skills.BundledSkill` directly)
+/// so this module stays a dependency-free leaf: `bundled_skills.zig` maps its
+/// own struct's fields onto this one at the one call site in skills.zig,
+/// instead of skill_types.zig importing upward into bundled_skills.zig.
+pub const BuiltinOptions = struct {
+    when_to_use: []const u8 = "",
+    argument_hint: []const u8 = "",
+    allowed_tools: []const []const u8 = &.{},
+    disallowed_tools: []const []const u8 = &.{},
+    user_invocable: bool = true,
+    disable_model_invocation: bool = false,
+    model: []const u8 = "",
+    effort: []const u8 = "",
+    context: SkillContext = .inline_skill,
+};
+
 /// Construct a builtin skill spec with default field values. `aliases` is the
 /// bundled skill's alternate-name list (empty for most builtins); it is duped
-/// into the spec so the caller keeps ownership of its slice.
-pub fn makeBuiltin(allocator: std.mem.Allocator, name: []const u8, description: []const u8, prompt: []const u8, aliases: []const []const u8) !SkillSpec {
+/// into the spec so the caller keeps ownership of its slice. `opts` carries the
+/// bundled-skills-03/17/226 per-skill overrides (when-to-use, argument hint,
+/// allowed/disallowed tools, user/model invocability, model, effort, context);
+/// omitting a field (or the whole `opts` value) keeps the pre-existing default.
+pub fn makeBuiltin(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    description: []const u8,
+    prompt: []const u8,
+    aliases: []const []const u8,
+    opts: BuiltinOptions,
+) !SkillSpec {
     return .{
         .name = try allocator.dupe(u8, name),
         .description = try allocator.dupe(u8, description),
-        .when_to_use = try allocator.dupe(u8, ""),
+        .when_to_use = try allocator.dupe(u8, opts.when_to_use),
         .prompt = try allocator.dupe(u8, prompt),
         .scope = .builtin,
         .source_path = try std.fmt.allocPrint(allocator, "<builtin:{s}>", .{name}),
-        .allowed_tools = try allocator.alloc([]u8, 0),
+        .allowed_tools = try dupeStrList(allocator, opts.allowed_tools),
         .arg_names = try allocator.alloc([]u8, 0),
-        .model = try allocator.dupe(u8, ""),
-        .effort = try allocator.dupe(u8, ""),
-        .context = .inline_skill,
+        .model = try allocator.dupe(u8, opts.model),
+        .effort = try allocator.dupe(u8, opts.effort),
+        .context = opts.context,
         .agent = try allocator.dupe(u8, ""),
         .paths = try allocator.alloc([]u8, 0),
-        .user_invocable = true,
-        .disable_model_invocation = false,
+        .user_invocable = opts.user_invocable,
+        .disable_model_invocation = opts.disable_model_invocation,
         .version = try allocator.dupe(u8, ""),
         .aliases = try dupeStrList(allocator, aliases),
         .hooks_json = try allocator.dupe(u8, ""),
+        .disallowed_tools = try dupeStrList(allocator, opts.disallowed_tools),
+        .argument_hint = try allocator.dupe(u8, opts.argument_hint),
+        .metadata_json = try allocator.dupe(u8, ""),
     };
 }
 
@@ -179,12 +233,25 @@ pub fn parse(
 ) !SkillSpec {
     if (frontmatter.extract(raw)) |block| {
         const fm = block.body;
-        // name override from frontmatter, else the directory name.
+        // name override from frontmatter, else the directory name. `name` (the
+        // caller-supplied identity) already carries any directory/plugin
+        // namespace prefix computed by the caller (e.g. `appendFromDir` passes
+        // "apps/web:deploy", not just "deploy") -- bundled-skills-02: almost
+        // every realistically-authored SKILL.md sets an explicit (conventionally
+        // bare, matching its directory's leaf) `name:`, so letting it replace
+        // `name` OUTRIGHT silently drops that prefix the instant a skill
+        // declares one, defeating directory-scoped naming for exactly the
+        // skills that need it. `owned_name` instead RE-namespaces a bare
+        // frontmatter name under `name`'s prefix (recovered by splitting on the
+        // last `:`); a frontmatter name the author already wrote WITH its own
+        // `:` is trusted verbatim (an explicit override), and the common
+        // flat/unprefixed case (`name` has no `:`) is unchanged from before.
         const fm_name = frontmatter.getValue(fm, "name");
-        const eff_name = if (fm_name) |n| (if (n.len > 0) n else name) else name;
+        const owned_name = try effectiveSkillName(allocator, name, fm_name);
+        errdefer allocator.free(owned_name);
 
         return .{
-            .name = try allocator.dupe(u8, eff_name),
+            .name = owned_name,
             .description = try allocator.dupe(u8, descriptionFrom(fm) orelse name),
             .when_to_use = try allocator.dupe(u8, getEither(fm, "when-to-use", "whenToUse") orelse ""),
             .prompt = try allocator.dupe(u8, block.rest),
@@ -201,7 +268,10 @@ pub fn parse(
             .disable_model_invocation = parseBool(getEither(fm, "disable-model-invocation", "disableModelInvocation"), false),
             .version = try allocator.dupe(u8, frontmatter.getValue(fm, "version") orelse ""),
             .aliases = try parseCommaList(allocator, frontmatter.getValue(fm, "aliases") orelse ""),
-            .hooks_json = try allocator.dupe(u8, hooksJsonFrom(fm)),
+            .hooks_json = try allocator.dupe(u8, jsonObjectFrom(fm, "hooks")),
+            .disallowed_tools = try parseCommaList(allocator, getEither(fm, "disallowed-tools", "disallowedTools") orelse ""),
+            .argument_hint = try allocator.dupe(u8, getEither(fm, "argument-hint", "argumentHint") orelse ""),
+            .metadata_json = try allocator.dupe(u8, jsonObjectFrom(fm, "metadata")),
         };
     }
 
@@ -225,11 +295,34 @@ pub fn parse(
         .version = try allocator.dupe(u8, ""),
         .aliases = try allocator.alloc([]u8, 0),
         .hooks_json = try allocator.dupe(u8, ""),
+        .disallowed_tools = try allocator.alloc([]u8, 0),
+        .argument_hint = try allocator.dupe(u8, ""),
+        .metadata_json = try allocator.dupe(u8, ""),
     };
 }
 
 fn getEither(fm: []const u8, key_a: []const u8, key_b: []const u8) ?[]const u8 {
     return frontmatter.getValue(fm, key_a) orelse frontmatter.getValue(fm, key_b);
+}
+
+/// bundled-skills-02: resolve a skill's final identity from the caller-supplied
+/// `dirname` (a bare leaf, or an already `:`-namespaced path the caller
+/// computed from directory/plugin structure -- see `appendFromDir`) and an
+/// optional frontmatter `name:` override. A bare frontmatter name (no `:` of
+/// its own) is RE-namespaced under `dirname`'s prefix rather than replacing it
+/// outright, so a directory-scoped skill does not lose its `apps/web:`/
+/// `<plugin>:` scoping just because its SKILL.md declares the conventional
+/// (dirname-matching) bare `name:`. An absent/empty frontmatter name, or a
+/// `dirname` with no prefix (the common flat case), behaves exactly as before.
+/// A frontmatter name the author already wrote WITH its own `:` is trusted
+/// verbatim as an explicit full override. Caller owns the returned slice.
+fn effectiveSkillName(allocator: std.mem.Allocator, dirname: []const u8, fm_name: ?[]const u8) ![]u8 {
+    const n = fm_name orelse return allocator.dupe(u8, dirname);
+    if (n.len == 0) return allocator.dupe(u8, dirname);
+    if (std.mem.indexOfScalar(u8, n, ':') != null) return allocator.dupe(u8, n);
+    const prefix = if (std.mem.lastIndexOfScalar(u8, dirname, ':')) |idx| dirname[0..idx] else "";
+    if (prefix.len == 0) return allocator.dupe(u8, n);
+    return std.fmt.allocPrint(allocator, "{s}:{s}", .{ prefix, n });
 }
 
 /// Description from frontmatter, handling inline and `description: |` block
@@ -272,16 +365,17 @@ fn parseContext(v: ?[]const u8) SkillContext {
     return .inline_skill;
 }
 
-/// skills-11: extract the skill's `hooks:` frontmatter value. zcode's
-/// frontmatter parser is flat-key only (no nested YAML), so a skill declares
-/// its hooks as a single-line JSON object after `hooks:` -- the same shape the
-/// settings.json `hooks` map uses. Returns the raw JSON object slice, or "" when
-/// the field is absent or not a JSON object. The slice aliases into `fm`; the
-/// caller dupes it. Only the JSON-object form is supported (a constrained format
-/// in place of a YAML sub-parser, per the skills-11 footgun note); a non-`{`
+/// skills-11 / bundled-skills-17: extract a frontmatter field's value as an
+/// opaque single-line JSON object. zcode's frontmatter parser is flat-key only
+/// (no nested YAML), so a skill declares `hooks:` / `metadata:` as a
+/// single-line JSON object -- `hooks:` in the same shape settings.json's
+/// `hooks` map uses, `metadata:` as a free-form object. Returns the raw JSON
+/// object slice, or "" when the field is absent or not a JSON object. The
+/// slice aliases into `fm`; the caller dupes it. Only the JSON-object form is
+/// supported (a constrained format in place of a YAML sub-parser); a non-`{`
 /// value degrades to "" rather than faulting.
-fn hooksJsonFrom(fm: []const u8) []const u8 {
-    const v = frontmatter.getValue(fm, "hooks") orelse return "";
+pub fn jsonObjectFrom(fm: []const u8, key: []const u8) []const u8 {
+    const v = frontmatter.getValue(fm, key) orelse return "";
     const t = std.mem.trim(u8, v, " \t\r");
     if (t.len == 0 or t[0] != '{') return "";
     return t;
@@ -358,7 +452,37 @@ pub fn hasOnlySafeProperties(spec: *const SkillSpec) bool {
     // is active, so a hooks block makes the skill unsafe (must consult the
     // permission engine rather than auto-allow).
     if (spec.hooks_json.len > 0) return false;
+    // bundled-skills-17: a declared deny-list is a tool-surface property, same
+    // family as allowed-tools, so it is unsafe by the same reasoning.
+    if (spec.disallowed_tools.len > 0) return false;
     return true;
+}
+
+/// bundled-skills-03/17: true when `tool_name` falls outside a skill's
+/// declared tool surface, so the run path can refuse the call instead of only
+/// using `allowed_tools`/`disallowed_tools` as a permission auto-allow grant
+/// or a listing/detail-view annotation. `allowed_tools`, when non-empty,
+/// narrows the surface to EXACTLY that list -- anything not named is blocked.
+/// Otherwise a non-empty `disallowed_tools` blocks exactly those names and
+/// nothing else (mirrors `disallowed_tools`'s own doc comment: "Ignored when
+/// `allowed_tools` is non-empty"). Both lists empty means no restriction (every
+/// tool is allowed). Comparison is case-insensitive, matching every other
+/// tool/skill name comparison in this module.
+pub fn isToolBlockedBySkillRestriction(
+    allowed_tools: []const []const u8,
+    disallowed_tools: []const []const u8,
+    tool_name: []const u8,
+) bool {
+    if (allowed_tools.len > 0) {
+        for (allowed_tools) |t| {
+            if (std.ascii.eqlIgnoreCase(t, tool_name)) return false;
+        }
+        return true;
+    }
+    for (disallowed_tools) |t| {
+        if (std.ascii.eqlIgnoreCase(t, tool_name)) return true;
+    }
+    return false;
 }
 
 // ===========================================================================
@@ -459,6 +583,9 @@ pub fn mcpPromptToSkill(
         .version = try allocator.dupe(u8, ""),
         .aliases = try allocator.alloc([]u8, 0),
         .hooks_json = try allocator.dupe(u8, ""),
+        .disallowed_tools = try allocator.alloc([]u8, 0),
+        .argument_hint = try allocator.dupe(u8, ""),
+        .metadata_json = try allocator.dupe(u8, ""),
     };
 }
 
@@ -502,6 +629,43 @@ test "parse populates fields and strips frontmatter from body" {
     // Body must NOT contain the frontmatter.
     try testing.expect(std.mem.indexOf(u8, spec.prompt, "name: committer") == null);
     try testing.expect(std.mem.indexOf(u8, spec.prompt, "Do the thing.") != null);
+}
+
+test "bundled-skills-02: a bare frontmatter name is re-namespaced under the caller's directory prefix" {
+    // The realistic case: a SKILL.md's `name:` matches its own directory's
+    // leaf (the conventional authoring pattern) -- the namespace prefix the
+    // caller computed from directory/plugin structure ("apps/web") must
+    // survive, not be replaced outright by the bare "deploy".
+    {
+        const raw = "---\nname: deploy\ndescription: ship it\n---\nbody\n";
+        var spec = try parse(testing.allocator, raw, "apps/web:deploy", .workspace, "/p");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("apps/web:deploy", spec.name);
+    }
+    // A multi-level within-root namespace (appendFromDir's own recursion)
+    // behaves the same way.
+    {
+        const raw = "---\nname: deploy\ndescription: ship it\n---\nbody\n";
+        var spec = try parse(testing.allocator, raw, "frontend:sub:deploy", .workspace, "/p");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("frontend:sub:deploy", spec.name);
+    }
+    // An author-written fully-qualified name (already containing ':') is
+    // trusted verbatim as an explicit override.
+    {
+        const raw = "---\nname: other:explicit\ndescription: ship it\n---\nbody\n";
+        var spec = try parse(testing.allocator, raw, "apps/web:deploy", .workspace, "/p");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("other:explicit", spec.name);
+    }
+    // The flat/unprefixed case (dirname has no ':') is exactly the pre-existing
+    // behavior: frontmatter name wins outright.
+    {
+        const raw = "---\nname: committer\ndescription: d\n---\nbody\n";
+        var spec = try parse(testing.allocator, raw, "dirname", .user, "/p");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("committer", spec.name);
+    }
 }
 
 test "parse handles no frontmatter" {
@@ -641,10 +805,39 @@ test "hasOnlySafeProperties: name/description-only safe; allowed-tools and fork 
 
     // A builtin made via makeBuiltin (no overrides) is safe.
     {
-        var spec = try makeBuiltin(alloc, "loop", "loop a prompt", "do it", &.{});
+        var spec = try makeBuiltin(alloc, "loop", "loop a prompt", "do it", &.{}, .{});
         defer spec.deinit(alloc);
         try testing.expect(hasOnlySafeProperties(&spec));
     }
+}
+
+test "isToolBlockedBySkillRestriction: no restriction, allow-list, and deny-list precedence" {
+    // No restriction at all -- nothing is blocked.
+    try testing.expect(!isToolBlockedBySkillRestriction(&.{}, &.{}, "Write"));
+
+    // allowed_tools non-empty: exactly that list, case-insensitively.
+    const allowed = [_][]const u8{ "Read", "Grep", "Glob" };
+    try testing.expect(!isToolBlockedBySkillRestriction(&allowed, &.{}, "read"));
+    try testing.expect(!isToolBlockedBySkillRestriction(&allowed, &.{}, "Glob"));
+    try testing.expect(isToolBlockedBySkillRestriction(&allowed, &.{}, "Write"));
+    try testing.expect(isToolBlockedBySkillRestriction(&allowed, &.{}, "Bash"));
+
+    // disallowed_tools only (no allowed_tools): exactly those names are
+    // blocked, everything else is fine.
+    const disallowed = [_][]const u8{ "Write", "Edit" };
+    try testing.expect(isToolBlockedBySkillRestriction(&.{}, &disallowed, "write"));
+    try testing.expect(isToolBlockedBySkillRestriction(&.{}, &disallowed, "Edit"));
+    try testing.expect(!isToolBlockedBySkillRestriction(&.{}, &disallowed, "Read"));
+    try testing.expect(!isToolBlockedBySkillRestriction(&.{}, &disallowed, "Bash"));
+
+    // allowed_tools, when non-empty, wins over disallowed_tools entirely --
+    // mirrors disallowed_tools's own doc comment ("Ignored when allowed_tools
+    // is non-empty"). Here "Write" is (oddly) in both lists; allowed_tools
+    // still decides.
+    const both_allowed = [_][]const u8{ "Write", "Read" };
+    const both_disallowed = [_][]const u8{ "Write", "Edit" };
+    try testing.expect(!isToolBlockedBySkillRestriction(&both_allowed, &both_disallowed, "Write"));
+    try testing.expect(isToolBlockedBySkillRestriction(&both_allowed, &both_disallowed, "Edit"));
 }
 
 test "skills-11: parse extracts a single-line JSON hooks block; absent yields empty" {
@@ -725,6 +918,108 @@ test "skills-11: clone round-trips hooks_json" {
     try testing.expectEqualStrings(spec.hooks_json, copy.hooks_json);
 }
 
+test "bundled-skills-17: parse reads disallowed-tools, argument-hint, and metadata frontmatter" {
+    const alloc = testing.allocator;
+
+    // Dashed spellings, plus a metadata JSON object.
+    {
+        const raw =
+            "---\nname: guarded\ndescription: d\n" ++
+            "disallowed-tools: Write, Edit\nargument-hint: [--fix] [<pr#>|<branch>|<path>]\n" ++
+            "metadata: {\"catalog\":\"security\"}\n" ++
+            "---\nbody\n";
+        var spec = try parse(alloc, raw, "guarded", .workspace, "/p");
+        defer spec.deinit(alloc);
+
+        try testing.expectEqual(@as(usize, 2), spec.disallowed_tools.len);
+        try testing.expectEqualStrings("Write", spec.disallowed_tools[0]);
+        try testing.expectEqualStrings("Edit", spec.disallowed_tools[1]);
+        try testing.expectEqualStrings("[--fix] [<pr#>|<branch>|<path>]", spec.argument_hint);
+        try testing.expect(std.mem.indexOf(u8, spec.metadata_json, "catalog") != null);
+        // A tool deny-list is a non-safe property, same family as allowed-tools.
+        try testing.expect(!hasOnlySafeProperties(&spec));
+    }
+
+    // camelCase spellings resolve the same way.
+    {
+        const raw = "---\nname: g2\ndescription: d\ndisallowedTools: Bash\nargumentHint: <target>\n---\nb\n";
+        var spec = try parse(alloc, raw, "g2", .workspace, "/p");
+        defer spec.deinit(alloc);
+        try testing.expectEqual(@as(usize, 1), spec.disallowed_tools.len);
+        try testing.expectEqualStrings("Bash", spec.disallowed_tools[0]);
+        try testing.expectEqualStrings("<target>", spec.argument_hint);
+    }
+
+    // Absent fields degrade to empty, and stay safe.
+    {
+        const raw = "---\nname: plain\ndescription: d\n---\nb\n";
+        var spec = try parse(alloc, raw, "plain", .workspace, "/p");
+        defer spec.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), spec.disallowed_tools.len);
+        try testing.expectEqualStrings("", spec.argument_hint);
+        try testing.expectEqualStrings("", spec.metadata_json);
+        try testing.expect(hasOnlySafeProperties(&spec));
+    }
+
+    // A non-object metadata value degrades to empty rather than faulting.
+    {
+        const raw = "---\nname: bad\ndescription: d\nmetadata: notjson\n---\nb\n";
+        var spec = try parse(alloc, raw, "bad", .workspace, "/p");
+        defer spec.deinit(alloc);
+        try testing.expectEqualStrings("", spec.metadata_json);
+    }
+}
+
+test "bundled-skills-17: clone round-trips disallowed_tools/argument_hint/metadata_json" {
+    const alloc = testing.allocator;
+    const raw =
+        "---\nname: g\ndescription: d\ndisallowed-tools: Write\nargument-hint: <x>\n" ++
+        "metadata: {\"k\":\"v\"}\n---\nb\n";
+    var spec = try parse(alloc, raw, "g", .workspace, "/p");
+    defer spec.deinit(alloc);
+    var copy = try clone(alloc, &spec);
+    defer copy.deinit(alloc);
+    try testing.expectEqual(spec.disallowed_tools.len, copy.disallowed_tools.len);
+    try testing.expectEqualStrings(spec.disallowed_tools[0], copy.disallowed_tools[0]);
+    try testing.expectEqualStrings(spec.argument_hint, copy.argument_hint);
+    try testing.expectEqualStrings(spec.metadata_json, copy.metadata_json);
+}
+
+test "bundled-skills-03/226: makeBuiltin threads opts into the produced SkillSpec" {
+    const alloc = testing.allocator;
+    const tools = [_][]const u8{ "Read", "Grep", "Glob" };
+    var spec = try makeBuiltin(alloc, "debug", "diagnose the session", "do it", &.{}, .{
+        .when_to_use = "when logs need inspecting",
+        .argument_hint = "[topic]",
+        .allowed_tools = &tools,
+        .user_invocable = true,
+        .disable_model_invocation = true,
+        .model = "opus",
+        .effort = "high",
+        .context = .fork,
+    });
+    defer spec.deinit(alloc);
+
+    try testing.expectEqualStrings("when logs need inspecting", spec.when_to_use);
+    try testing.expectEqualStrings("[topic]", spec.argument_hint);
+    try testing.expectEqual(@as(usize, 3), spec.allowed_tools.len);
+    try testing.expectEqualStrings("Read", spec.allowed_tools[0]);
+    try testing.expectEqualStrings("Grep", spec.allowed_tools[1]);
+    try testing.expectEqualStrings("Glob", spec.allowed_tools[2]);
+    try testing.expect(spec.disable_model_invocation);
+    try testing.expectEqualStrings("opus", spec.model);
+    try testing.expectEqualStrings("high", spec.effort);
+    try testing.expectEqual(SkillContext.fork, spec.context);
+
+    // An unset opts field keeps makeBuiltin's original defaults.
+    var plain = try makeBuiltin(alloc, "plain", "d", "do it", &.{}, .{});
+    defer plain.deinit(alloc);
+    try testing.expectEqualStrings("", plain.when_to_use);
+    try testing.expectEqual(@as(usize, 0), plain.allowed_tools.len);
+    try testing.expect(!plain.disable_model_invocation);
+    try testing.expect(plain.user_invocable);
+}
+
 test "skills-13: parse reads the aliases comma list; matchesNameOrAlias matches canonical name and any alias" {
     const alloc = testing.allocator;
 
@@ -760,7 +1055,7 @@ test "skills-13: a skill with no aliases yields an empty list and matches only i
 test "skills-13: makeBuiltin stores aliases and clone round-trips them" {
     const alloc = testing.allocator;
     const aliases = [_][]const u8{ "cmt", "ci" };
-    var spec = try makeBuiltin(alloc, "commit", "make a commit", "do it", &aliases);
+    var spec = try makeBuiltin(alloc, "commit", "make a commit", "do it", &aliases, .{});
     defer spec.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), spec.aliases.len);
     try testing.expect(matchesNameOrAlias(&spec, "ci"));

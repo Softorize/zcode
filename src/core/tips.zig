@@ -54,6 +54,10 @@ pub const registry = [_]Tip{
     .{ .id = "skills", .text = "Skills live in .zcode/skills and ~/.zcode/skills; run one with /skill <name> or let the model invoke it." },
     .{ .id = "compact", .text = "/compact summarizes the conversation to free context; it happens automatically as you approach the limit." },
     .{ .id = "rewind", .text = "/rewind restores the conversation to an earlier turn when a direction went wrong." },
+    // sessions-storage-11: the reference's primary rewind-discovery path is
+    // this gesture, not the slash command (cc_strings.txt tip registry:
+    // id:'double-esc', cooldownSessions:10).
+    .{ .id = "double-esc", .text = "Double-tap Esc at an empty prompt to rewind the conversation to a previous point in time.", .cooldown_sessions = 10 },
     .{ .id = "resume", .text = "Resume past work with /resume; export a transcript with `session export <id> md` for a readable Markdown copy." },
     .{ .id = "mcp", .text = "MCP servers extend zcode with extra tools - manage them with /mcp." },
     .{ .id = "at-mention", .text = "Use @file mentions in your prompt to pull a file into context quickly." },

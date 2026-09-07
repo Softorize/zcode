@@ -222,6 +222,90 @@ test "runtime: SessionStart additionalContext reaches the session history" {
     h.runtime.maybeFireSessionStart();
 }
 
+test "hooks-permissions-02: Setup additionalContext reaches the session history, fires once" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json",
+        \\{"hooks":{"Setup":[{"matcher":"*","hooks":[{"type":"command","command":"echo '{\"hookSpecificOutput\":{\"additionalContext\":\"SETUP_INJECTED\"}}'"}]}]}}
+    );
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    var h = try Harness.init(alloc, root, cwd);
+    defer h.deinit();
+
+    h.runtime.maybeFireSetup();
+    try testing.expect(h.runtime.setup_fired);
+    try testing.expect(h.historyContains("SETUP_INJECTED"));
+
+    // Once-per-session: a second call is a no-op.
+    h.runtime.maybeFireSetup();
+}
+
+test "hooks-permissions-02: TaskCompleted fires exactly once on the done transition, not on every update" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "task_completed_count.txt" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"hooks\":{{\"TaskCompleted\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"echo x >> '{s}'\"}}]}}]}}}}",
+        .{sentinel},
+    );
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    const task = @import("../tools/task.zig");
+    const created = try task.taskCreate(alloc, cwd, "swarm-task", "test task", "");
+    defer alloc.free(created);
+
+    // Extract the numeric id from "task created\nid=<N>\n...".
+    const id_line_start = std.mem.indexOf(u8, created, "id=").? + 3;
+    const id_line_end = std.mem.indexOfScalarPos(u8, created, id_line_start, '\n').?;
+    const id = created[id_line_start..id_line_end];
+
+    // First transition into "done": TaskCompleted fires once.
+    const upd1 = try task.taskUpdate(alloc, cwd, id, null, null, "done", null, null);
+    defer alloc.free(upd1);
+    const after_first = std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096)) catch |err| {
+        std.debug.print("TaskCompleted hook did not fire on first done transition: {any}\n", .{err});
+        return error.TaskCompletedHookDidNotRun;
+    };
+    defer alloc.free(after_first);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, after_first, "x\n"));
+
+    // A subsequent update that is STILL done (e.g. editing the summary) does
+    // not re-fire TaskCompleted -- it only fires on the transition.
+    const upd2 = try task.taskUpdate(alloc, cwd, id, null, "revised summary", "done", null, null);
+    defer alloc.free(upd2);
+    const after_second = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(after_second);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, after_second, "x\n"));
+}
+
 test "runtime: UserPromptSubmit exit-2 blocks the prompt with its reason" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -637,4 +721,183 @@ test "agent-loop-deep-11: max-rounds stop reports terminal_reason max_turns" {
     defer result.deinit(alloc);
 
     try testing.expectEqual(agent_runtime.TerminalReason.max_turns, result.terminal_reason);
+}
+
+// --- hooks-permissions-02 (CORRECTED): StopFailure fires instead of Stop ----
+// when the turn ends on a model/API error, not (per the original gap guess)
+// when a Stop *hook's* own execution fails -- see agent_runtime.zig's
+// `fireStopFailureHook` doc comment for the verified reference correction.
+
+test "hooks-permissions-02 (corrected): StopFailure fires instead of Stop when the model call errors" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "stop_failure.json" });
+    defer alloc.free(sentinel);
+    const stop_sentinel = try std.fs.path.join(alloc, &.{ root, "stop_fired.txt" });
+    defer alloc.free(stop_sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"StopFailure":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}],"Stop":[{{"matcher":"*","hooks":[{{"type":"command","command":"echo x >> '{s}'"}}]}}]}}}}
+    , .{ sentinel, stop_sentinel });
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    var h = try Harness.init(alloc, root, cwd);
+    defer h.deinit();
+    try h.useMockProvider();
+
+    // Force a deterministic, hermetic model-call error with no network I/O at
+    // all: the availableModels allowlist gate (agent_history.zig, ahead of
+    // any provider adapter creation) rejects "mock-agent" outright.
+    h.allocator.free(h.cfg.available_models);
+    h.cfg.available_models = try h.allocator.dupe(u8, "some-other-model");
+
+    var result = try h.runtime.handlePromptDetailed("say something");
+    defer result.deinit(alloc);
+
+    try testing.expect(std.mem.indexOf(u8, result.final_text, "Model error:") != null);
+    try testing.expect(std.mem.indexOf(u8, result.final_text, "ModelNotAllowed") != null);
+
+    // StopFailure fired with the error captured in its stdin payload.
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("StopFailure", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("ModelNotAllowed", parsed.value.object.get("error").?.string);
+    try testing.expect(parsed.value.object.get("error_details") != null);
+
+    // The death-spiral guard skipped Stop entirely -- it never ran.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(rt.io, stop_sentinel, .{}));
+}
+
+// --- hooks-permissions-03: CwdChanged fires on a real Bash `cd` -------------
+
+test "hooks-permissions-03: a Bash cd during a turn fires CwdChanged with old_cwd/new_cwd" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+
+    try tmp.dir.createDirPath(rt.io, "proj/sub");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "cwd_changed.json" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"CwdChanged":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat > '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    try MockResponses.install(alloc,
+        \\["{\"assistant\":\"Changing directory.\",\"tool_calls\":[{\"name\":\"Bash\",\"args\":{\"command\":\"cd sub\"}}]}","{\"assistant\":\"Done.\",\"tool_calls\":[]}"]
+    );
+    defer MockResponses.clear();
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    var h = try Harness.init(alloc, root, cwd);
+    defer h.deinit();
+    try h.useMockProvider();
+    h.allocator.free(h.cfg.sandbox);
+    h.cfg.sandbox = try h.allocator.dupe(u8, "danger-full-access");
+
+    var result = try h.runtime.handlePromptDetailed("cd into sub and report");
+    defer result.deinit(alloc);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(4096));
+    defer alloc.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("CwdChanged", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings(cwd, parsed.value.object.get("old_cwd").?.string);
+    try testing.expect(std.mem.endsWith(u8, parsed.value.object.get("new_cwd").?.string, "sub"));
+}
+
+// --- hooks-permissions-03: InstructionsLoaded fires on real memory discovery -
+
+test "hooks-permissions-03: InstructionsLoaded fires once for a ZCODE.md discovered at session start, not again next turn" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try test_helpers.tmpDirCwd(alloc, &tmp);
+    defer alloc.free(root);
+    var home_ov = try HomeOverride.install(alloc, root);
+    defer home_ov.deinit();
+
+    try tmp.dir.createDirPath(rt.io, "proj");
+    const cwd = try test_helpers.tmpDirPath(alloc, &tmp, "proj");
+    defer alloc.free(cwd);
+    try tmp.dir.writeFile(rt.io, .{ .sub_path = "proj/ZCODE.md", .data = "# Project notes\nUse tabs.\n" });
+
+    const sentinel = try std.fs.path.join(alloc, &.{ root, "instructions_loaded_count.txt" });
+    defer alloc.free(sentinel);
+    const settings = try std.fmt.allocPrint(alloc,
+        \\{{"hooks":{{"InstructionsLoaded":[{{"matcher":"*","hooks":[{{"type":"command","command":"cat >> '{s}'"}}]}}]}}}}
+    , .{sentinel});
+    defer alloc.free(settings);
+    try writeFileMakingDirs(tmp.dir, ".zcode/settings.json", settings);
+
+    try MockResponses.install(alloc,
+        \\["{\"assistant\":\"FIRST\",\"tool_calls\":[]}","{\"assistant\":\"SECOND\",\"tool_calls\":[]}"]
+    );
+    defer MockResponses.clear();
+
+    agent_runtime.hooks_test_override = true;
+    defer agent_runtime.hooks_test_override = false;
+
+    var h = try Harness.init(alloc, root, cwd);
+    defer h.deinit();
+    try h.useMockProvider();
+
+    var result1 = try h.runtime.handlePromptDetailed("what does the project say");
+    defer result1.deinit(alloc);
+
+    // `instructions.discover` walks UP from cwd to the filesystem root, so
+    // this tmp dir (nested inside the real zcode checkout under
+    // `.zig-cache/tmp/...`) also picks up THIS repo's own ancestor CLAUDE.md
+    // as a second, unrelated entry -- an environmental artifact of running
+    // under this repo's own tree, not something to special-case in the
+    // production code. Assert on the ZCODE.md-specific occurrence count
+    // instead of the total InstructionsLoaded count so the test is robust to
+    // that ambient discovery.
+    const first_data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(16 * 1024));
+    defer alloc.free(first_data);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, first_data, "ZCODE.md"));
+    // memory_type classification itself (User vs Project vs Local) is
+    // unit-tested directly against `classifyMemoryType` in agent_runtime.zig
+    // -- this HOME-overridden harness puts the whole tmp tree under the fake
+    // $HOME, so the project file classifies as "User" here, not "Project".
+    try testing.expect(std.mem.indexOf(u8, first_data, "\"memory_type\":\"User\"") != null);
+    try testing.expect(std.mem.indexOf(u8, first_data, "\"load_reason\":\"session_start\"") != null);
+
+    // A second turn with no cache-busting event (no /clear, /compact, edit) is
+    // a cache HIT: the discovery cost is skipped and InstructionsLoaded does
+    // not fire again for either file.
+    var result2 = try h.runtime.handlePromptDetailed("and now");
+    defer result2.deinit(alloc);
+    const second_data = try std.Io.Dir.cwd().readFileAlloc(rt.io, sentinel, alloc, .limited(16 * 1024));
+    defer alloc.free(second_data);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, second_data, "ZCODE.md"));
 }

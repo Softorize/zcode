@@ -12,3 +12,4 @@ extensions/*/out/
 extensions/*/*.vsix
 dist/
 .claude/
+__pycache__/
