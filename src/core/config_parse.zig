@@ -422,8 +422,10 @@ fn readConfigFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         // A 1MB limit is generous for a key-value config; exceeding
         // it almost always means a stray blob got pasted in. Name
         // the file + limit so the user can fix it without having to
-        // guess the boundary.
-        error.FileTooBig => {
+        // guess the boundary. 0.16: readFileAlloc(.limited(N)) yields
+        // error.StreamTooLong on an over-limit read, not FileTooBig --
+        // catch both so this keeps working across std revisions.
+        error.StreamTooLong, error.FileTooBig => {
             std_io.stderrWriter().print(
                 "zcode: config error: {s} exceeds the 1 MiB config size limit.\n  - Trim the file, or move large data out of config.toml.\n",
                 .{path},

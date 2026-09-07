@@ -131,7 +131,15 @@ pub fn scopeName(scope: CommandScope) []const u8 {
 
 pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]CommandSpec {
     var out = std.array_list.Managed(CommandSpec).init(allocator);
-    errdefer freeList(allocator, out.items);
+    // NOT `freeList(allocator, out.items)`: see agents.zig:list -- freeing
+    // a slice sized to `.items.len` against an allocation sized to
+    // `.capacity` panics ("Invalid free") once the list has grown past its
+    // first append and a later entry (e.g. corrupt command frontmatter)
+    // errors out.
+    errdefer {
+        for (out.items) |*command| command.deinit(allocator);
+        out.deinit();
+    }
 
     if (userCommandsRoot(allocator)) |root| {
         defer allocator.free(root);

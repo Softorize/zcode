@@ -39,7 +39,15 @@ pub fn listWithTouched(
     touched_files: []const []const u8,
 ) ![]SkillSpec {
     var out = std.array_list.Managed(SkillSpec).init(allocator);
-    errdefer freeList(allocator, out.items);
+    // NOT `freeList(allocator, out.items)`: see agents.zig:list -- freeing
+    // a slice sized to `.items.len` against an allocation sized to
+    // `.capacity` panics ("Invalid free") once the list has grown past its
+    // first append and a later entry (e.g. corrupt SKILL.md frontmatter)
+    // errors out.
+    errdefer {
+        for (out.items) |*skill| skill.deinit(allocator);
+        out.deinit();
+    }
 
     try appendBuiltinSkills(allocator, &out);
 

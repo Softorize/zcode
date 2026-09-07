@@ -175,7 +175,16 @@ pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]PluginSpec {
     defer trust_status.deinit(allocator);
 
     var out = std.array_list.Managed(PluginSpec).init(allocator);
-    errdefer freeList(allocator, out.items);
+    // NOT `freeList(allocator, out.items)`: that frees a slice sized to
+    // `.items.len` against an allocation actually sized to `.capacity`,
+    // which panics ("Invalid free") once the list has grown past its
+    // first append and a later entry (e.g. a corrupt plugin.json) errors
+    // out. Deinit each appended item, then let the ArrayList free its own
+    // correctly-sized backing buffer.
+    errdefer {
+        for (out.items) |*plugin| plugin.deinit(allocator);
+        out.deinit();
+    }
 
     if (userPluginsRoot(allocator)) |root| {
         defer allocator.free(root);

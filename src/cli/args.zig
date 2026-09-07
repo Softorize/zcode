@@ -1542,11 +1542,18 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions
             return options;
         }
         if (std.mem.eql(u8, positional.items[1], "resume")) {
-            // Arg is now optional: `session resume` with no id/term prints the
-            // session list with a resume hint (the interactive picker lives in
-            // the REPL); `session resume <id-or-term>` resolves exact then fuzzy.
+            // Arg is optional ONLY on a real TTY: `session resume` with no
+            // id/term there prints the session list with a resume hint (the
+            // interactive picker lives in the REPL). Piped/non-interactive
+            // callers (scripts, CI) get the same targeted usage error as
+            // every other <id>-required session subcommand instead of a
+            // silent listing -- there is no terminal to pick from.
+            const subject = if (positional.items.len > 2) positional.items[2] else null;
+            if (subject == null and std.c.isatty(std.Io.File.stdin().handle) == 0) {
+                return reportUsageError("session resume", "<session-id>", "session resume <session-id>");
+            }
             options.command = .session_resume;
-            options.subject = if (positional.items.len > 2) positional.items[2] else null;
+            options.subject = subject;
             return options;
         }
         if (std.mem.eql(u8, positional.items[1], "compact")) {

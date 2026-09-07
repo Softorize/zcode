@@ -277,7 +277,14 @@ fn listCheckpointsWithStoreRoot(
     defer dir.close(rt.io);
 
     var out = std.array_list.Managed(CheckpointEntry).init(allocator);
-    errdefer freeCheckpointEntries(allocator, out.items);
+    // NOT `freeCheckpointEntries(allocator, out.items)`: see
+    // agents.zig:list -- freeing a slice sized to `.items.len` against an
+    // allocation sized to `.capacity` panics ("Invalid free") once the
+    // list has grown past its first append and a later entry errors out.
+    errdefer {
+        for (out.items) |*entry| entry.deinit(allocator);
+        out.deinit();
+    }
 
     var it = dir.iterate();
     while (try it.next(rt.io)) |entry| {

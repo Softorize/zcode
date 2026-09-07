@@ -228,7 +228,14 @@ pub fn findByName(allocator: std.mem.Allocator, cwd: []const u8, raw_name: []con
 
 pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]OutputStyle {
     var out = std.array_list.Managed(OutputStyle).init(allocator);
-    errdefer freeList(allocator, out.items);
+    // NOT `freeList(allocator, out.items)`: see agents.zig:list -- freeing
+    // a slice sized to `.items.len` against an allocation sized to
+    // `.capacity` panics ("Invalid free") once the list has grown past its
+    // first append and a later entry errors out.
+    errdefer {
+        for (out.items) |*style| style.deinit(allocator);
+        out.deinit();
+    }
 
     try appendBuiltinStyles(allocator, &out);
 

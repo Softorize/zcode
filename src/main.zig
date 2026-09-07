@@ -868,9 +868,13 @@ pub fn main(init: std.process.Init) !void {
     @import("core/config_migrations.zig").runAll(allocator, cwd);
 
     var loaded_cfg = config_mod.load(allocator, cwd, &opts) catch |err| {
-        // FileTooBig: config_parse already emitted a targeted line
-        // naming the offending file and the 1 MiB limit. Exit silently.
-        if (err == error.FileTooBig) std.process.exit(2);
+        // FileTooBig / StreamTooLong (0.16's readFileAlloc(.limited(N))
+        // error for an over-limit read): config_parse already emitted a
+        // targeted line naming the offending file and the 1 MiB limit.
+        // Exit silently -- the generic "Delete the file" fallback below
+        // would otherwise pile a second, misleading hint onto the same
+        // error.
+        if (err == error.FileTooBig or err == error.StreamTooLong) std.process.exit(2);
         const stderr = std_io.stderrWriter();
         // AccessDenied: the generic "Delete the file to start fresh"
         // hint is actively dangerous (the user's real config is

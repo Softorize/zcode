@@ -681,11 +681,49 @@ pub const Store = struct {
     /// `<zcode_home>/projects/<slug(active_cwd)>/`) when `active_cwd` is
     /// known; otherwise falls back to `list()`'s flat-directory scan so a
     /// caller that never set `active_cwd` is unaffected.
+    ///
+    /// Also folds in `self.sessions_dir`, the pre-migration flat layout: a
+    /// session sitting there predates per-project sharding (or was written
+    /// by a caller that never set `active_cwd`) and so carries no project
+    /// affiliation at all -- it belongs in every project's default view,
+    /// not only under `--all-projects`. Without this, such a session
+    /// silently vanished from `session list` the instant `active_cwd` was
+    /// set (it still resumed fine via `sessionPath`'s cross-project scan;
+    /// it just stopped being listed).
     pub fn listForActiveProject(self: *Store) ![]SessionEntry {
         if (self.active_cwd.len == 0) return self.list();
         const project_dir = try self.projectDirForCwd(self.active_cwd);
         defer self.allocator.free(project_dir);
-        return self.listDir(project_dir);
+        const project_entries = try self.listDir(project_dir);
+        errdefer self.freeSessionEntries(project_entries);
+
+        if (std.mem.eql(u8, self.sessions_dir, project_dir)) return project_entries;
+
+        const legacy_entries = try self.listDir(self.sessions_dir);
+        if (legacy_entries.len == 0) {
+            self.allocator.free(legacy_entries);
+            return project_entries;
+        }
+        errdefer self.freeSessionEntries(legacy_entries);
+
+        var out = std.array_list.Managed(SessionEntry).init(self.allocator);
+        errdefer {
+            for (out.items) |e| {
+                self.allocator.free(e.id);
+                if (e.label) |l| self.allocator.free(l);
+                if (e.origin_cwd) |o| self.allocator.free(o);
+            }
+            out.deinit();
+        }
+        try out.appendSlice(project_entries);
+        try out.appendSlice(legacy_entries);
+        // Both source slices' entries have been copied (moved, not
+        // duplicated) into `out`; free only the now-empty backing slices.
+        self.allocator.free(project_entries);
+        self.allocator.free(legacy_entries);
+
+        std.mem.sort(SessionEntry, out.items, {}, lessRecentFirst);
+        return out.toOwnedSlice();
     }
 
     /// List every session across the legacy flat directory AND every

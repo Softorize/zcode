@@ -624,6 +624,14 @@ pub const Client = struct {
     /// registry alone cannot drive (mcp-01 / mcp-04 live wiring).
     scoped_servers: []mcp_config.ServerConfig = &.{},
     scoped_loaded: bool = false,
+    /// Set by `ensureScopedConfig` when `loadScopedConfig` found the legacy
+    /// `servers.json` registry (the file `zcode mcp add` writes) is not valid
+    /// JSON. That is fatal, matching the pre-scoped-config `readServers()`
+    /// behavior, NOT a soft per-scope validation warning -- a hand-corrupted
+    /// registry must still hard-fail `mcp list`/`mcp tools`/etc with a
+    /// targeted message and exit 1, rather than silently merging in zero
+    /// legacy servers behind a warning line on stderr. Checked by `list()`.
+    scoped_registry_invalid: bool = false,
     /// Working directory used as the root for the project-scope `.mcp.json`
     /// parent traversal. When null, `ensureScopedConfig` resolves the process
     /// CWD. Set explicitly by tests via `loadScopedConfigForTest` so the
@@ -705,6 +713,16 @@ pub const Client = struct {
         if (!self.scoped_enabled or self.scoped_loaded) return;
         self.scoped_loaded = true;
         self.loadScopedConfig() catch |err| {
+            if (err == error.InvalidMcpRegistry) {
+                // loadScopedConfig already printed the targeted
+                // "registry file is not valid JSON" line; don't pile a
+                // second, vaguer "failed to load scoped config" warning
+                // on top. `list()` checks this flag and returns the same
+                // error so every mcp subcommand exits 1 exactly like the
+                // pre-scoped-config readServers() path did.
+                self.scoped_registry_invalid = true;
+                return;
+            }
             std_io.stderrWriter().print(
                 "warning: mcp: failed to load scoped config ({s}); using the legacy registry only\n",
                 .{@errorName(err)},
@@ -764,6 +782,23 @@ pub const Client = struct {
             else => return err,
         }
         errdefer user_result.deinit(self.allocator);
+
+        // A corrupt legacy servers.json (the file `zcode mcp add` writes) is
+        // fatal, matching readServers()'s pre-scoped-config behavior -- not a
+        // soft per-scope validation warning that would otherwise silently
+        // merge in zero legacy servers behind a line on stderr the operator
+        // may not even see (`mcp list | ...`). importLegacyRegistry records
+        // exactly one such error (scope=.user, server_name=null,
+        // severity=.fatal) when the file fails to parse as JSON at all.
+        for (user_result.errors) |e| {
+            if (e.scope == .user and e.server_name == null and e.severity == .fatal) {
+                std_io.stderrWriter().print(
+                    "error: mcp: registry file is not valid JSON: {s}\n  - Fix or delete the file; zcode will regenerate it on next `mcp add`.\n",
+                    .{self.registry_path},
+                ) catch {};
+                return error.InvalidMcpRegistry;
+            }
+        }
 
         // config-layout-12: `~/.claude.json`'s top-level `mcpServers` is the
         // reference's user-scope MCP registry, separate from zcode's own
@@ -1006,6 +1041,7 @@ pub const Client = struct {
 
     pub fn list(self: *Client) ![]Server {
         self.ensureScopedConfig();
+        if (self.scoped_registry_invalid) return error.InvalidMcpRegistry;
         // When scoped config is active, the merged set (legacy registry imported
         // at user scope + project `.mcp.json` + enterprise, filtered by policy /
         // approval) is the source of truth, rendered back into the flat

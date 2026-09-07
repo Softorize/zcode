@@ -82,7 +82,16 @@ pub fn count() usize {
 /// caller; the `text` points into `raw` (no copy). Free with `freeCustomTips`.
 pub fn parseCustomTips(allocator: std.mem.Allocator, raw: []const u8) ![]Tip {
     var out: std.ArrayListUnmanaged(Tip) = .empty;
-    errdefer freeCustomTips(allocator, out.items);
+    // NOT `freeCustomTips(allocator, out.items)`: that frees a slice sized
+    // to `.items.len` against an allocation sized to `.capacity`, which
+    // panics ("Invalid free") once the list has grown past its first
+    // append and a later append (e.g. an OOM'd `id` allocation) errors
+    // out. Free each already-appended id, then let the ArrayListUnmanaged
+    // free its own correctly-sized backing buffer.
+    errdefer {
+        for (out.items) |t| allocator.free(t.id);
+        out.deinit(allocator);
+    }
     var index: usize = 0;
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {

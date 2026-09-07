@@ -205,7 +205,19 @@ pub fn scopeName(scope: AgentScope) []const u8 {
 
 pub fn list(allocator: std.mem.Allocator, cwd: []const u8) ![]AgentSpec {
     var out = std.array_list.Managed(AgentSpec).init(allocator);
-    errdefer freeList(allocator, out.items);
+    // NOT `freeList(allocator, out.items)`: that frees a slice sized to
+    // `.items.len`, but the ArrayList's actual allocation is sized to
+    // `.capacity` (>= len once it has grown past its first append) --
+    // freeing the shorter slice hands the allocator a size that doesn't
+    // match the tracked allocation and panics ("Invalid free") the moment
+    // a later loader (a corrupt hand-edited agent JSON, say) errors out
+    // after at least one earlier agent (e.g. a builtin) was already
+    // appended. Deinit each appended item, then let the ArrayList free its
+    // own correctly-sized backing buffer.
+    errdefer {
+        for (out.items) |*agent| agent.deinit(allocator);
+        out.deinit();
+    }
 
     try appendBuiltinAgents(allocator, &out);
 
@@ -989,6 +1001,39 @@ test "cli-flags-05: a malformed --agents value is a silent no-op" {
     defer freeList(testing.allocator, agents);
     // No crash, and the builtin agents are still present.
     try testing.expect(agents.len > 0);
+}
+
+// Pass-39 regression: a corrupt on-disk agent JSON definition used to
+// SIGABRT the whole process instead of returning a clean error. list()'s
+// errdefer freed `out.items` -- a slice sized to `.items.len` -- against
+// the ArrayList's actual allocation, sized to `.capacity`. By the time
+// appendFromDir reaches the workspace agents dir, `out` already holds
+// every builtin agent, so `.capacity` has grown past `.items.len` and the
+// DebugAllocator's size-mismatch canary check panics ("Invalid free") the
+// instant the errdefer runs -- aborting instead of unwinding cleanly.
+// `zcode agents list` on a hand-corrupted `.zcode/agents/*.json` file must
+// exit 1 with a targeted message, not crash.
+test "list() returns a clean error instead of crashing on a corrupt workspace agent JSON file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try test_helpers_mod.tmpDirCwd(testing.allocator, &tmp);
+    defer testing.allocator.free(cwd);
+
+    const agents_dir = try std.fs.path.join(testing.allocator, &.{ cwd, ".zcode", "agents" });
+    defer testing.allocator.free(agents_dir);
+    try std.Io.Dir.cwd().createDirPath(rt.io, agents_dir);
+    const file_path = try std.fs.path.join(testing.allocator, &.{ agents_dir, "broken.json" });
+    defer testing.allocator.free(file_path);
+    try std.Io.Dir.cwd().writeFile(rt.io, .{
+        .sub_path = file_path,
+        .data = "not valid json",
+    });
+
+    // Confirm builtins load first (so `out` is genuinely non-empty and past
+    // its initial capacity by the time the corrupt file is hit) before
+    // asserting the corrupt-file path returns cleanly rather than
+    // aborting the test process.
+    try testing.expectError(error.InvalidAgentDefinition, list(testing.allocator, cwd));
 }
 
 const test_helpers_mod = @import("test_helpers.zig");
