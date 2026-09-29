@@ -162,6 +162,7 @@ pub fn replOptionsFromConfig(cfg: *const config_mod.Config, yolo_mode: bool, cwd
         .enable_spinner = cfg.ui_spinner,
         .enable_thinking_summary = cfg.ui_thinking_summary,
         .brief_mode = cfg.ui_brief_mode,
+        .ui_brief_body_rows = cfg.ui_brief_body_rows,
         .ui_density = density,
         .ui_leader_key = cfg.ui_leader_key,
         .show_top_bar = cfg.ui_show_top_bar,

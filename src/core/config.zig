@@ -46,6 +46,7 @@ pub const Config = struct {
     ui_spinner: bool,
     ui_thinking_summary: bool,
     ui_brief_mode: bool,
+    ui_brief_body_rows: usize,
     ui_vim_mode: bool,
     ui_auto_mode_opt_in_seen: bool,
     /// ui-dialogs-03: persisted default permission mode chosen via the AutoMode
@@ -476,6 +477,7 @@ pub const Config = struct {
             .ui_spinner = true,
             .ui_thinking_summary = true,
             .ui_brief_mode = false,
+            .ui_brief_body_rows = 6,
             .ui_vim_mode = false,
             .ui_auto_mode_opt_in_seen = false,
             .default_mode = try allocator.dupe(u8, ""),
