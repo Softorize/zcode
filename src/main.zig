@@ -623,6 +623,12 @@ pub fn main(init: std.process.Init) !void {
     // Same class of fix, same reason: `-d, --debug <filter>` installs a
     // process-lifetime allocation in log_runtime's category-filter global.
     defer log_runtime.clearCategoryFilter();
+    // Same class of fix: providers/common stashes the last HTTP error
+    // response's headers and body in process-lifetime globals (consulted by
+    // the retry path). beginNewRequest frees the previous stash each call, but
+    // the run's LAST error has no following request to free it, so it lingers
+    // until exit and the leak check flags it. Free it here.
+    defer @import("providers/common.zig").deinitRequestGlobals();
     const allocator = init.gpa;
 
     // Convert init.minimal.args.vector ([*:0]const u8 sentinel ptrs)

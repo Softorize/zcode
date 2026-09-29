@@ -29,6 +29,18 @@ const PROMPT_PLACEHOLDER = "Type a task or use / for commands";
 const FOOTER_SEGMENT_SEPARATOR = " \xe2\x88\x99 ";
 const BRIEF_ASSISTANT_BODY_ROWS: usize = 6;
 
+/// The number of body rows a collapsed (brief) assistant block shows before the
+/// "hidden N more rows" notice. Configurable via `ui_brief_body_rows` so the
+/// collapse can be gentler than the historic hard 6 (e.g. 24 for a small local
+/// model whose answers are long but worth a longer preview). Falls back to the 6
+/// default when the option is absent (the many anonymous option literals in the
+/// render tests) or set to 0, so existing behavior/tests are unchanged.
+fn briefBodyRows(options: anytype) usize {
+    if (@hasField(@TypeOf(options), "ui_brief_body_rows") and options.ui_brief_body_rows > 0)
+        return options.ui_brief_body_rows;
+    return BRIEF_ASSISTANT_BODY_ROWS;
+}
+
 const DividerTone = enum {
     neutral,
     warning,
@@ -402,8 +414,9 @@ fn userInnerWidthForOptions(cols: usize) usize {
 fn assistantVisibleRowsForLine(line: []const u8, cols: usize, decor_state: TranscriptDecorState, options: anytype) usize {
     const full_rows = wrappedRowsForLine(line, assistantInnerWidthForOptions(cols, options));
     if (!decor_state.in_assistant_block or !isBriefMode(options)) return full_rows;
-    if (decor_state.assistant_brief_rows_used >= BRIEF_ASSISTANT_BODY_ROWS) return 0;
-    return @min(full_rows, BRIEF_ASSISTANT_BODY_ROWS - decor_state.assistant_brief_rows_used);
+    const cap = briefBodyRows(options);
+    if (decor_state.assistant_brief_rows_used >= cap) return 0;
+    return @min(full_rows, cap - decor_state.assistant_brief_rows_used);
 }
 
 fn assistantHiddenRowsForLine(line: []const u8, cols: usize, decor_state: TranscriptDecorState, options: anytype) usize {
@@ -3065,6 +3078,42 @@ test "brief mode collapses long assistant blocks in transcript math" {
     });
 
     try testing.expect(brief_rows < full_rows);
+}
+
+test "ui_brief_body_rows makes the collapse cap configurable" {
+    var transcript = UiTranscript.init(testing.allocator, 20);
+    defer transcript.deinit(testing.allocator);
+    try transcript.appendLine(testing.allocator, transcriptAssistantBlockStartMarker());
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        try transcript.appendLine(testing.allocator, "assistant body line");
+    }
+    try transcript.appendLine(testing.allocator, transcriptAssistantBlockEndMarker());
+
+    // Default brief cap (6) hides more than a gentler cap (10), which in turn
+    // hides more than no collapse -- so a larger ui_brief_body_rows shows more.
+    const cap6 = transcriptVisualRows(&transcript, 40, .{
+        .transcript_line_spacing = @as(usize, 1),
+        .brief_mode = true,
+    });
+    const cap10 = transcriptVisualRows(&transcript, 40, .{
+        .transcript_line_spacing = @as(usize, 1),
+        .brief_mode = true,
+        .ui_brief_body_rows = @as(usize, 10),
+    });
+    const full = transcriptVisualRows(&transcript, 40, .{
+        .transcript_line_spacing = @as(usize, 1),
+    });
+    try testing.expect(cap6 < cap10);
+    try testing.expect(cap10 < full);
+
+    // A cap larger than the block collapses nothing (equals the full height).
+    const cap_big = transcriptVisualRows(&transcript, 40, .{
+        .transcript_line_spacing = @as(usize, 1),
+        .brief_mode = true,
+        .ui_brief_body_rows = @as(usize, 100),
+    });
+    try testing.expectEqual(full, cap_big);
 }
 
 test "renderFullScreen writes to an ArrayList.Managed writer" {

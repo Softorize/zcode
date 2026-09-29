@@ -204,6 +204,9 @@ pub const Options = struct {
     enable_spinner: bool = true,
     enable_thinking_summary: bool = true,
     brief_mode: bool = false,
+    /// Rows a collapsed (brief) assistant block shows before the "hidden N
+    /// more rows" notice. From config ui_brief_body_rows; 0 falls back to 6.
+    ui_brief_body_rows: usize = 6,
     /// commands-16: /focus -- a second, distinct transcript view-mode
     /// toggle from brief_mode (reference: "Toggle focus view: just your
     /// prompt, summary, and response"). Session-only.

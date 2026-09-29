@@ -139,6 +139,17 @@ fn clearLastErrorBody() void {
     last_error_body_alloc = null;
 }
 
+/// Free the process-lifetime error-response stashes at shutdown. beginNewRequest
+/// frees the PREVIOUS stash at the start of each top-level model call, but the
+/// LAST error of the run has no following request to free it, so its headers /
+/// body slice stays live until process exit and the debug allocator's end-of-run
+/// leak check flags it. main() calls this via `defer`, the same pattern used for
+/// the other process-lifetime globals (env overrides, cron store, log filter).
+pub fn deinitRequestGlobals() void {
+    clearLastResponseHeaders();
+    clearLastErrorBody();
+}
+
 const is_windows = @import("builtin").os.tag == .windows;
 
 pub fn trackChildPid(child: anytype) void {

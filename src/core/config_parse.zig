@@ -877,6 +877,8 @@ pub fn applyKeyValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8
         cfg.ui_thinking_summary = parseBool(value);
     } else if (std.mem.eql(u8, key, "ui_brief_mode")) {
         cfg.ui_brief_mode = parseBool(value);
+    } else if (std.mem.eql(u8, key, "ui_brief_body_rows")) {
+        cfg.ui_brief_body_rows = try parseConfigInt(usize, key, value);
     } else if (std.mem.eql(u8, key, "ui_vim_mode")) {
         cfg.ui_vim_mode = parseBool(value);
     } else if (std.mem.eql(u8, key, "ui_auto_mode_opt_in_seen")) {
