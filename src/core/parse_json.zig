@@ -85,9 +85,23 @@ pub fn parseCandidateJson(allocator: std.mem.Allocator, candidate: []const u8, f
         return null;
     }
 
-    const assistant_text = getAssistantText(allocator, obj) catch try allocator.dupe(u8, fallback_text);
+    var assistant_text = getAssistantText(allocator, obj) catch try allocator.dupe(u8, fallback_text);
     const tool_calls = parseToolCalls(allocator, obj) catch try allocator.alloc(ToolCall, 0);
     const control = parseControl(obj);
+
+    // Guard against blanking a real answer. An object that carries neither an
+    // "assistant"/"text" key nor any tool call is not actually a protocol
+    // envelope -- it's an embedded JSON blob such as
+    // `{"tool_calls": [], "control": {"continue": false}}` buried inside prose
+    // or a code fence (small local models emit these constantly). getAssistantText
+    // returns "" for it, which previously replaced the model's entire reply with
+    // empty text and dropped the turn into the empty-response retry loop. Keep
+    // the original text as the reply instead.
+    const has_text_key = obj.get("assistant") != null or obj.get("text") != null;
+    if (!has_text_key and tool_calls.len == 0 and assistant_text.len == 0) {
+        allocator.free(assistant_text);
+        assistant_text = try allocator.dupe(u8, fallback_text);
+    }
 
     return .{
         .assistant_text = assistant_text,

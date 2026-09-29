@@ -35,6 +35,16 @@ fn numCtxFragment(context_window: usize) []const u8 {
     return std.fmt.bufPrint(&num_ctx_buf, ",\"num_ctx\":{d}", .{context_window}) catch "";
 }
 
+/// Clamp the requested output-token budget to the context window. Ollama's
+/// num_ctx bounds total tokens (prompt + generation); asking for more output
+/// than the whole window -- e.g. the 65536-token max-output escalation retry
+/// against a 32768-token window -- only wastes time and forces context-shift.
+/// Leaves the value untouched when the window is unknown (0).
+fn clampNumPredict(max_output_tokens: usize, context_window: usize) usize {
+    if (context_window == 0) return max_output_tokens;
+    return @min(max_output_tokens, context_window);
+}
+
 pub fn create(allocator: std.mem.Allocator, cfg: types.ProviderConfig) !types.ProviderAdapter {
     const adapter = try allocator.create(LocalAdapter);
     // Local models (especially large ones like 32B) need longer timeouts
@@ -97,15 +107,29 @@ fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReque
     var body_buf = std_io.StringBuilder.init(allocator);
     defer body_buf.deinit();
 
-    // Detect if this is a follow-up round (prompt contains tool results from previous execution).
-    // If so, use text-based tool descriptions instead of native function calling, because
-    // the prompt engine embeds tool results as text in the user message, which native
-    // function calling can't see (it expects structured tool result messages).
-    // First round (no tool results in prompt) = native function calling.
-    // Subsequent rounds = text-based approach.
-    const has_tool_results = std.mem.indexOf(u8, request.prompt, "tool=") != null or
-        std.mem.indexOf(u8, request.prompt, "output=") != null or
-        std.mem.indexOf(u8, request.prompt, "[tool]") != null;
+    // Detect if this is a follow-up round (the conversation already carries a
+    // tool result). On the first round we send native Ollama function-calling
+    // tools; on later rounds the prompt engine embeds tool results as text, so
+    // we fall back to text-based tool descriptions the model can see.
+    //
+    // Detection reads the STRUCTURED history (a turn with role .tool), not a
+    // substring scan of the flat prompt. The previous scan matched "output="
+    // inside the "[BUDGET] ... reserved_output=" line that EVERY prompt carries,
+    // so has_tool_results was always true and native tools were NEVER sent --
+    // even on the first round. That forced the model into a free-form JSON
+    // "contract" it handles poorly and was a major driver of the multi-round
+    // retry loop on small local models. A narrowed text check for the "[tool]"
+    // marker stays as a defensive fallback for callers that don't thread
+    // structured history.
+    var has_tool_results = std.mem.indexOf(u8, request.prompt, "[tool]") != null;
+    if (!has_tool_results) {
+        for (request.history) |turn| {
+            if (turn.role == .tool) {
+                has_tool_results = true;
+                break;
+            }
+        }
+    }
     const use_native_tools = !has_tool_results and request.tool_schemas.len > 0;
 
     const system = if (use_native_tools)
@@ -128,7 +152,7 @@ fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReque
     local_request.system_prompt = system;
     try common.writeMultiTurnMessages(w, &local_request);
     try w.writeAll(",\"stream\":false,\"think\":false");
-    try w.print(",\"options\":{{\"temperature\":{d:.3},\"num_predict\":{d}{s}}}", .{ request.temperature, request.max_output_tokens, numCtxFragment(request.context_window) });
+    try w.print(",\"options\":{{\"temperature\":{d:.3},\"num_predict\":{d}{s}}}", .{ request.temperature, clampNumPredict(request.max_output_tokens, request.context_window), numCtxFragment(request.context_window) });
     try w.writeAll("}");
 
     // Inject native tools for first-round calls only.
@@ -208,7 +232,7 @@ fn stream(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.ModelReq
     try w.writeAll(",\"messages\":");
     try common.writeMultiTurnMessages(w, &local_request);
     try w.writeAll(",\"stream\":true,\"think\":false");
-    try w.print(",\"options\":{{\"temperature\":{d:.3},\"num_predict\":{d}{s}}}", .{ request.temperature, request.max_output_tokens, numCtxFragment(request.context_window) });
+    try w.print(",\"options\":{{\"temperature\":{d:.3},\"num_predict\":{d}{s}}}", .{ request.temperature, clampNumPredict(request.max_output_tokens, request.context_window), numCtxFragment(request.context_window) });
     try w.writeAll("}");
 
     const raw = try common.callHttpJsonWithPolicy(allocator, endpoint, &.{}, body_buf.items(), self.timeout_ms, local_provider_egress_policy);
@@ -237,7 +261,7 @@ fn streamLive(ctx: *anyopaque, allocator: std.mem.Allocator, request: types.Mode
     try w.writeAll(",\"messages\":");
     try common.writeMultiTurnMessages(w, &local_request);
     try w.writeAll(",\"stream\":true,\"think\":false");
-    try w.print(",\"options\":{{\"temperature\":{d:.3},\"num_predict\":{d}{s}}}", .{ request.temperature, request.max_output_tokens, numCtxFragment(request.context_window) });
+    try w.print(",\"options\":{{\"temperature\":{d:.3},\"num_predict\":{d}{s}}}", .{ request.temperature, clampNumPredict(request.max_output_tokens, request.context_window), numCtxFragment(request.context_window) });
     try w.writeAll("}");
 
     // For local providers, we use the streaming HTTP path which handles

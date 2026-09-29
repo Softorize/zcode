@@ -257,6 +257,65 @@ pub const TurnResult = struct {
     }
 };
 
+/// Build a no-progress signature for one model round: the trimmed assistant
+/// text, then each tool call's name and args, unit-separated (0x1f). Two
+/// consecutive rounds with an identical, non-empty signature mean the model
+/// produced the same text and would re-run the same tool call with the same
+/// args -- i.e. no progress -- so the turn loop ends instead of repeating until
+/// the round budget is exhausted. Caller owns the returned slice.
+fn buildRoundSignature(
+    allocator: std.mem.Allocator,
+    assistant_text: []const u8,
+    tool_calls: []const parse_helpers.ToolCall,
+) ![]u8 {
+    var sig = std.array_list.Managed(u8).init(allocator);
+    errdefer sig.deinit();
+    try sig.appendSlice(std.mem.trim(u8, assistant_text, " \t\r\n"));
+    for (tool_calls) |tc| {
+        try sig.append(0x1f);
+        try sig.appendSlice(tc.name);
+        try sig.append(0x1f);
+        try sig.appendSlice(tc.args);
+    }
+    return sig.toOwnedSlice();
+}
+
+test "buildRoundSignature is stable and distinguishes text and tool calls" {
+    const a = std.testing.allocator;
+    // Identical text + identical tool call -> identical signature (a repeat).
+    var call1 = [_]parse_helpers.ToolCall{.{
+        .name = try a.dupe(u8, "git_status"),
+        .args = try a.dupe(u8, "{\"path\":\".\"}"),
+    }};
+    defer {
+        a.free(call1[0].name);
+        a.free(call1[0].args);
+    }
+    const s1 = try buildRoundSignature(a, "  same text  ", &call1);
+    defer a.free(s1);
+    const s2 = try buildRoundSignature(a, "same text", &call1);
+    defer a.free(s2);
+    try std.testing.expect(std.mem.eql(u8, s1, s2)); // whitespace-trimmed, equal.
+
+    // Different tool args -> different signature (progress, not a repeat).
+    var call2 = [_]parse_helpers.ToolCall{.{
+        .name = try a.dupe(u8, "git_status"),
+        .args = try a.dupe(u8, "{\"path\":\"src\"}"),
+    }};
+    defer {
+        a.free(call2[0].name);
+        a.free(call2[0].args);
+    }
+    const s3 = try buildRoundSignature(a, "same text", &call2);
+    defer a.free(s3);
+    try std.testing.expect(!std.mem.eql(u8, s1, s3));
+
+    // Empty round -> empty signature (never counts as a repeat).
+    const s4 = try buildRoundSignature(a, "   ", &.{});
+    defer a.free(s4);
+    try std.testing.expectEqual(@as(usize, 0), s4.len);
+}
+
 pub const OneShotOutput = struct {
     body: []u8,
     strict_violation: bool,
@@ -1897,6 +1956,18 @@ pub const AgentRuntime = struct {
         // Last assistant text we nudged on, for identical-response break.
         var last_question_stall_text: []u8 = try self.allocator.dupe(u8, "");
         defer self.allocator.free(last_question_stall_text);
+        // No-progress stall guard (re-introduced; the signature version was
+        // removed in 0.11.26). A small local model fed a large tool system
+        // prompt can lock onto re-issuing the SAME tool call (identical name +
+        // args) every round -- e.g. calling git_status over and over after a
+        // one-word "hi" -- or repeating the same narration verbatim. The
+        // per-branch nudge caps only bound that to max_tool_rounds instead of
+        // stopping it. If a round's (assistant_text + tool-call names/args)
+        // signature is identical to the immediately preceding round's, the model
+        // is making no progress: end the turn rather than re-running the same
+        // call until the round budget is exhausted.
+        var last_round_sig: []u8 = try self.allocator.dupe(u8, "");
+        defer self.allocator.free(last_round_sig);
         var truncation_continuations: u8 = 0;
         // Phase 22 (agent-loop-deep-04): single-shot max-output-tokens cap
         // escalation. When a response is cut off by the request's
@@ -2803,6 +2874,35 @@ pub const AgentRuntime = struct {
 
                     // Auto-promote high-value insights to persistent memory
                     compaction_mod.promoteToMemory(self.allocator, &self.snapshot);
+                }
+
+                // No-progress stall guard. Build a signature of this round's
+                // output (trimmed assistant text + each tool call's name/args)
+                // and compare it to the previous round's. An identical, non-empty
+                // signature means the model repeated itself with no new
+                // information -- re-running its tool calls would just reproduce
+                // the same result -- so end the turn now. This breaks BEFORE the
+                // tool-execution / nudge branches below, keeping the model's own
+                // text (already saved into final_text above) as the answer.
+                {
+                    const round_sig = try buildRoundSignature(self.allocator, parsed.assistant_text, parsed.tool_calls);
+                    // Only treat an identical signature as no-progress when this
+                    // round actually re-issues TOOL CALLS. Re-running the same
+                    // tool with the same args yields the same result -- genuine
+                    // no progress (the DeepHat "hi -> git_status forever" loop).
+                    // A pure-text repeat (no tool calls) is deliberately NOT
+                    // caught here: the bounded nudge branches below turn that
+                    // into a forced tool call, which is a legitimate recovery.
+                    if (parsed.tool_calls.len > 0 and round_sig.len > 0 and
+                        last_round_sig.len > 0 and std.mem.eql(u8, last_round_sig, round_sig))
+                    {
+                        self.allocator.free(round_sig);
+                        emitProgress(reporter, "model repeated the same tool call with no progress; ending turn");
+                        terminal_reason = .completed;
+                        break;
+                    }
+                    self.allocator.free(last_round_sig);
+                    last_round_sig = round_sig;
                 }
 
                 if (parsed.control.compact) {
