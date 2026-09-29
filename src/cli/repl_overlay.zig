@@ -366,6 +366,25 @@ fn readOneByte(fd: std.posix.fd_t) !u8 {
     }
 }
 
+/// Consume and discard a terminal string sequence (DCS / OSC / SOS / PM / APC)
+/// up to its terminator: either BEL (0x07) or the two-byte ST "ESC \". These
+/// arrive on stdin as replies to the capability probes raw-mode setup emits
+/// (the Kitty keyboard push and the XTVERSION query in repl_input.enable()).
+/// They are not user keystrokes; without this drain the picker readers below
+/// mistake the reply's leading ESC for a cancel, which made the startup trust
+/// gate decline itself before the user ever saw it. Bounded so a stream with no
+/// terminator cannot hang the reader.
+fn drainStringTerminated(fd: std.posix.fd_t) void {
+    var prev: u8 = 0;
+    var guard: usize = 0;
+    while (guard < 1024) : (guard += 1) {
+        const ch = readOneByte(fd) catch return;
+        if (ch == 0x07) return; // BEL terminates immediately.
+        if (ch == '\\' and prev == 0x1b) return; // ST = ESC \.
+        prev = ch;
+    }
+}
+
 /// ZCODE_DEBUG_INPUT instrumentation, mirrored from repl_input so
 /// overlay reads show up in the same log file. Zero-cost when the
 /// env var is unset.
@@ -779,6 +798,12 @@ fn parseApprovalEscape(fd: std.posix.fd_t) ApprovalNavEvent {
     if (ready == 0) return .cancel;
 
     const second = readOneByte(fd) catch return .cancel;
+    // Swallow terminal capability replies (DCS/OSC/SOS/PM/APC) rather than
+    // reading their ESC as a cancel. See drainStringTerminated.
+    if (second == 'P' or second == ']' or second == 'X' or second == '^' or second == '_') {
+        drainStringTerminated(fd);
+        return .none;
+    }
     if (second != '[') return .cancel;
 
     // Capture the CSI parameter bytes plus the final byte so we can recognise
@@ -1000,7 +1025,21 @@ pub fn runTrustGateOverlayLoop(
                 clearTrustGateOverlay(body_lines.len, bottom_margin_rows);
                 return 0;
             },
-            .char, .backspace, .none => {},
+            .char => {
+                // Claude-Code-style one-key answers: 'y' accepts (the trust
+                // option is the last choice, "Yes, I trust this folder"), 'n'
+                // declines. Any other character is ignored.
+                const c = std.ascii.toLower(key.char);
+                if (c == 'y' and choices.len > 0) {
+                    clearTrustGateOverlay(body_lines.len, bottom_margin_rows);
+                    return choices.len - 1;
+                }
+                if (c == 'n') {
+                    clearTrustGateOverlay(body_lines.len, bottom_margin_rows);
+                    return 0;
+                }
+            },
+            .backspace, .none => {},
         }
     }
 }
@@ -1809,6 +1848,14 @@ fn readPickerKey(fd: std.posix.fd_t, chord_buf: *[24]u8) !PickerKey {
             if (ready == 0) return .{ .event = .cancel, .chord = "escape" };
 
             const second = readOneByte(fd) catch return .{ .event = .cancel, .chord = "escape" };
+            // Swallow terminal capability replies (DCS "ESC P", OSC "ESC ]",
+            // and SOS/PM/APC) instead of treating their ESC as a cancel. See
+            // drainStringTerminated. This is the fix for the trust gate exiting
+            // on its own at startup.
+            if (second == 'P' or second == ']' or second == 'X' or second == '^' or second == '_') {
+                drainStringTerminated(fd);
+                return .{ .event = .none };
+            }
             if (second != '[') return .{ .event = .cancel, .chord = "escape" };
 
             var seq: [32]u8 = undefined;
@@ -2497,6 +2544,12 @@ fn readTranscriptKey(fd: std.posix.fd_t, chord_buf: *[24]u8) !TranscriptKey {
             if (ready == 0) return .{ .event = .cancel, .chord = "escape" };
 
             const second = readOneByte(fd) catch return .{ .event = .cancel, .chord = "escape" };
+            // Swallow terminal capability replies (DCS/OSC/SOS/PM/APC) rather
+            // than reading their ESC as a cancel. See drainStringTerminated.
+            if (second == 'P' or second == ']' or second == 'X' or second == '^' or second == '_') {
+                drainStringTerminated(fd);
+                return .{ .event = .none };
+            }
             if (second != '[') return .{ .event = .cancel, .chord = "escape" };
 
             var seq: [32]u8 = undefined;
@@ -7151,6 +7204,58 @@ test "parsePlanAction recognizes supported aliases" {
     try testing.expect(parsePlanAction("continue").? == .discuss);
     try testing.expect(parsePlanAction("cancel").? == .cancel);
     try testing.expect(parsePlanAction("unknown") == null);
+}
+
+test "readPickerKey swallows an XTVERSION DCS reply instead of cancelling" {
+    // Regression: raw-mode setup emits an XTVERSION probe; the terminal answers
+    // with a DCS "ESC P >|name ESC \" sequence on stdin. The picker used to read
+    // the leading ESC as a cancel, which made the startup trust gate decline
+    // itself before the user could see it. The reply must now be consumed and a
+    // real key that follows it must be read normally.
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(fds[0]);
+    const body = "\x1bP>|ghostty 1.3.1\x1b\\\r"; // DCS reply, then Enter.
+    _ = std.c.write(fds[1], body.ptr, body.len);
+    _ = std.c.close(fds[1]);
+
+    var chord_buf: [24]u8 = undefined;
+    const first = try readPickerKey(fds[0], &chord_buf);
+    try testing.expectEqual(PickerEvent.none, first.event); // reply consumed, not a cancel.
+    const second = try readPickerKey(fds[0], &chord_buf);
+    try testing.expectEqual(PickerEvent.select, second.event); // the real Enter.
+}
+
+test "readPickerKey swallows an OSC reply terminated by BEL" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(fds[0]);
+    const body = "\x1b]11;rgb:1e1e/1e1e/1e1e\x07\r"; // OSC color reply + Enter.
+    _ = std.c.write(fds[1], body.ptr, body.len);
+    _ = std.c.close(fds[1]);
+
+    var chord_buf: [24]u8 = undefined;
+    const first = try readPickerKey(fds[0], &chord_buf);
+    try testing.expectEqual(PickerEvent.none, first.event);
+    const second = try readPickerKey(fds[0], &chord_buf);
+    try testing.expectEqual(PickerEvent.select, second.event);
+}
+
+test "readPickerKey reports y and n as char events for one-key answers" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(fds[0]);
+    const body = "yn";
+    _ = std.c.write(fds[1], body.ptr, body.len);
+    _ = std.c.close(fds[1]);
+
+    var chord_buf: [24]u8 = undefined;
+    const y = try readPickerKey(fds[0], &chord_buf);
+    try testing.expectEqual(PickerEvent.char, y.event);
+    try testing.expectEqual(@as(u8, 'y'), y.char);
+    const n = try readPickerKey(fds[0], &chord_buf);
+    try testing.expectEqual(PickerEvent.char, n.event);
+    try testing.expectEqual(@as(u8, 'n'), n.char);
 }
 
 test "buildAskUserOptionsLine highlights selected choice" {

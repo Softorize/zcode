@@ -1148,6 +1148,31 @@ fn renderPermissionModeChip(writer: anytype, used_cols: *usize, cols: usize, opt
 /// only-after-the-fact compact-boundary marker in the transcript).
 const CONTEXT_LOW_WARNING_USED_PCT: usize = 90;
 
+/// Tokens currently occupying the context window, for the status meter. Prefer
+/// the provider's REAL reported input-token count (e.g. Ollama's
+/// prompt_eval_count, surfaced as last_input_tokens) once a response has come
+/// back; fall back to the pre-send estimate only before the first response.
+/// The estimate heavily overcounts -- it charges roughly one token per
+/// punctuation character across every tool's JSON schema -- so a fresh session
+/// used to read ~100% used and flash "Context low (0% remaining)" right after a
+/// one-word "hi". Using the real count keeps the meter honest.
+fn contextUsedTokens(metrics: anytype) usize {
+    if (metrics.last_input_tokens > 0) return metrics.last_input_tokens;
+    return metrics.last_prompt_tokens;
+}
+
+/// Denominator for the context meter: the full model context window, so the
+/// meter reads "share of the window consumed" (Claude-Code style). Falls back
+/// to the input budget only when the window is unknown. Dividing by the input
+/// budget (window minus reserved output) made the meter read materially higher
+/// than the intuitive "% of the window used".
+fn contextWindowBase(metrics: anytype, options: anytype) usize {
+    if (@hasField(@TypeOf(options), "status_model_context_window") and options.status_model_context_window > 0)
+        return options.status_model_context_window;
+    if (metrics.last_budget_input > 0) return metrics.last_budget_input;
+    return 0;
+}
+
 /// Compute the reference's "Context low (N% remaining) \xc2\xb7 Run
 /// /compact to compact & continue" line (cc_strings.txt: `` `Context low
 /// (${pctLeft}% remaining) \xB7 ${...}` ``, "Run /compact to compact &
@@ -1167,15 +1192,11 @@ fn computeContextLowWarning(buf: []u8, options: anytype) []const u8 {
     const provider = options.status_metrics_provider orelse return "";
     const metrics = provider.get(provider.ctx);
 
-    const ctx_base = if (metrics.last_budget_input > 0)
-        metrics.last_budget_input
-    else if (options.status_model_context_window > 0)
-        options.status_model_context_window
-    else
-        0;
-    if (ctx_base == 0 or metrics.last_prompt_tokens == 0) return "";
+    const ctx_base = contextWindowBase(metrics, options);
+    const used_tokens = contextUsedTokens(metrics);
+    if (ctx_base == 0 or used_tokens == 0) return "";
 
-    const used_pct = @min(@as(usize, 100), (metrics.last_prompt_tokens * 100) / ctx_base);
+    const used_pct = @min(@as(usize, 100), (used_tokens * 100) / ctx_base);
     if (used_pct < CONTEXT_LOW_WARNING_USED_PCT) return "";
 
     const percent_left = 100 -| used_pct;
@@ -2279,14 +2300,10 @@ fn buildTokenStatusVariants(options: anytype, wide_out: []u8, compact_out: []u8,
     var cost_buf: [16]u8 = undefined;
     var ctx_pct_buf: [12]u8 = undefined;
 
-    const ctx_base = if (metrics.last_budget_input > 0)
-        metrics.last_budget_input
-    else if (options.status_model_context_window > 0)
-        options.status_model_context_window
-    else
-        0;
-    const ctx_pct = if (ctx_base > 0 and metrics.last_prompt_tokens > 0)
-        @min(@as(usize, 999), (metrics.last_prompt_tokens * 100) / ctx_base)
+    const ctx_base = contextWindowBase(metrics, options);
+    const used_tokens = contextUsedTokens(metrics);
+    const ctx_pct = if (ctx_base > 0 and used_tokens > 0)
+        @min(@as(usize, 999), (used_tokens * 100) / ctx_base)
     else
         0;
     const ctx_segment = if (ctx_pct > 0)
@@ -3943,6 +3960,7 @@ test "renderStatusPanel skips empty sections" {
 const TestContextMetrics = struct {
     last_budget_input: usize = 0,
     last_prompt_tokens: usize = 0,
+    last_input_tokens: usize = 0,
 };
 const TestContextMetricsProvider = struct {
     ctx: ?*anyopaque = null,
@@ -4018,6 +4036,56 @@ test "computeContextLowWarning defaults to the /compact wording when autocompact
     const warning = computeContextLowWarning(&buf, options);
     try testing.expect(std.mem.indexOf(u8, warning, "Run /compact to compact & continue") != null);
     try testing.expect(std.mem.indexOf(u8, warning, "auto-compact is off") == null);
+}
+
+test "computeContextLowWarning prefers real provider usage over the estimate" {
+    // A large pre-send estimate (last_prompt_tokens) would cross the threshold,
+    // but the provider's real reported usage (last_input_tokens) is small. The
+    // meter must trust the real number and stay silent. This is the regression
+    // for "Context low (0% remaining)" flashing after a one-word prompt.
+    var metrics = TestContextMetrics{
+        .last_budget_input = 100_000,
+        .last_prompt_tokens = 99_000,
+        .last_input_tokens = 1_200,
+    };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 0),
+    };
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("", computeContextLowWarning(&buf, options));
+}
+
+test "computeContextLowWarning: small hi prompt against a 32k window shows no warning" {
+    // The reported "hi" scenario: 32768-token window, a tiny real prompt.
+    var metrics = TestContextMetrics{
+        .last_budget_input = 24_576,
+        .last_prompt_tokens = 0,
+        .last_input_tokens = 300,
+    };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 32_768),
+    };
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("", computeContextLowWarning(&buf, options));
+}
+
+test "computeContextLowWarning uses the full window as the denominator" {
+    // Real usage 30000 against a 32768 window is ~91% used -> fires. If the
+    // denominator were the smaller input budget the percentage would differ,
+    // so this pins the window-based denominator.
+    var metrics = TestContextMetrics{
+        .last_budget_input = 24_576,
+        .last_input_tokens = 30_000,
+    };
+    const options = .{
+        .status_metrics_provider = @as(?TestContextMetricsProvider, .{ .ctx = &metrics, .get = testContextMetricsGet }),
+        .status_model_context_window = @as(usize, 32_768),
+    };
+    var buf: [96]u8 = undefined;
+    const warning = computeContextLowWarning(&buf, options);
+    try testing.expect(std.mem.startsWith(u8, warning, "Context low (9% remaining)"));
 }
 
 test "classifyInputHighlightByte marks slash commands and @references" {
