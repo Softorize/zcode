@@ -72,7 +72,7 @@ jobs:
           bash scripts/release/macos_sign_and_notarize.sh "dist/${{ matrix.asset_name }}"
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: v2.4.1
 
@@ -176,7 +176,7 @@ jobs:
           bash scripts/release/generate_sbom.sh "$version" dist/release
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: v2.4.1
 
